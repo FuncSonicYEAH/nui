@@ -32,8 +32,6 @@ pub enum Keyword {
     State,
     /// `on`
     On,
-    /// `from`
-    From,
     /// `when`
     When,
     /// `enter`
@@ -68,7 +66,6 @@ impl Keyword {
             "machine" => Some(Keyword::Machine),
             "state" => Some(Keyword::State),
             "on" => Some(Keyword::On),
-            "from" => Some(Keyword::From),
             "when" => Some(Keyword::When),
             "enter" => Some(Keyword::Enter),
             "exit" => Some(Keyword::Exit),
@@ -101,7 +98,6 @@ impl Keyword {
             Keyword::Machine => "machine",
             Keyword::State => "state",
             Keyword::On => "on",
-            Keyword::From => "from",
             Keyword::When => "when",
             Keyword::Enter => "enter",
             Keyword::Exit => "exit",

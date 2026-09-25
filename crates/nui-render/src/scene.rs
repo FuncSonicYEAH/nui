@@ -17,7 +17,7 @@ use crate::image::ImageDraw;
 const DEFAULT_FONT_SIZE_DP: f32 = 16.0;
 
 /// A rounded clip region in dp, resolved per draw (shader-side clipping).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClipDraw {
     /// Clip bounds in dp (absolute, after scroll translation).
     pub bounds: Rect,
@@ -73,6 +73,21 @@ pub struct Shadow {
     pub color: Color,
 }
 
+/// A linear gradient across the rect (shader-side interpolation).
+///
+/// The angle uses screen coordinates (y grows downward): `0` runs left to
+/// right, `90` runs top to bottom. The gradient is defined in the rect's
+/// own coordinate space, so it rotates with the element.
+#[derive(Debug, Clone, Copy)]
+pub struct GradientDraw {
+    /// Color at the gradient's start edge.
+    pub from: Color,
+    /// Color at the gradient's end edge.
+    pub to: Color,
+    /// Direction in degrees (screen coordinates, 0 = rightward).
+    pub angle: f32,
+}
+
 /// One drawable rounded rectangle.
 #[derive(Debug, Clone)]
 pub struct RectDraw {
@@ -80,10 +95,41 @@ pub struct RectDraw {
     pub geometry: Rect,
     /// Corner radius in dp.
     pub corner_radius: f32,
-    /// Fill color.
+    /// Fill color (ignored when `gradient` is set).
     pub fill: Color,
     /// Soft shadow, if any.
     pub shadow: Option<Shadow>,
+    /// Inherited clip region, if any.
+    pub clip: Option<ClipDraw>,
+    /// Rotation in degrees, clockwise, around the rect's center. The
+    /// layout box is unchanged; hit testing still uses the unrotated AABB.
+    pub rotation: f32,
+    /// Linear gradient overriding `fill`, if any. Border and shadow keep
+    /// their own colors.
+    pub gradient: Option<GradientDraw>,
+}
+
+/// Stroke end caps for polyline/arc stroking (FUTURE batch 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineCap {
+    /// Square ends exactly at the endpoints.
+    Butt,
+    /// Semicircular caps extending half the stroke width past the endpoints.
+    Round,
+}
+
+/// One stroked polyline: rendered as a capsule SDF per segment
+/// ([`crate::stroke`]). An `Arc` flattens into this shape at build time.
+#[derive(Debug, Clone)]
+pub struct PolylineDraw {
+    /// Vertices in absolute dp (element-local points + element origin).
+    pub points: Vec<Point>,
+    /// Stroke width in dp.
+    pub width: f32,
+    /// End cap style.
+    pub cap: LineCap,
+    /// Stroke color (opacity folded in at build time).
+    pub color: Color,
     /// Inherited clip region, if any.
     pub clip: Option<ClipDraw>,
 }
@@ -115,6 +161,9 @@ pub struct Scene {
     pub texts: Vec<TextDraw>,
     /// Image draws in paint order (expanded to quads by the renderer).
     pub images: Vec<ImageDraw>,
+    /// Stroked polylines (incl. flattened arcs) in paint order, expanded
+    /// to per-segment capsule quads by the renderer.
+    pub polylines: Vec<PolylineDraw>,
     /// Offscreen layers in paint order (drawn last, M9).
     pub layers: Vec<LayerDraw>,
 }
@@ -135,6 +184,7 @@ pub struct SceneBuilder {
     sources: Vec<ElementId>,
     texts: Vec<TextDraw>,
     images: Vec<ImageDraw>,
+    polylines: Vec<PolylineDraw>,
     layers: Vec<LayerDraw>,
 }
 
@@ -152,6 +202,8 @@ impl SceneBuilder {
             fill,
             shadow: None,
             clip: None,
+            rotation: 0.0,
+            gradient: None,
         });
     }
 
@@ -223,6 +275,12 @@ impl SceneBuilder {
             "Image" => {
                 self.collect_image_one(id, element, bounds, clip, context.image_keys);
             }
+            "Polyline" => {
+                self.collect_polyline_one(element, x, y, clip);
+            }
+            "Arc" => {
+                self.collect_arc_one(element, x, y, clip);
+            }
             _ => {
                 self.draw_rect(element, id, bounds, clip);
             }
@@ -269,13 +327,34 @@ impl SceneBuilder {
         if opacity <= 0.0 {
             return;
         }
-        let Some(fill) = color_property(element, "fill") else {
-            // No fill = no surface (Qt Quick Item semantics): Window,
-            // Column, Row, Scroll and Spacer are transparent containers;
-            // the host clear color shows through.
+        // A gradient alone is a valid surface (it overrides `fill`); only
+        // when neither is set is the element a transparent container (Qt
+        // Quick Item semantics): Window, Column, Row, Scroll and Spacer let
+        // the host clear color show through. The placeholder fill here is
+        // overridden by the gradient in the shader.
+        let gradient_from = color_property(element, "gradient.from");
+        let Some(fill) = color_property(element, "fill").or(gradient_from) else {
             return;
         };
         let corner_radius = f_property(element, "radius").unwrap_or(0.0);
+        // Rotation (degrees, clockwise, around the rect center). Only plain
+        // rect surfaces rotate; Text/Image/TextInput decorations keep their
+        // axis-aligned placement in v1.
+        let rotation = f_property(element, "rotation").unwrap_or(0.0);
+        // Linear gradient: both endpoints must be present; `gradient.angle`
+        // defaults to 90 (top-to-bottom, matching the screen y axis). The
+        // element's opacity folds into both endpoints, like `fill`.
+        let gradient = match (
+            color_property(element, "gradient.from"),
+            color_property(element, "gradient.to"),
+        ) {
+            (Some(from), Some(to)) => Some(GradientDraw {
+                from: from.with_alpha(from.alpha() * opacity),
+                to: to.with_alpha(to.alpha() * opacity),
+                angle: f_property(element, "gradient.angle").unwrap_or(90.0),
+            }),
+            _ => None,
+        };
         let shadow = color_property(element, "shadow.color").map(|color| {
             return Shadow {
                 offset: Point::new(
@@ -292,6 +371,8 @@ impl SceneBuilder {
             fill: fill.with_alpha(fill.alpha() * opacity),
             shadow,
             clip,
+            rotation,
+            gradient,
         });
         self.sources.push(id);
     }
@@ -363,6 +444,8 @@ impl SceneBuilder {
             fill: fill.with_alpha(fill.alpha() * opacity),
             shadow: None,
             clip,
+            rotation: 0.0,
+            gradient: None,
         });
         self.sources.push(id);
 
@@ -443,6 +526,8 @@ impl SceneBuilder {
                 fill: text_color.with_alpha(text_color.alpha() * opacity),
                 shadow: None,
                 clip,
+                rotation: 0.0,
+                gradient: None,
             });
         }
         // Selection highlight under the glyphs.
@@ -461,6 +546,8 @@ impl SceneBuilder {
                 fill: selection_color,
                 shadow: None,
                 clip,
+                rotation: 0.0,
+                gradient: None,
             });
         }
         // Cursor: a 2dp caret, centered vertically; during composition it
@@ -483,6 +570,8 @@ impl SceneBuilder {
             fill: Color::WHITE.with_alpha(opacity),
             shadow: None,
             clip,
+            rotation: 0.0,
+            gradient: None,
         });
     }
 
@@ -517,6 +606,75 @@ impl SceneBuilder {
             clip,
         });
         let _ = id;
+    }
+
+    /// Extracts one `Polyline` element's stroke.
+    fn collect_polyline_one(
+        &mut self,
+        element: &nui_runtime::Element,
+        x: f32,
+        y: f32,
+        clip: Option<ClipDraw>,
+    ) {
+        let Some(text) = element
+            .get("points")
+            .and_then(|value| return value.as_str().ok())
+        else {
+            return;
+        };
+        let points = parse_points(text);
+        let Some((width, cap, color)) = stroke_style_of(element) else {
+            return;
+        };
+        self.push_stroke(points, width, cap, color, clip, Point::new(x, y));
+    }
+
+    /// Extracts one `Arc` element's stroke, flattening the arc into
+    /// polyline points on the CPU (v1; no GPU tessellation yet).
+    fn collect_arc_one(
+        &mut self,
+        element: &nui_runtime::Element,
+        x: f32,
+        y: f32,
+        clip: Option<ClipDraw>,
+    ) {
+        let cx = f_property(element, "cx").unwrap_or(0.0);
+        let cy = f_property(element, "cy").unwrap_or(0.0);
+        let radius = f_property(element, "radius").unwrap_or(0.0);
+        let start = f_property(element, "start").unwrap_or(0.0);
+        let end = f_property(element, "end").unwrap_or(360.0);
+        let points = arc_points(cx, cy, radius, start, end);
+        let Some((width, cap, color)) = stroke_style_of(element) else {
+            return;
+        };
+        self.push_stroke(points, width, cap, color, clip, Point::new(x, y));
+    }
+
+    /// Pushes one stroked polyline, offsetting element-local points by the
+    /// element origin. Degenerate input (< 2 points) is dropped.
+    fn push_stroke(
+        &mut self,
+        points: Vec<Point>,
+        width: f32,
+        cap: LineCap,
+        color: Color,
+        clip: Option<ClipDraw>,
+        origin: Point,
+    ) {
+        if points.len() < 2 || width <= 0.0 {
+            return;
+        }
+        let points: Vec<Point> = points
+            .into_iter()
+            .map(|point| return Point::new(point.x + origin.x, point.y + origin.y))
+            .collect();
+        self.polylines.push(PolylineDraw {
+            points,
+            width,
+            cap,
+            color,
+            clip,
+        });
     }
 
     /// Shapes one line of glyphs and pushes the quads.
@@ -557,6 +715,7 @@ impl SceneBuilder {
             sources: self.sources,
             texts: self.texts,
             images: self.images,
+            polylines: self.polylines,
             layers: self.layers,
         };
     }
@@ -626,6 +785,76 @@ fn bool_property(element: &nui_runtime::Element, name: &str) -> bool {
         .get(name)
         .and_then(|value| return value.as_bool().ok())
         .unwrap_or(false);
+}
+
+/// Parses `"x,y x,y ..."` point pairs (whitespace between pairs, comma
+/// within a pair). Malformed pairs are skipped.
+fn parse_points(text: &str) -> Vec<Point> {
+    let mut points = Vec::new();
+    for pair in text.split_whitespace() {
+        let Some((x, y)) = pair.split_once(',') else {
+            continue;
+        };
+        if let (Ok(x), Ok(y)) = (x.trim().parse::<f32>(), y.trim().parse::<f32>()) {
+            points.push(Point::new(x, y));
+        }
+    }
+    return points;
+}
+
+/// Flattens an arc into polyline points. Screen coordinates: y grows down,
+/// so a positive sweep runs clockwise. The segment count scales with the
+/// sweep at ~4 degrees per segment, clamped to 8..96; a full circle drops
+/// the duplicated closing point so no zero-length segment reaches the GPU.
+fn arc_points(cx: f32, cy: f32, radius: f32, start_deg: f32, end_deg: f32) -> Vec<Point> {
+    let sweep = end_deg - start_deg;
+    if radius <= 0.0 || sweep == 0.0 {
+        return Vec::new();
+    }
+    let segments = ((sweep.abs() / 4.0).ceil() as usize).clamp(8, 96);
+    let mut points = Vec::with_capacity(segments + 1);
+    for step in 0..=segments {
+        let angle = (start_deg + sweep * step as f32 / segments as f32).to_radians();
+        points.push(Point::new(
+            cx + radius * angle.cos(),
+            cy + radius * angle.sin(),
+        ));
+    }
+    let closed = match (points.first().copied(), points.last().copied()) {
+        (Some(first), Some(last)) => {
+            (last.x - first.x).abs() < 1e-4 && (last.y - first.y).abs() < 1e-4
+        }
+        _ => false,
+    };
+    if closed {
+        points.pop();
+    }
+    return points;
+}
+
+/// Reads the stroke style: `stroke.width` (dp) is required, `stroke.cap`
+/// maps `"round"`/`"butt"` (default round), and the color comes from
+/// `color` then `stroke.color` (white default) with the element's opacity
+/// folded in.
+fn stroke_style_of(element: &nui_runtime::Element) -> Option<(f32, LineCap, Color)> {
+    let width = f_property(element, "stroke.width").unwrap_or(0.0);
+    if width <= 0.0 {
+        return None;
+    }
+    let cap = match element
+        .get("stroke.cap")
+        .and_then(|value| return value.as_str().ok())
+    {
+        Some("butt") => LineCap::Butt,
+        _ => LineCap::Round,
+    };
+    let opacity = f_property(element, "opacity")
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    let color = color_property(element, "color")
+        .or_else(|| return color_property(element, "stroke.color"))
+        .unwrap_or(Color::WHITE);
+    return Some((width, cap, color.with_alpha(color.alpha() * opacity)));
 }
 
 #[cfg(test)]
@@ -760,6 +989,109 @@ mod tests {
         assert!(
             scroll_draw.clip.is_none(),
             "the scroll element itself is unclipped"
+        );
+    }
+
+    #[test]
+    fn polyline_becomes_a_draw_with_parsed_points_and_opacity() {
+        let mut tree = ElementTree::new();
+        let mut polyline = Element::new("Polyline", None);
+        polyline.set("x", Value::Float(5.0));
+        polyline.set("y", Value::Float(6.0));
+        polyline.set("points", Value::String("0,0 40,20 80,10".to_string()));
+        polyline.set("stroke.width", Value::Float(2.0));
+        polyline.set("color", Value::Color(Color::from_rgb8(255, 0, 0)));
+        polyline.set("opacity", Value::Float(0.5));
+        let id = tree.insert(polyline);
+        tree.push_root(id);
+        let scene = SceneBuilder::build_with_context(
+            &tree,
+            &mut nui_text::TextSystem::with_embedded_font(),
+            SceneContext {
+                focused: None,
+                image_keys: &HashMap::new(),
+            },
+        );
+        assert_eq!(scene.polylines.len(), 1);
+        let draw = &scene.polylines[0];
+        // Points shifted by the element origin (5, 6).
+        assert_eq!(draw.points[0], Point::new(5.0, 6.0));
+        assert_eq!(draw.points[2], Point::new(85.0, 16.0));
+        assert_eq!(draw.width, 2.0);
+        assert_eq!(draw.cap, LineCap::Round, "round is the default cap");
+        assert!((draw.color.alpha() - 0.5).abs() < 1e-6, "opacity folded");
+        assert_eq!(draw.clip, None);
+    }
+
+    #[test]
+    fn arc_flattens_into_a_ring_of_points() {
+        // Full circle: 360/4 = 90 segments, and the duplicated closing
+        // point is dropped so the GPU never sees a zero-length segment.
+        let points = arc_points(50.0, 50.0, 30.0, 0.0, 360.0);
+        assert_eq!(points.len(), 90);
+        assert_eq!(points[0], Point::new(80.0, 50.0), "angle 0 starts at +x");
+        for point in &points {
+            let distance = (point.x - 50.0).hypot(point.y - 50.0);
+            assert!((distance - 30.0).abs() < 1e-3, "all points on the ring");
+        }
+        // Quarter sweep: ceil(90/4) = 23 segments -> 24 points, clockwise
+        // on screen (y down): angle 90 lands below the center.
+        let quarter = arc_points(50.0, 50.0, 30.0, 0.0, 90.0);
+        assert_eq!(quarter.len(), 24);
+        assert_eq!(quarter[0], Point::new(80.0, 50.0));
+        let last = quarter[quarter.len() - 1];
+        assert!((last.x - 50.0).abs() < 1e-3);
+        assert!((last.y - 80.0).abs() < 1e-3);
+        // Degenerate arcs produce nothing.
+        assert!(arc_points(0.0, 0.0, 0.0, 0.0, 360.0).is_empty());
+        assert!(arc_points(0.0, 0.0, 10.0, 45.0, 45.0).is_empty());
+    }
+
+    #[test]
+    fn strokes_without_width_or_enough_points_are_skipped() {
+        let mut tree = ElementTree::new();
+        let mut no_width = Element::new("Polyline", None);
+        no_width.set("points", Value::String("0,0 40,20".to_string()));
+        let no_width_id = tree.insert(no_width);
+        tree.push_root(no_width_id);
+        let mut no_points = Element::new("Polyline", None);
+        no_points.set("stroke.width", Value::Float(2.0));
+        let no_points_id = tree.insert(no_points);
+        tree.push_root(no_points_id);
+        let mut one_point = Element::new("Polyline", None);
+        one_point.set("points", Value::String("0,0".to_string()));
+        one_point.set("stroke.width", Value::Float(2.0));
+        let one_point_id = tree.insert(one_point);
+        tree.push_root(one_point_id);
+        let mut arc_no_radius = Element::new("Arc", None);
+        arc_no_radius.set("stroke.width", Value::Float(2.0));
+        arc_no_radius.set("end", Value::Float(180.0));
+        let arc_id = tree.insert(arc_no_radius);
+        tree.push_root(arc_id);
+        let scene = SceneBuilder::build_with_context(
+            &tree,
+            &mut nui_text::TextSystem::with_embedded_font(),
+            SceneContext {
+                focused: None,
+                image_keys: &HashMap::new(),
+            },
+        );
+        assert_eq!(scene.polylines.len(), 0);
+    }
+
+    #[test]
+    fn point_pairs_survive_extra_whitespace_and_skip_garbage() {
+        // Whitespace separates pairs; the comma must sit inside a pair
+        // ("40, 20" splits into two tokens and both are dropped).
+        let points = parse_points("  0,0   40,20  80,10 bad oops,again -5,2.5 ");
+        assert_eq!(
+            points,
+            vec![
+                Point::new(0.0, 0.0),
+                Point::new(40.0, 20.0),
+                Point::new(80.0, 10.0),
+                Point::new(-5.0, 2.5),
+            ]
         );
     }
 }

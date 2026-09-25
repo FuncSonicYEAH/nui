@@ -240,11 +240,14 @@ impl Parser {
     }
 
     /// `on event from states when guard => target`
+    ///
+    /// `from` is a contextual keyword (matched by text, not reserved):
+    /// reserving it would block member paths like `gradient.from`.
     fn parse_transition(&mut self) -> Option<TransitionDecl> {
         let start_index = self.pos;
         self.bump(); // `on`
         let event = self.expect_ident()?;
-        if !self.expect_keyword(Keyword::From) {
+        if !self.expect_word("from") {
             return None;
         }
         let mut from_states = Vec::new();
@@ -700,6 +703,18 @@ impl Parser {
         }
         self.error(format!("expected an identifier, found {}", self.peek()));
         return None;
+    }
+
+    /// Matches an identifier by exact text without reserving it (`from` in
+    /// transitions); reports a diagnostic on mismatch.
+    fn expect_word(&mut self, word: &str) -> bool {
+        let matches_word = matches!(self.peek(), TokenKind::Ident(name) if name == word);
+        if matches_word {
+            self.bump();
+            return true;
+        }
+        self.error(format!("expected `{word}`, found {}", self.peek()));
+        return false;
     }
 
     pub(crate) fn span_from(&self, start_index: usize) -> Span {

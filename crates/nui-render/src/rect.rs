@@ -50,8 +50,17 @@ pub struct RectInstance {
     pub clip_bounds: [f32; 4],
     /// Clip corner radius (physical px); negative = no clipping.
     pub clip_radius: f32,
+    /// Rotation in degrees, clockwise, around the rect center (0 = none).
+    pub rotation: f32,
     /// WGSL struct padding to 128 bytes.
-    pub _pad2: [f32; 3],
+    pub _pad2: [f32; 2],
+    /// Gradient start color (linear premultiplied); unused when no gradient.
+    pub gradient_from: [f32; 4],
+    /// Gradient end color (linear premultiplied); unused when no gradient.
+    pub gradient_to: [f32; 4],
+    /// `(dir.x, dir.y, kind, 0)` — unit direction of the gradient axis in
+    /// screen coordinates, `kind`: 0 = none, 1 = linear.
+    pub gradient_params: [f32; 4],
 }
 
 /// Converts a UI color (sRGB-encoded components) to **linear-space
@@ -112,8 +121,32 @@ impl RectInstance {
             shadow_offset: [0.0, 0.0],
             clip_bounds: [0.0, 0.0, 0.0, 0.0],
             clip_radius: -1.0,
-            _pad2: [0.0, 0.0, 0.0],
+            rotation: 0.0,
+            _pad2: [0.0, 0.0],
+            gradient_from: [0.0, 0.0, 0.0, 0.0],
+            gradient_to: [0.0, 0.0, 0.0, 0.0],
+            gradient_params: [0.0, 0.0, 0.0, 0.0],
         };
+    }
+
+    /// Attaches a rotation in degrees (clockwise around the rect center).
+    ///
+    /// The layout box and hit-test AABB are unchanged; the quad and its
+    /// shadow rotate together in the vertex shader.
+    pub fn with_rotation(mut self, degrees: f32) -> RectInstance {
+        self.rotation = degrees;
+        return self;
+    }
+
+    /// Attaches a linear gradient (rect-local coordinate space, so it
+    /// rotates with the element). `angle_deg` uses screen coordinates
+    /// (y down): 0 = left-to-right, 90 = top-to-bottom.
+    pub fn with_gradient(mut self, from: Color, to: Color, angle_deg: f32) -> RectInstance {
+        let angle = angle_deg.to_radians();
+        self.gradient_from = linear_rgba(from);
+        self.gradient_to = linear_rgba(to);
+        self.gradient_params = [angle.cos(), angle.sin(), 1.0, 0.0];
+        return self;
     }
 
     /// Attaches a rounded clip region in dp (M9 shader-side clipping).
@@ -180,7 +213,11 @@ struct RectData {
     shadow_offset: vec2<f32>,
     clip_bounds: vec4<f32>,
     clip_radius: f32,
-    _pad2: array<f32, 3>,
+    rotation: f32,
+    _pad2: array<f32, 2>,
+    gradient_from: vec4<f32>,
+    gradient_to: vec4<f32>,
+    gradient_params: vec4<f32>,  // dir.x, dir.y, kind (0 none / 1 linear), 0
 };
 
 @group(1) @binding(0) var<storage, read> rects: array<RectData>;
@@ -208,7 +245,16 @@ fn vs_main(@builtin(vertex_index) vertex: u32,
     let corner = corners[vertex];
     let bleed = shadow_bleed(data);
     let expanded = data.size + bleed * 2.0;
-    let pixel = data.origin - bleed + corner * expanded;
+    // Rotate the expanded quad around the rect center. At rotation = 0 the
+    // math below collapses to `origin - bleed + corner * expanded` exactly.
+    // `local` stays in unrotated quad space, so the fragment SDF (and the
+    // shadow/border math) needs no changes.
+    let offset = (corner - vec2<f32>(0.5, 0.5)) * expanded;
+    let angle = radians(data.rotation);
+    let s = sin(angle);
+    let c = cos(angle);
+    let rotated = vec2<f32>(offset.x * c - offset.y * s, offset.x * s + offset.y * c);
+    let pixel = data.origin + data.size * 0.5 + rotated;
     let ndc = vec2<f32>(
         pixel.x / camera.viewport.x * 2.0 - 1.0,
         1.0 - pixel.y / camera.viewport.y * 2.0,
@@ -232,6 +278,22 @@ fn rounded_rect_sdf(point: vec2<f32>, size: vec2<f32>, radius: f32) -> f32 {
     return outside + inside - clamped_radius;
 }
 
+/// Linear gradient along a screen-space direction projected onto the rect:
+/// `t = 0` at the entry edge, `t = 1` at the exit edge. The direction is
+/// rect-local, so a rotated element carries its gradient with it.
+fn gradient_fill(data: RectData, local: vec2<f32>) -> vec4<f32> {
+    if (data.gradient_params.z < 0.5) {
+        return data.fill;
+    }
+    let dir = normalize(data.gradient_params.xy);
+    let half_size = data.size * 0.5;
+    let p = local - half_size;
+    // Rectangle support along `dir`: max projection magnitude over the rect.
+    let span = abs(dir.x) * half_size.x + abs(dir.y) * half_size.y;
+    let t = clamp(dot(p, dir) / span * 0.5 + 0.5, 0.0, 1.0);
+    return mix(data.gradient_from, data.gradient_to, t);
+}
+
 @fragment
 fn fs_main(output: VertexOutput) -> @location(0) vec4<f32> {
     let data = rects[output.instance_index];
@@ -241,7 +303,7 @@ fn fs_main(output: VertexOutput) -> @location(0) vec4<f32> {
     // fwidth-based AA: one pixel of soft edge.
     let aa = fwidth(distance);
     let fill_alpha = 1.0 - smoothstep(-aa, aa, distance);
-    var color = data.fill * fill_alpha;
+    var color = gradient_fill(data, output.local - bleed) * fill_alpha;
 
     // Soft shadow: SDF of the rect shifted by `shadow_offset`, softened
     // over `shadow_blur`, composited under the fill (plan §6.4).
@@ -273,7 +335,7 @@ pub struct CameraUniform {
     /// Surface size (physical px).
     pub viewport: [f32; 2],
     /// Padding to 16-byte uniform alignment.
-    _padding: [f32; 2],
+    pub _padding: [f32; 2],
 }
 
 /// The rect pipeline: shader, bind groups, and instance buffer.
@@ -281,6 +343,7 @@ pub struct RectPipeline {
     pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    rect_layout: wgpu::BindGroupLayout,
     rect_buffer: wgpu::Buffer,
     rect_bind_group: wgpu::BindGroup,
     rect_capacity: usize,
@@ -385,6 +448,7 @@ impl RectPipeline {
             pipeline,
             camera_buffer,
             camera_bind_group,
+            rect_layout,
             rect_buffer,
             rect_bind_group,
             rect_capacity: capacity,
@@ -400,7 +464,8 @@ impl RectPipeline {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera));
     }
 
-    /// Uploads the instance list, growing the storage buffer when needed.
+    /// Uploads the instance list, regrowing the storage buffer (and its
+    /// bind group, which references the buffer) when needed.
     pub fn upload_instances(
         &mut self,
         device: &wgpu::Device,
@@ -415,10 +480,16 @@ impl RectPipeline {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            // The bind group references the old buffer; recreate lazily on
-            // the next render by storing capacity only. Simpler: rebuild now
-            // requires the layout; instead the renderer recreates bind groups
-            // per frame when capacity changed (tracked by the caller).
+            // The old bind group still points at the replaced buffer; rebuild
+            // it so rendering reads the new storage (same fix as stroke.rs).
+            self.rect_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("nui-rect-bind"),
+                layout: &self.rect_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.rect_buffer.as_entire_binding(),
+                }],
+            });
         }
         let bytes = bytemuck::cast_slice(instances);
         queue.write_buffer(&self.rect_buffer, 0, bytes);
@@ -464,8 +535,9 @@ mod tests {
     fn round_trip_gpu_bytes_matches_layout() {
         // Layout mirrors WGSL: origin(8) + size(8) + radius(4) + border(4)
         // + pad(8) + fill(16) + border_color(16) + shadow_color(16)
-        // + blur(4) + pad(4) + offset(8) + clip(16+4+12) = 128 bytes.
-        assert_eq!(std::mem::size_of::<RectInstance>(), 128);
+        // + blur(4) + pad(4) + offset(8) + clip(16+4) + rotation(4) + pad(8)
+        // + gradient_from(16) + gradient_to(16) + params(16) = 176 bytes.
+        assert_eq!(std::mem::size_of::<RectInstance>(), 176);
         assert_eq!(std::mem::size_of::<CameraUniform>(), 16);
         // `fill` must sit at the WGSL vec4 alignment (offset 32).
         let probe = RectInstance::from_dp(
@@ -477,5 +549,45 @@ mod tests {
         let bytes = bytemuck::bytes_of(&probe);
         assert_eq!(&bytes[32..36], &1.0f32.to_ne_bytes(), "fill.r at 32");
         assert_eq!(&bytes[36..40], &0.0f32.to_ne_bytes(), "fill.g at 36");
+        // `gradient_from` must sit at offset 128 (vec4 aligned), and the
+        // gradient kind defaults to off.
+        assert_eq!(
+            &bytes[128..132],
+            &0.0f32.to_ne_bytes(),
+            "gradient_from.r at 128"
+        );
+        assert_eq!(probe.gradient_params[2], 0.0, "no gradient by default");
+    }
+
+    #[test]
+    fn gradient_prepares_direction_and_colors() {
+        let instance = RectInstance::from_dp(
+            Rect::new(Point::ZERO, Size::new(10.0, 10.0)),
+            0.0,
+            Color::BLACK,
+            1.0,
+        )
+        .with_gradient(
+            Color::from_rgb8(255, 0, 0),
+            Color::from_rgb8(0, 0, 255),
+            0.0,
+        );
+        // Angle 0: gradient axis points rightward (+x).
+        assert!((instance.gradient_params[0] - 1.0).abs() < 1e-6);
+        assert!(instance.gradient_params[1].abs() < 1e-6);
+        assert_eq!(instance.gradient_params[2], 1.0, "kind = linear");
+        // Colors are converted to linear space like `fill` (red keeps red).
+        assert!(instance.gradient_from[0] > 0.9, "from stays red");
+        assert!(instance.gradient_to[2] > 0.9, "to stays blue");
+        // Angle 90: axis points down (+y, screen coordinates).
+        let down = RectInstance::from_dp(
+            Rect::new(Point::ZERO, Size::new(10.0, 10.0)),
+            0.0,
+            Color::BLACK,
+            1.0,
+        )
+        .with_gradient(Color::BLACK, Color::BLACK, 90.0);
+        assert!(down.gradient_params[0].abs() < 1e-6);
+        assert!((down.gradient_params[1] - 1.0).abs() < 1e-6);
     }
 }

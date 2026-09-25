@@ -633,7 +633,7 @@ fn snapshot_machine_component() {
   punct }
   keyword on
   ident pause
-  keyword from
+  ident from
   ident playing
   keyword when
   ident canStop
@@ -641,7 +641,7 @@ fn snapshot_machine_component() {
   ident stopped
   keyword on
   ident play
-  keyword from
+  ident from
   ident stopped
   punct ,
   ident paused

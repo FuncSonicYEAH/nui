@@ -1087,6 +1087,57 @@ impl<'source> ComponentBinder<'source> {
             Builtin::Min | Builtin::Max => self.check_min_max(func, args),
             Builtin::Clamp => self.check_clamp(args),
             Builtin::Tween | Builtin::Spring => self.check_animation(func, args),
+            _ if func.is_unary_math() => self.check_unary_math(func, args),
+            _ => {
+                // Exhaustive safety net: every Builtin is handled above.
+                self.diagnostics.push(nui_syntax::Diagnostic::error(
+                    *span,
+                    format!("`{name}` cannot be called here"),
+                ));
+                TypedExpr::Error
+            }
+        };
+    }
+
+    /// Checks a single-argument math builtin (`sin`, `sqrt`, ..): one
+    /// positional numeric argument, always yields `Float`.
+    fn check_unary_math(&mut self, func: Builtin, args: &[nui_syntax::CallArg]) -> TypedExpr {
+        if args.len() != 1 {
+            self.diagnostics.push(nui_syntax::Diagnostic::error(
+                args.first()
+                    .map(|arg| return arg.span)
+                    .unwrap_or(Span::new(0, 0)),
+                format!(
+                    "`{}` takes exactly 1 argument, found {}",
+                    func_name(func),
+                    args.len()
+                ),
+            ));
+            return TypedExpr::Error;
+        }
+        let arg = &args[0];
+        if arg.name.is_some() {
+            self.diagnostics.push(nui_syntax::Diagnostic::error(
+                arg.span,
+                format!("`{}` takes positional arguments only", func_name(func)),
+            ));
+        }
+        let checked = self.check_expr(&arg.value);
+        if !checked.type_of().is_numeric() {
+            self.diagnostics.push(nui_syntax::Diagnostic::error(
+                arg.span,
+                format!(
+                    "`{}` requires a numeric argument, found {}",
+                    func_name(func),
+                    checked.type_of()
+                ),
+            ));
+            return TypedExpr::Error;
+        }
+        return TypedExpr::Call {
+            func,
+            args: vec![checked],
+            ty: Type::Float,
         };
     }
 
@@ -1497,6 +1548,13 @@ fn func_name(func: Builtin) -> &'static str {
         Builtin::Min => "min",
         Builtin::Max => "max",
         Builtin::Clamp => "clamp",
+        Builtin::Sin => "sin",
+        Builtin::Cos => "cos",
+        Builtin::Tan => "tan",
+        Builtin::Sqrt => "sqrt",
+        Builtin::Abs => "abs",
+        Builtin::Floor => "floor",
+        Builtin::Ceil => "ceil",
         Builtin::Tween => "tween",
         Builtin::Spring => "spring",
     };
@@ -1963,5 +2021,92 @@ mod tests {
     fn never_panics_on_garbage() {
         let outcome = compile("component A { ??? } component B { property = = = }");
         assert!(!outcome.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn math_builtins_accept_numeric_arguments() {
+        let outcome = compile(
+            "component A { property p: Float = 4.0 Window(id = root, width = 200dp, height = 100dp) { Rectangle(width <- sqrt(p), height <- abs(-2.5), x <- sin(3.14), y <- floor(1.9)) {} } }",
+        );
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+    }
+
+    #[test]
+    fn math_builtins_reject_argument_count_and_type() {
+        let too_many = compile(
+            "component B { Window(id = root, width = 100dp, height = 100dp) { Rectangle(width <- sin(1, 2)) {} } }",
+        );
+        assert!(
+            !too_many.diagnostics.is_empty(),
+            "arity error expected: {:?}",
+            too_many.diagnostics
+        );
+        let wrong_type = compile(
+            "component C { Window(id = root, width = 100dp, height = 100dp) { Rectangle(width <- sqrt(\"x\")) {} } }",
+        );
+        assert!(
+            !wrong_type.diagnostics.is_empty(),
+            "type error expected: {:?}",
+            wrong_type.diagnostics
+        );
+    }
+
+    #[test]
+    fn temporary_demo_source_check() {
+        let demo = r#"
+component RotationGradient {
+    property spin: Float = 45
+
+    Window(id = root) {
+        Column(id = content, spacing = 16dp, padding = 24dp) {
+            Text(content = "rotation + gradient + math builtins", font.size = 14dp)
+
+            Rectangle(id = diamond, width = 80dp, height = 80dp, radius = 14dp,
+                      fill = #e05555, rotation <- spin) {
+                on click => spin += 15
+            }
+
+            Rectangle(id = bar, height = 40dp,
+                      gradient.from = #ff5544, gradient.to = #4466ff,
+                      gradient.angle = 0)
+
+            Rectangle(id = pill, height = 40dp, radius = 20dp,
+                      gradient.from = #ffb347, gradient.to = #7a4c9e)
+
+            Text(content <- "floor(sin(1.57) * 100) / 100 = {floor(sin(1.57) * 100.0) / 100.0}")
+        }
+    }
+}
+"#;
+        let outcome = compile(demo);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+    }
+
+    #[test]
+    fn temporary_strokes_demo_source_check() {
+        let demo = r#"
+component Strokes {
+    Window(id = root) {
+        Column(id = content, spacing = 20dp, padding = 24dp) {
+            Text(content = "polyline + arc stroking", font.size = 14dp)
+
+            Polyline(id = chart, width = 292dp, height = 110dp,
+                     points = "0,95 48,60 96,74 144,28 192,46 240,14 292,30",
+                     stroke.width = 3dp, color = #55aaee)
+
+            Polyline(id = divider, width = 292dp, height = 2dp,
+                     points = "0,0 292,0",
+                     stroke.width = 2dp, stroke.cap = "butt", color = #444a55)
+
+            Arc(id = ring, width = 150dp, height = 150dp,
+                cx = 75, cy = 75, radius = 60,
+                start = -90, end = 180,
+                stroke.width = 8dp, stroke.cap = "round", color = #e05555)
+        }
+    }
+}
+"#;
+        let outcome = compile(demo);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
     }
 }

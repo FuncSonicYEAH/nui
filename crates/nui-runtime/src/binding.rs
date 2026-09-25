@@ -335,7 +335,17 @@ impl Engine {
                     .start_spring(element, property, target, stiffness, damping, current);
                 Ok(())
             }
-            Builtin::Min | Builtin::Max | Builtin::Clamp => Ok(()),
+            // Math builtins are plain value functions: nothing to animate.
+            Builtin::Min
+            | Builtin::Max
+            | Builtin::Clamp
+            | Builtin::Sin
+            | Builtin::Cos
+            | Builtin::Tan
+            | Builtin::Sqrt
+            | Builtin::Abs
+            | Builtin::Floor
+            | Builtin::Ceil => Ok(()),
         };
     }
 
@@ -1426,6 +1436,32 @@ fn apply_builtin(func: Builtin, args: &[Value]) -> Value {
             }
             _ => Value::Int(0),
         },
+        // Math builtins: numeric in, Float out. `floor`/`ceil` also return
+        // Float for a uniform math surface (Int coercion stays explicit).
+        Builtin::Sin
+        | Builtin::Cos
+        | Builtin::Tan
+        | Builtin::Sqrt
+        | Builtin::Abs
+        | Builtin::Floor
+        | Builtin::Ceil => {
+            let raw = args.first().and_then(numeric).unwrap_or(0.0);
+            let out = match func {
+                Builtin::Sin => raw.sin(),
+                Builtin::Cos => raw.cos(),
+                Builtin::Tan => raw.tan(),
+                Builtin::Sqrt => raw.sqrt(),
+                Builtin::Abs => raw.abs(),
+                Builtin::Floor => raw.floor(),
+                Builtin::Ceil => raw.ceil(),
+                // Non-math builtins never enter this branch; the value is
+                // irrelevant and matches the enclosing arm's type.
+                Builtin::Min | Builtin::Max | Builtin::Clamp | Builtin::Tween | Builtin::Spring => {
+                    raw
+                }
+            };
+            Value::Float(out)
+        }
         // Animation wrappers pass the target value through in M2; the
         // animation clock (animation.rs) intercepts the property writes.
         Builtin::Tween | Builtin::Spring => args.first().cloned().unwrap_or(Value::Int(0)),
@@ -1633,5 +1669,51 @@ mod tests {
             ),
             Value::Int(5)
         );
+    }
+
+    #[test]
+    fn math_builtins_evaluate_to_float() {
+        let half_pi = Value::Float(std::f64::consts::FRAC_PI_2);
+        let sin_half_pi = apply_builtin(Builtin::Sin, &[half_pi]);
+        assert!((sin_half_pi.as_f64().unwrap() - 1.0).abs() < 1e-12);
+        let cos_zero = apply_builtin(Builtin::Cos, &[Value::Float(0.0)]);
+        assert!((cos_zero.as_f64().unwrap() - 1.0).abs() < 1e-12);
+        let tan_zero = apply_builtin(Builtin::Tan, &[Value::Float(0.0)]);
+        assert!(tan_zero.as_f64().unwrap().abs() < 1e-12);
+        assert_eq!(
+            apply_builtin(Builtin::Sqrt, &[Value::Int(9)]),
+            Value::Float(3.0)
+        );
+        assert_eq!(
+            apply_builtin(Builtin::Abs, &[Value::Float(-2.5)]),
+            Value::Float(2.5)
+        );
+        assert_eq!(
+            apply_builtin(Builtin::Floor, &[Value::Float(3.7)]),
+            Value::Float(3.0)
+        );
+        assert_eq!(
+            apply_builtin(Builtin::Ceil, &[Value::Float(3.2)]),
+            Value::Float(4.0)
+        );
+    }
+
+    #[test]
+    fn evaluates_math_builtin_calls() {
+        let mut tree = ElementTree::new();
+        let root = tree.insert(Element::new("Window", None));
+        tree.push_root(root);
+        tree.arena[root].set("angle", Value::Float(std::f64::consts::FRAC_PI_2));
+        let mut engine = Engine::new();
+        let expr = TypedExpr::Call {
+            func: Builtin::Sin,
+            args: vec![TypedExpr::Property {
+                target: PropertyTarget::Component("angle".to_string()),
+                ty: nui_compiler::Type::Float,
+            }],
+            ty: nui_compiler::Type::Float,
+        };
+        let value = engine.evaluate_free(&mut tree, root, &expr).unwrap();
+        assert!((value.as_f64().unwrap() - 1.0).abs() < 1e-12);
     }
 }

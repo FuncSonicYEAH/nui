@@ -13,6 +13,7 @@ pub mod image;
 pub mod layer;
 pub mod rect;
 pub mod scene;
+pub mod stroke;
 pub mod text;
 
 pub use image::{
@@ -21,7 +22,8 @@ pub use image::{
 };
 pub use layer::{BlurPipeline, LayerInstance, LayerPipeline};
 pub use rect::{CameraUniform, RectInstance, RectPipeline};
-pub use scene::{Scene, SceneBuilder, SceneContext, TextDraw};
+pub use scene::{LineCap, PolylineDraw, Scene, SceneBuilder, SceneContext, TextDraw};
+pub use stroke::{StrokeInstance, StrokePipeline};
 pub use text::{TextInstance, TextPipeline};
 
 use std::collections::HashMap;
@@ -32,6 +34,8 @@ use nui_core::Size;
 pub struct Renderer {
     /// The rect pipeline.
     pub rect: RectPipeline,
+    /// The stroke pipeline (polyline/arc capsule segments, batch 1).
+    pub stroke: StrokePipeline,
     /// The text pipeline (M6 glyph atlas quads).
     pub text: TextPipeline,
     /// The image pipeline (M8 textured quads).
@@ -49,6 +53,7 @@ impl Renderer {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Renderer {
         return Renderer {
             rect: RectPipeline::new(device, format),
+            stroke: StrokePipeline::new(device, format),
             text: TextPipeline::new(device, format),
             image: ImagePipeline::new(device, format),
             layer: LayerPipeline::new(device, format),
@@ -75,6 +80,8 @@ impl Renderer {
     ) {
         self.rect
             .set_viewport(queue, viewport.width * scale, viewport.height * scale);
+        self.stroke
+            .set_viewport(queue, viewport.width * scale, viewport.height * scale);
         self.text
             .set_viewport(queue, viewport.width * scale, viewport.height * scale);
         self.image
@@ -94,9 +101,36 @@ impl Renderer {
             if let Some(clip) = &rect.clip {
                 instance = instance.with_clip(clip.bounds, clip.radius, scale);
             }
+            if rect.rotation != 0.0 {
+                instance = instance.with_rotation(rect.rotation);
+            }
+            if let Some(gradient) = &rect.gradient {
+                instance = instance.with_gradient(gradient.from, gradient.to, gradient.angle);
+            }
             instances.push(instance);
         }
         self.rect.upload_instances(device, queue, &instances);
+        // Strokes: expand each polyline into per-segment capsule quads.
+        // The count here must match the draw count in `render`, which
+        // derives it from the same `scene.polylines` (segments = points-1).
+        let mut strokes: Vec<StrokeInstance> = Vec::new();
+        for polyline in &scene.polylines {
+            for pair in polyline.points.windows(2) {
+                let mut instance = StrokeInstance::from_dp(
+                    pair[0],
+                    pair[1],
+                    polyline.width,
+                    polyline.cap,
+                    polyline.color,
+                    scale,
+                );
+                if let Some(clip) = &polyline.clip {
+                    instance = instance.with_clip(clip.bounds, clip.radius, scale);
+                }
+                strokes.push(instance);
+            }
+        }
+        self.stroke.upload_instances(device, queue, &strokes);
         // Images: upload not-yet-uploaded textures, then expand draws.
         for (key, decoded) in decoded_images {
             if !self.image.has_texture(key) {
@@ -132,11 +166,19 @@ impl Renderer {
         }
     }
 
-    /// Encodes the draw commands for the current frame: rects, then images,
-    /// then glyphs (document paint order within each list). Layers must be
-    /// prepared first — use [`Renderer::render_to_view`].
+    /// Encodes the draw commands for the current frame: rects, then strokes,
+    /// then images, then glyphs (document paint order within each list).
+    /// Layers must be prepared first — use [`Renderer::render_to_view`].
     pub fn render<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>, scene: &Scene) {
         self.rect.render(pass, scene.rects.len() as u32);
+        // Segment count must match what `prepare` uploaded: one instance
+        // per consecutive point pair.
+        let stroke_count: usize = scene
+            .polylines
+            .iter()
+            .map(|polyline| return polyline.points.len().saturating_sub(1))
+            .sum();
+        self.stroke.render(pass, stroke_count as u32);
         self.image.render(pass);
         self.text.render(pass);
         self.layer.render(pass, scene.layers.len() as u32);

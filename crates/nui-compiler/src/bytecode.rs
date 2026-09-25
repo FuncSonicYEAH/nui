@@ -30,6 +30,20 @@ pub enum Builtin {
     Max,
     /// `clamp(v, lo, hi)` numeric.
     Clamp,
+    /// `sin(x)` — radians in, Float out.
+    Sin,
+    /// `cos(x)` — radians in, Float out.
+    Cos,
+    /// `tan(x)` — radians in, Float out.
+    Tan,
+    /// `sqrt(x)` — Float out.
+    Sqrt,
+    /// `abs(x)` — magnitude, Float out.
+    Abs,
+    /// `floor(x)` — rounds down, Float out.
+    Floor,
+    /// `ceil(x)` — rounds up, Float out.
+    Ceil,
     /// `tween(value, duration, easing)` animated binding.
     Tween,
     /// `spring(value, stiffness, damping)` animated binding.
@@ -43,10 +57,32 @@ impl Builtin {
             "min" => Some(Builtin::Min),
             "max" => Some(Builtin::Max),
             "clamp" => Some(Builtin::Clamp),
+            "sin" => Some(Builtin::Sin),
+            "cos" => Some(Builtin::Cos),
+            "tan" => Some(Builtin::Tan),
+            "sqrt" => Some(Builtin::Sqrt),
+            "abs" => Some(Builtin::Abs),
+            "floor" => Some(Builtin::Floor),
+            "ceil" => Some(Builtin::Ceil),
             "tween" => Some(Builtin::Tween),
             "spring" => Some(Builtin::Spring),
             _ => None,
         };
+    }
+
+    /// Whether the builtin is a single-argument math function (numeric in,
+    /// Float out).
+    pub fn is_unary_math(self) -> bool {
+        return matches!(
+            self,
+            Builtin::Sin
+                | Builtin::Cos
+                | Builtin::Tan
+                | Builtin::Sqrt
+                | Builtin::Abs
+                | Builtin::Floor
+                | Builtin::Ceil
+        );
     }
 }
 
