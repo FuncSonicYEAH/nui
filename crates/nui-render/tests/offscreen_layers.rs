@@ -9,8 +9,11 @@ use nui_runtime::{Element, ElementTree};
 
 /// Renders a tree via `render_to_view` into an offscreen target (black
 /// background) and returns the pixels plus the stride.
-fn render_pixels(tree: &ElementTree, viewport: nui_core::Size) -> (Vec<u8>, usize) {
+fn render_pixels(tree: &mut ElementTree, viewport: nui_core::Size) -> (Vec<u8>, usize) {
     let mut text = nui_text::TextSystem::with_embedded_font();
+    // Elements carry no x/y until layout runs (plan §2); without it every
+    // sibling stacks at (0,0).
+    nui_layout::layout_with_text(tree, viewport, Some(&mut text));
     let scene = SceneBuilder::build_with_context(
         tree,
         &mut text,
@@ -151,7 +154,7 @@ fn clip_property_crops_overflowing_children() {
     let mut tree = tree_with_red_child((50.0, 50.0));
     let root = tree.roots[0];
     tree.arena[root].set("clip", Value::Bool(true));
-    let (data, stride) = render_pixels(&tree, nui_core::Size::new(100.0, 100.0));
+    let (data, stride) = render_pixels(&mut tree, nui_core::Size::new(100.0, 100.0));
 
     let inside = pixel(&data, stride, 25, 25);
     assert!(
@@ -164,8 +167,8 @@ fn clip_property_crops_overflowing_children() {
 
 #[test]
 fn without_clip_children_overflow() {
-    let tree = tree_with_red_child((50.0, 50.0));
-    let (data, stride) = render_pixels(&tree, nui_core::Size::new(100.0, 100.0));
+    let mut tree = tree_with_red_child((50.0, 50.0));
+    let (data, stride) = render_pixels(&mut tree, nui_core::Size::new(100.0, 100.0));
     let outside = pixel(&data, stride, 80, 80);
     assert!(outside[0] > 180, "overflow stays visible, got {outside:?}");
 }
@@ -175,7 +178,7 @@ fn layer_opacity_dims_the_whole_subtree() {
     let mut tree = tree_with_red_child((50.0, 50.0));
     let root = tree.roots[0];
     tree.arena[root].set("layer.opacity", Value::Float(0.5));
-    let (data, stride) = render_pixels(&tree, nui_core::Size::new(100.0, 100.0));
+    let (data, stride) = render_pixels(&mut tree, nui_core::Size::new(100.0, 100.0));
     let inside = pixel(&data, stride, 25, 25);
     eprintln!("DBG inside={inside:?}");
     // Group opacity: red at 50% alpha composited over black. The layer
@@ -204,7 +207,7 @@ fn layer_blur_spreads_bright_pixels() {
     child.set("fill", Value::Color(Color::WHITE));
     let child_id = tree.insert(child);
     tree.append_child(root_id, child_id);
-    let (data, stride) = render_pixels(&tree, nui_core::Size::new(60.0, 60.0));
+    let (data, stride) = render_pixels(&mut tree, nui_core::Size::new(60.0, 60.0));
 
     let inside = pixel(&data, stride, 5, 5);
     assert!(
@@ -217,4 +220,50 @@ fn layer_blur_spreads_bright_pixels() {
     assert!(spread[0] > 8, "blur spreads light outward, got {spread:?}");
     let far = pixel(&data, stride, 55, 55);
     assert!(far[0] < 8, "far corner stays dark, got {far:?}");
+}
+
+#[test]
+fn second_layer_renders_after_the_first() {
+    // Regression guard for the WGSL `LayerData` stride bug: `_pad` was a
+    // `vec3<f32>` (16-byte alignment), growing the storage-array stride to
+    // 48 bytes while the Rust instance is 32 — layer 0 read correctly by
+    // accident and every later layer read its neighbor's padding, so all
+    // layers after the first rendered as degenerate zero-size quads.
+    let mut tree = ElementTree::new();
+    let mut root = Element::new("Column", None);
+    root.set("width", Value::Float(200.0));
+    root.set("height", Value::Float(60.0));
+    let root_id = tree.insert(root);
+    tree.push_root(root_id);
+
+    let mut first = Element::new("Rectangle", None);
+    first.set("width", Value::Float(80.0));
+    first.set("height", Value::Float(24.0));
+    first.set("fill", Value::Color(Color::from_rgb8(122, 76, 158)));
+    first.set("layer.opacity", Value::Float(0.99));
+    let first_id = tree.insert(first);
+    tree.append_child(root_id, first_id);
+
+    let mut second = Element::new("Rectangle", None);
+    second.set("width", Value::Float(80.0));
+    second.set("height", Value::Float(24.0));
+    second.set("fill", Value::Color(Color::from_rgb8(200, 60, 60)));
+    second.set("layer.opacity", Value::Float(0.99));
+    let second_id = tree.insert(second);
+    tree.append_child(root_id, second_id);
+
+    // Column stacks vertically: first at y0..24, second at y24..48.
+    // Center of each must be its own color, not the other's and not the
+    // background.
+    let (data, stride) = render_pixels(&mut tree, nui_core::Size::new(200.0, 60.0));
+    let first_px = pixel(&data, stride, 40, 12);
+    let second_px = pixel(&data, stride, 40, 36);
+    assert!(
+        first_px[2] > 100 && first_px[0] < first_px[2],
+        "first layer keeps its blue-ish fill, got {first_px:?}"
+    );
+    assert!(
+        second_px[0] > 100 && second_px[2] < second_px[0],
+        "second layer keeps its red fill, got {second_px:?}"
+    );
 }

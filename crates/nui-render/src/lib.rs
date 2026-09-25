@@ -212,6 +212,18 @@ impl Renderer {
             let height = (layer.size.height * scale).ceil().max(1.0) as u32;
             let texture =
                 self.render_offscreen(device, queue, width, height, scale, &layer.scene, text);
+            // Sync before the next sibling's work: on lavapipe, the staged
+            // `write_buffer` copies of a later layer's `prepare` were
+            // observed landing while the previous layer's pass was still
+            // pending, corrupting its result (plan §M9 已知问题). One
+            // blocking poll per layer — layers are rare, correctness first.
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .expect("layer sync completes");
+
             let view = if layer.blur > 0.0 {
                 let blurred =
                     self.blur_texture(device, queue, texture, width, height, layer.blur * scale);
@@ -221,10 +233,14 @@ impl Renderer {
             };
             views.push(view);
             instances.push(LayerInstance {
-                origin: [layer.origin.x * scale, layer.origin.y * scale],
-                size: [layer.size.width * scale, layer.size.height * scale],
-                opacity: layer.opacity,
-                _pad: [0.0; 3],
+                origin: [layer.origin.x * scale, layer.origin.y * scale, 0.0, 0.0],
+                size_opacity: [
+                    layer.size.width * scale,
+                    layer.size.height * scale,
+                    layer.opacity,
+                    0.0,
+                ],
+                _pad: [0.0; 4],
             });
         }
         self.layer.prepare(device, queue, &instances, &views);

@@ -9,19 +9,20 @@ use bytemuck::{Pod, Zeroable};
 
 /// Per-instance GPU data for one composited layer quad.
 ///
-/// Layout mirrors WGSL `LayerData`: two `vec2`s, opacity, padding — 32
-/// bytes.
+/// Layout mirrors WGSL `LayerData`: three `vec4`s — 48 bytes. Every member
+/// is a `vec4` so the WGSL stride is unambiguous (a `vec3` padding field
+/// once grew the stride to 48 while Rust wrote 32, and every layer after
+/// the first read its neighbor's padding).
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
 pub struct LayerInstance {
-    /// Top-left corner in physical pixels.
-    pub origin: [f32; 2],
-    /// Quad size in physical pixels.
-    pub size: [f32; 2],
-    /// Group opacity (0..=1).
-    pub opacity: f32,
-    /// Padding to 32 bytes.
-    pub _pad: [f32; 3],
+    /// Top-left corner in physical pixels; `.zw` unused.
+    pub origin: [f32; 4],
+    /// Quad size in physical pixels in `.xy`; `.z` = group opacity (0..=1);
+    /// `.w` unused.
+    pub size_opacity: [f32; 4],
+    /// Padding to 48 bytes.
+    pub _pad: [f32; 4],
 }
 
 /// WGSL shader: textured quad scaled by the group opacity.
@@ -33,10 +34,9 @@ struct Camera {
 @group(0) @binding(0) var<uniform> camera: Camera;
 
 struct LayerData {
-    origin: vec2<f32>,
-    size: vec2<f32>,
-    opacity: f32,
-    _pad: vec3<f32>,
+    origin: vec4<f32>,
+    size_opacity: vec4<f32>,
+    _pad: vec4<f32>,
 };
 
 @group(1) @binding(0) var<storage, read> layers: array<LayerData>;
@@ -59,7 +59,7 @@ fn vs_main(@builtin(vertex_index) vertex: u32,
     );
     let data = layers[instance];
     let corner = corners[vertex];
-    let pixel = data.origin + corner * data.size;
+    let pixel = data.origin.xy + corner * data.size_opacity.xy;
     let ndc = vec2<f32>(
         pixel.x / camera.viewport.x * 2.0 - 1.0,
         1.0 - pixel.y / camera.viewport.y * 2.0,
@@ -75,7 +75,7 @@ fn vs_main(@builtin(vertex_index) vertex: u32,
 fn fs_main(output: VertexOutput) -> @location(0) vec4<f32> {
     let data = layers[output.instance_index];
     let sampled = textureSample(tex, tex_sampler, output.uv);
-    return sampled * data.opacity;
+    return sampled * data.size_opacity.z;
 }
 "#;
 
@@ -248,7 +248,9 @@ impl LayerPipeline {
             self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("nui-layer-instances"),
                 size: (self.instance_capacity * std::mem::size_of::<LayerInstance>()) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
         }
