@@ -138,6 +138,14 @@ pub trait ElementBehavior: std::fmt::Debug {
     /// Called when a signal reaches the element, after the element's DSL
     /// handlers and machines have run.
     fn on_signal(&mut self, context: &mut BehaviorContext<'_>, element: ElementId, signal: &str);
+
+    /// The painter this behavior exposes for `Canvas` elements (FUTURE
+    /// batch 3): the engine stores it on the element so the scene builder
+    /// can interpret the command buffer. `None` (the default) for
+    /// behaviors without a canvas.
+    fn canvas(&self) -> Option<crate::canvas::CanvasPainter> {
+        return None;
+    }
 }
 
 /// The host extension registry: custom components and host functions.

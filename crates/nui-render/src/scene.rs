@@ -134,6 +134,22 @@ pub struct PolylineDraw {
     pub clip: Option<ClipDraw>,
 }
 
+/// One filled path: flattened rings drawn through the triangle pipeline
+/// ([`crate::path`]). Stroked paths additionally become [`PolylineDraw`]s.
+#[derive(Debug, Clone)]
+pub struct PathDraw {
+    /// Flattened rings in absolute dp (element-local points + origin).
+    /// Open subpaths are included; rings with fewer than 3 points are
+    /// ignored by the fill.
+    pub loops: Vec<Vec<Point>>,
+    /// Fill color (opacity folded in at build time).
+    pub fill: Color,
+    /// Inherited clip region. v1 note: the triangle pipeline does not
+    /// apply shader-side clipping yet (hard edges; scissor/feather is the
+    /// later AA review) — the field travels with the draw for when it does.
+    pub clip: Option<ClipDraw>,
+}
+
 /// One offscreen-composited layer: a subtree rendered into its own texture
 /// and drawn back with a group opacity (and optional blur, M9).
 #[derive(Debug, Clone)]
@@ -164,6 +180,8 @@ pub struct Scene {
     /// Stroked polylines (incl. flattened arcs) in paint order, expanded
     /// to per-segment capsule quads by the renderer.
     pub polylines: Vec<PolylineDraw>,
+    /// Filled paths in paint order (triangulated by the renderer).
+    pub paths: Vec<PathDraw>,
     /// Offscreen layers in paint order (drawn last, M9).
     pub layers: Vec<LayerDraw>,
 }
@@ -185,6 +203,7 @@ pub struct SceneBuilder {
     texts: Vec<TextDraw>,
     images: Vec<ImageDraw>,
     polylines: Vec<PolylineDraw>,
+    paths: Vec<PathDraw>,
     layers: Vec<LayerDraw>,
 }
 
@@ -283,6 +302,12 @@ impl SceneBuilder {
             }
             "Waveline" => {
                 self.collect_waveline_one(element, bounds, clip);
+            }
+            "Path" => {
+                self.collect_path_one(element, x, y, clip);
+            }
+            "Canvas" => {
+                self.collect_canvas_one(element, bounds);
             }
             _ => {
                 self.draw_rect(element, id, bounds, clip);
@@ -721,6 +746,107 @@ impl SceneBuilder {
         }
     }
 
+    /// Extracts one `Path` element: parses the `d` attribute, flattens it
+    /// into rings, and emits the fill plus (when `stroke.width` is set)
+    /// one stroke per ring. A broken `d` string silently paints nothing
+    /// (v1; compile-time validation is a later item).
+    fn collect_path_one(
+        &mut self,
+        element: &nui_runtime::Element,
+        x: f32,
+        y: f32,
+        clip: Option<ClipDraw>,
+    ) {
+        let Some(data) = element
+            .get("d")
+            .and_then(|value| return value.as_str().ok())
+            .and_then(|text| return nui_core::path::parse_path(text).ok())
+        else {
+            return;
+        };
+        // ~0.1dp tolerance keeps curves visually smooth at UI stroke widths.
+        let loops = nui_core::path::flatten(&data, 0.1);
+        let opacity = f_property(element, "opacity")
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        if let (Some(fill), false) = (color_property(element, "fill"), opacity <= 0.0) {
+            let loops: Vec<Vec<Point>> = loops
+                .iter()
+                .map(|loop_points| {
+                    return loop_points
+                        .iter()
+                        .map(|point| return Point::new(point.x + x, point.y + y))
+                        .collect();
+                })
+                .collect();
+            self.paths.push(PathDraw {
+                loops,
+                fill: fill.with_alpha(fill.alpha() * opacity),
+                clip,
+            });
+        }
+        if let Some((width, cap, color)) = stroke_style_of(element) {
+            for loop_points in &loops {
+                self.push_stroke(loop_points.clone(), width, cap, color, clip, Point::new(x, y));
+            }
+        }
+    }
+
+    /// Extracts one `Canvas` element (FUTURE batch 3): interprets the
+    /// behavior's command buffer into fills (earcut) and strokes (capsule
+    /// pipeline) inside a texture-local sub-scene, composited through the
+    /// offscreen layer pipeline. Zero new GPU code; v1 reinterprets the
+    /// buffer every frame. The element's inherited clip does not reach the
+    /// sub-scene — the layer texture bounds ARE the clip, matching how
+    /// `layer.*` capture works.
+    fn collect_canvas_one(
+        &mut self,
+        element: &nui_runtime::Element,
+        bounds: Rect,
+    ) {
+        let Some(painter) = element.canvas.as_ref() else {
+            return;
+        };
+        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+            return;
+        }
+        // ~0.1dp tolerance keeps curves visually smooth at UI stroke widths.
+        let frame = nui_runtime::canvas::interpret(&painter.ops(), 0.1);
+        let mut sub = SceneBuilder::new();
+        for (color, loops) in frame.fills {
+            sub.paths.push(PathDraw {
+                loops,
+                fill: color,
+                clip: None,
+            });
+        }
+        for (color, width, cap, loops) in frame.strokes {
+            let cap = match cap {
+                nui_runtime::canvas::CanvasCap::Butt => LineCap::Butt,
+                nui_runtime::canvas::CanvasCap::Round => LineCap::Round,
+            };
+            for points in loops {
+                if points.len() < 2 {
+                    continue;
+                }
+                sub.polylines.push(PolylineDraw {
+                    points,
+                    width,
+                    cap,
+                    color,
+                    clip: None,
+                });
+            }
+        }
+        self.layers.push(LayerDraw {
+            origin: bounds.origin,
+            size: bounds.size,
+            opacity: 1.0,
+            blur: 0.0,
+            scene: Box::new(sub.build()),
+        });
+    }
+
     /// Shapes one line of glyphs and pushes the quads.
     #[allow(clippy::too_many_arguments)]
     fn push_glyphs(
@@ -760,6 +886,7 @@ impl SceneBuilder {
             texts: self.texts,
             images: self.images,
             polylines: self.polylines,
+            paths: self.paths,
             layers: self.layers,
         };
     }
@@ -1298,5 +1425,72 @@ mod tests {
                 Point::new(-5.0, 2.5),
             ]
         );
+    }
+
+    #[test]
+    fn path_element_flattens_into_fill_and_strokes() {
+        let mut tree = ElementTree::new();
+        let mut path = Element::new("Path", None);
+        path.set("x", Value::Float(5.0));
+        path.set("y", Value::Float(6.0));
+        path.set(
+            "d",
+            Value::String("M 0 0 L 48 0 L 24 42 Z".to_string()),
+        );
+        path.set("fill", Value::Color(Color::from_rgb8(255, 0, 0)));
+        path.set("stroke.width", Value::Float(2.0));
+        path.set("stroke.color", Value::Color(Color::from_rgb8(0, 0, 255)));
+        path.set("opacity", Value::Float(0.5));
+        let id = tree.insert(path);
+        tree.push_root(id);
+        let scene = SceneBuilder::build_with_context(
+            &tree,
+            &mut nui_text::TextSystem::with_embedded_font(),
+            SceneContext {
+                focused: None,
+                image_keys: &HashMap::new(),
+            },
+        );
+        // Fill: one closed ring, offset by the origin, opacity folded in.
+        assert_eq!(scene.paths.len(), 1);
+        let fill = &scene.paths[0];
+        assert_eq!(fill.loops.len(), 1);
+        assert_eq!(fill.loops[0][0], Point::new(5.0, 6.0));
+        assert_eq!(fill.loops[0][1], Point::new(53.0, 6.0));
+        assert!((fill.fill.alpha() - 0.5).abs() < 1e-6, "opacity folded");
+        // Stroke: the same ring goes through the polyline pipeline.
+        assert_eq!(scene.polylines.len(), 1);
+        assert_eq!(scene.polylines[0].points.len(), 4, "closed ring of 3 points");
+        assert_eq!(scene.polylines[0].width, 2.0);
+    }
+
+    #[test]
+    fn path_without_fill_or_stroke_paints_nothing() {
+        let mut tree = ElementTree::new();
+        let mut no_d = Element::new("Path", None);
+        no_d.set("fill", Value::Color(Color::from_rgb8(255, 0, 0)));
+        let no_d_id = tree.insert(no_d);
+        tree.push_root(no_d_id);
+        let mut broken_d = Element::new("Path", None);
+        broken_d.set("d", Value::String("M 0 0 X 5".to_string()));
+        broken_d.set("fill", Value::Color(Color::from_rgb8(255, 0, 0)));
+        let broken_id = tree.insert(broken_d);
+        tree.push_root(broken_id);
+        let mut stroke_only = Element::new("Path", None);
+        stroke_only.set("d", Value::String("M 0 0 L 10 0".to_string()));
+        stroke_only.set("stroke.width", Value::Float(2.0));
+        let stroke_id = tree.insert(stroke_only);
+        tree.push_root(stroke_id);
+        let scene = SceneBuilder::build_with_context(
+            &tree,
+            &mut nui_text::TextSystem::with_embedded_font(),
+            SceneContext {
+                focused: None,
+                image_keys: &HashMap::new(),
+            },
+        );
+        // No fill anywhere; only the stroke-only path produces a polyline.
+        assert_eq!(scene.paths.len(), 0);
+        assert_eq!(scene.polylines.len(), 1);
     }
 }

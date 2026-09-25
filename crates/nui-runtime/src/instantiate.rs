@@ -142,6 +142,9 @@ pub(crate) fn instantiate_scoped_node(
     }
     if let Some(factory) = engine.registry().behavior(&node.ty) {
         let behavior = factory();
+        // Canvas behaviors expose their painter so the scene builder can
+        // interpret the command buffer (FUTURE batch 3).
+        tree.arena[id].canvas = behavior.canvas();
         tree.arena[id].behavior = Some(behavior);
     }
     for assignment in deferred {

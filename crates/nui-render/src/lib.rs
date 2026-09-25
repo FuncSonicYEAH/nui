@@ -11,6 +11,7 @@
 
 pub mod image;
 pub mod layer;
+pub mod path;
 pub mod rect;
 pub mod scene;
 pub mod stroke;
@@ -21,8 +22,9 @@ pub use image::{
     decode_file, nine_slice_quads,
 };
 pub use layer::{BlurPipeline, LayerInstance, LayerPipeline};
+pub use path::{PathPipeline, PathVertex};
 pub use rect::{CameraUniform, RectInstance, RectPipeline};
-pub use scene::{LineCap, PolylineDraw, Scene, SceneBuilder, SceneContext, TextDraw};
+pub use scene::{LineCap, PathDraw, PolylineDraw, Scene, SceneBuilder, SceneContext, TextDraw};
 pub use stroke::{StrokeInstance, StrokePipeline};
 pub use text::{TextInstance, TextPipeline};
 
@@ -36,6 +38,8 @@ pub struct Renderer {
     pub rect: RectPipeline,
     /// The stroke pipeline (polyline/arc capsule segments, batch 1).
     pub stroke: StrokePipeline,
+    /// The path fill pipeline (triangulated paths, batch 2).
+    pub path: PathPipeline,
     /// The text pipeline (M6 glyph atlas quads).
     pub text: TextPipeline,
     /// The image pipeline (M8 textured quads).
@@ -54,6 +58,7 @@ impl Renderer {
         return Renderer {
             rect: RectPipeline::new(device, format),
             stroke: StrokePipeline::new(device, format),
+            path: PathPipeline::new(device, format),
             text: TextPipeline::new(device, format),
             image: ImagePipeline::new(device, format),
             layer: LayerPipeline::new(device, format),
@@ -81,6 +86,8 @@ impl Renderer {
         self.rect
             .set_viewport(queue, viewport.width * scale, viewport.height * scale);
         self.stroke
+            .set_viewport(queue, viewport.width * scale, viewport.height * scale);
+        self.path
             .set_viewport(queue, viewport.width * scale, viewport.height * scale);
         self.text
             .set_viewport(queue, viewport.width * scale, viewport.height * scale);
@@ -131,6 +138,30 @@ impl Renderer {
             }
         }
         self.stroke.upload_instances(device, queue, &strokes);
+        // Path fills: triangulate each ring and merge into one vertex +
+        // index pair. The draw count lives in the pipeline (the triangle
+        // count is not a pure function of the scene — ear clipping decides
+        // it), so `render` reads it from there.
+        let mut vertices: Vec<PathVertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        for path in &scene.paths {
+            for loop_points in &path.loops {
+                let triangles = nui_core::earcut::triangulate(loop_points);
+                if triangles.is_empty() {
+                    continue;
+                }
+                let base = vertices.len() as u32;
+                for point in loop_points {
+                    vertices.push(PathVertex::from_dp(point.x, point.y, path.fill, scale));
+                }
+                for triangle in triangles {
+                    indices.push(base + triangle[0]);
+                    indices.push(base + triangle[1]);
+                    indices.push(base + triangle[2]);
+                }
+            }
+        }
+        self.path.upload(device, queue, &vertices, &indices);
         // Images: upload not-yet-uploaded textures, then expand draws.
         for (key, decoded) in decoded_images {
             if !self.image.has_texture(key) {
@@ -166,11 +197,13 @@ impl Renderer {
         }
     }
 
-    /// Encodes the draw commands for the current frame: rects, then strokes,
+    /// Encodes the draw commands for the current frame: rects, then path
+    /// fills, then strokes (strokes sit on top of the fills they outline),
     /// then images, then glyphs (document paint order within each list).
     /// Layers must be prepared first — use [`Renderer::render_to_view`].
     pub fn render<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>, scene: &Scene) {
         self.rect.render(pass, scene.rects.len() as u32);
+        self.path.render(pass);
         // Segment count must match what `prepare` uploaded: one instance
         // per consecutive point pair.
         let stroke_count: usize = scene

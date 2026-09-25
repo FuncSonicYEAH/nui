@@ -13,10 +13,12 @@
 
 pub mod color;
 pub mod duration;
+pub mod earcut;
 pub mod error;
 pub mod event;
 pub mod geometry;
 pub mod length;
+pub mod path;
 pub mod value;
 
 pub use color::Color;

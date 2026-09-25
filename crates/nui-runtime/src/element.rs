@@ -98,6 +98,10 @@ pub struct Element {
     /// Host behavior of a custom Rust component instance (plan §5 宿主
     /// 互操作), created from the registry at instantiation.
     pub behavior: Option<Box<dyn crate::registry::ElementBehavior>>,
+    /// Shared command buffer when the element is a `Canvas` (FUTURE batch
+    /// 3): the host behavior paints through [`crate::canvas::CanvasPainter`]
+    /// and the scene builder interprets the ops. Clones share the buffer.
+    pub canvas: Option<crate::canvas::CanvasPainter>,
     /// Whether the element participates in Tab focus cycling.
     pub focusable: bool,
     /// Editing state when this element is a `TextInput` (M7).
@@ -140,6 +144,7 @@ impl Element {
             for_binding: None,
             for_scope: None,
             behavior: None,
+            canvas: None,
             focusable: false,
             text_input: None,
         };
