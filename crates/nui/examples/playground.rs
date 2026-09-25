@@ -169,12 +169,9 @@ fn snapshot_mode() {
             &scene,
             Some(text),
             &std::collections::HashMap::new(),
-            wgpu::Color {
-                r: 0.08,
-                g: 0.09,
-                b: 0.11,
-                a: 1.0,
-            },
+            // Shared with the host: linear-RGB #14171c (wgpu::Color is
+            // linear for sRGB targets).
+            nui::host::CLEAR_COLOR,
         );
         // Read back and save.
         let width = physical.width as u32;

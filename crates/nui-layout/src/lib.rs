@@ -107,6 +107,18 @@ fn style_for(element: &Element) -> Style {
     } else {
         (taffy::Size { width, height }, None)
     };
+    // Window IS the viewport: it always fills the window regardless of its
+    // declared width/height (those document the requested initial size; the
+    // real initial size comes from the host, and a resized window must not
+    // leave a band of clear color beside the root — plan §M11).
+    let size = if element.ty == "Window" {
+        taffy::Size {
+            width: taffy::prelude::Dimension::percent(1.0),
+            height: taffy::prelude::Dimension::percent(1.0),
+        }
+    } else {
+        size
+    };
     let mut style = Style {
         padding: taffy::Rect {
             left: length_value(padding),
@@ -373,6 +385,25 @@ mod tests {
         layout(&mut tree, nui_core::Size::new(400.0, 400.0));
         assert_eq!(tree.arena[first].get("x"), Some(&Value::Float(8.0)));
         assert_eq!(tree.arena[first].get("y"), Some(&Value::Float(8.0)));
+    }
+
+    #[test]
+    fn window_root_fills_the_viewport() {
+        // Window IS the viewport: its declared width/height must not pin
+        // the root when the real window differs (resize, host size).
+        let mut tree = ElementTree::new();
+        let mut window = Element::new("Window", None);
+        window.set("width", Value::Length(Length::Dp(480.0)));
+        window.set("height", Value::Length(Length::Dp(620.0)));
+        let window_id = tree.insert(window);
+        tree.push_root(window_id);
+
+        layout(&mut tree, nui_core::Size::new(800.0, 600.0));
+        let root = &tree.arena[window_id];
+        assert_eq!(root.get("width"), Some(&Value::Float(800.0)));
+        assert_eq!(root.get("height"), Some(&Value::Float(600.0)));
+        assert_eq!(root.get("x"), Some(&Value::Float(0.0)));
+        assert_eq!(root.get("y"), Some(&Value::Float(0.0)));
     }
 }
 

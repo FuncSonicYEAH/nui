@@ -12,6 +12,17 @@ use crate::app::hit_test;
 
 use nui_render::{Renderer, SceneBuilder};
 
+/// The default window clear color, `#14171c` in **linear** RGB —
+/// `wgpu::Color` is linear for sRGB targets, so the sRGB values
+/// (0.08/0.09/0.11) must be converted first. Share this instead of
+/// re-deriving it (a raw sRGB value renders as a darker seam).
+pub const CLEAR_COLOR: wgpu::Color = wgpu::Color {
+    r: 0.0069,
+    g: 0.0082,
+    b: 0.0117,
+    a: 1.0,
+};
+
 /// The element hit by a pointer event (opaque handle for dispatch).
 #[derive(Debug, Clone, Copy)]
 pub struct HitTarget {
@@ -566,14 +577,7 @@ impl WindowHost {
             &scene,
             Some(&mut self.text),
             &self.image_store,
-            // wgpu::Color is linear for sRGB targets; 0.08/0.09/0.11 are
-            // the intended sRGB values.
-            wgpu::Color {
-                r: 0.0069,
-                g: 0.0082,
-                b: 0.0117,
-                a: 1.0,
-            },
+            CLEAR_COLOR,
         );
         // wgpu 30 presents through the queue (the texture drops as presented).
         self.queue.present(frame);

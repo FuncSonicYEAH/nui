@@ -269,16 +269,11 @@ impl SceneBuilder {
         if opacity <= 0.0 {
             return;
         }
-        let fill = match color_property(element, "fill") {
-            Some(color) => color,
-            // Viewports and virtualized spacers are not surfaces.
-            None if element.ty == "Scroll"
-                || element.ty == "Spacer"
-                || element.ty == "ListView" =>
-            {
-                return;
-            }
-            None => Color::BLACK,
+        let Some(fill) = color_property(element, "fill") else {
+            // No fill = no surface (Qt Quick Item semantics): Window,
+            // Column, Row, Scroll and Spacer are transparent containers;
+            // the host clear color shows through.
+            return;
         };
         let corner_radius = f_property(element, "radius").unwrap_or(0.0);
         let shadow = color_property(element, "shadow.color").map(|color| {
@@ -646,6 +641,7 @@ mod tests {
         element.set("y", Value::Float(6.0));
         element.set("width", Value::Length(nui_core::Length::Dp(width)));
         element.set("height", Value::Length(nui_core::Length::Dp(height)));
+        element.set("fill", Value::Color(Color::from_rgb8(40, 40, 40)));
         return element;
     }
 
@@ -697,6 +693,33 @@ mod tests {
         );
         assert_eq!(scene.rects.len(), 1);
         assert_eq!(scene.sources, vec![visible]);
+    }
+
+    #[test]
+    fn fill_less_containers_paint_nothing() {
+        // Qt Quick Item semantics: no `fill` = transparent, for every
+        // container type (the host clear color shows through). Regression
+        // guard for the old Color::BLACK fallback that made Window/Column
+        // opaque black surfaces.
+        let mut tree = ElementTree::new();
+        let window = tree.insert(Element::new("Window", None));
+        let mut column = Element::new("Column", None);
+        column.set("width", Value::Float(100.0));
+        column.set("height", Value::Float(50.0));
+        let column_id = tree.insert(column);
+        tree.append_child(window, column_id);
+        tree.push_root(window);
+
+        let scene = SceneBuilder::build_with_context(
+            &tree,
+            &mut nui_text::TextSystem::with_embedded_font(),
+            SceneContext {
+                focused: None,
+                image_keys: &HashMap::new(),
+            },
+        );
+        assert_eq!(scene.rects.len(), 0);
+        assert_eq!(scene.sources.len(), 0);
     }
 
     #[test]
