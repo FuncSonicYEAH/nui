@@ -1,0 +1,14 @@
+// nui-preview 演示文档:保存此文件即热重载
+component Counter {
+    property count: Int = 0
+
+    Window(id = root) {
+        Column(id = content, spacing = 12dp, padding = 24dp) {
+            Rectangle(id = panel, fill = #336699, radius = 12dp, opacity = 0.25)
+            Text(id = label, content <- "已点击 {count} 次", width = 200dp, height = 40dp)
+            Button(id = increment, label = "+1", width = 120dp, height = 44dp) {
+                on click => count += 1
+            }
+        }
+    }
+}

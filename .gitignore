@@ -1,0 +1,25 @@
+# —— Rust / Cargo ——
+/target/
+**/*.rs.bk
+
+# —— 演示与验收产物 ——
+# playground --snap 会在 cwd 下生成 PNG；用不带斜杠的 snapshots/，
+# 这样在仓库根或 crates/nui 下运行都会命中
+snapshots/
+# 离屏测试的图片写在系统临时目录（std::env::temp_dir），无需忽略
+
+# —— 打包产物（M13：Inno Setup / .app / AppImage）——
+/dist/
+
+# —— 本地工具状态（不是项目内容）——
+.workbuddy/
+.freebuff/
+
+# —— 编辑器 / 操作系统 ——
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# 注意：Cargo.lock 有意纳入版本库（workspace 内含可执行产物）

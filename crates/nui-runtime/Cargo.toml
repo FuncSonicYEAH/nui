@@ -1,0 +1,16 @@
+[package]
+name = "nui-runtime"
+description = "nui runtime: element tree, binding engine, signals, state machines, animation, and the Model protocol"
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nui-core.workspace = true
+nui-compiler.workspace = true
+nui-syntax.workspace = true
+slotmap = "1"
+
+[lints]
+workspace = true

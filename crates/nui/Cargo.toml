@@ -1,0 +1,27 @@
+[package]
+name = "nui"
+description = "nui framework facade: Application/Window/run loop and the built-in component set"
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nui-core.workspace = true
+nui-syntax.workspace = true
+nui-compiler.workspace = true
+nui-runtime.workspace = true
+nui-layout.workspace = true
+nui-text.workspace = true
+nui-render.workspace = true
+nui-winit.workspace = true
+pollster = "0.4"
+winit = "0.30"
+arboard = "3"
+wgpu = "30"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }

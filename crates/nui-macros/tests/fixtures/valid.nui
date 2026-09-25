@@ -1,0 +1,7 @@
+component Embedded {
+    property count: Int = 0
+
+    Window(id = root) {
+        Text(content <- "count: {count}")
+    }
+}

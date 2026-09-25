@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+
+  # plan.md D13：平台差异只允许出现在 nui-winit 与打包层
+  platform-cfg-lint:
+    name: platform cfg confinement (D13)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Forbid cfg(target_os) outside crates/nui-winit
+        run: |
+          set -euo pipefail
+          offenders=$(grep -rn 'cfg(target_os' crates tools --include='*.rs' | grep -v '^crates/nui-winit/' || true)
+          if [ -n "$offenders" ]; then
+            echo "::error::cfg(target_os) outside crates/nui-winit is forbidden (plan.md D13)"
+            echo "$offenders"
+            exit 1
+          fi

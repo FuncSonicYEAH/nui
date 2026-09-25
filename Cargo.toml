@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "tools/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+nui = { path = "crates/nui" }
+nui-core = { path = "crates/nui-core" }
+nui-syntax = { path = "crates/nui-syntax" }
+nui-compiler = { path = "crates/nui-compiler" }
+nui-runtime = { path = "crates/nui-runtime" }
+nui-layout = { path = "crates/nui-layout" }
+nui-text = { path = "crates/nui-text" }
+nui-render = { path = "crates/nui-render" }
+nui-winit = { path = "crates/nui-winit" }
+nui-macros = { path = "crates/nui-macros" }
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+implicit_return = "warn"
+# 与 implicit_return 互斥：项目规范强制显式 return（rust-quality §2）
+needless_return = "allow"
+unwrap_used = "warn"

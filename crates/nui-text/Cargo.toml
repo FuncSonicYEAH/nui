@@ -1,0 +1,17 @@
+[package]
+name = "nui-text"
+description = "nui text: cosmic-text shaping, line breaking, and glyph atlas"
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nui-core.workspace = true
+cosmic-text = "0.19"
+fontdb = "0.23"
+swash = "0.2"
+etagere = "0.3"
+
+[lints]
+workspace = true

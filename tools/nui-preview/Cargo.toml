@@ -1,0 +1,19 @@
+[package]
+name = "nui-preview"
+description = "nui hot-reload previewer"
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nui-preview"
+path = "src/main.rs"
+
+[dependencies]
+nui.workspace = true
+nui-core.workspace = true
+notify = "8"
+
+[lints]
+workspace = true

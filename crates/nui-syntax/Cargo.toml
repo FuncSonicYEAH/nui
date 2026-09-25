@@ -1,0 +1,13 @@
+[package]
+name = "nui-syntax"
+description = "nui-lang 词法/语法分析：AST 与 span 诊断"
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nui-core.workspace = true
+
+[lints]
+workspace = true

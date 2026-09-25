@@ -1,0 +1,16 @@
+[package]
+name = "nui-layout"
+description = "nui layout: taffy flex/grid adapter, dp conversion, and geometry write-back"
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nui-core.workspace = true
+nui-runtime.workspace = true
+nui-text.workspace = true
+taffy = "0.9"
+
+[lints]
+workspace = true
