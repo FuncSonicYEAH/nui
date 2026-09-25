@@ -23,16 +23,29 @@ pub struct AppConfig {
     pub size: Size,
     /// Window title.
     pub title: String,
+    /// Whether the user may resize the window (default `true`). Note: on
+    /// Wayland this is best-effort — the protocol has no way to forbid
+    /// client-side resizes, so winit disables maximize and lets the
+    /// compositor decide (plan §13 已知限制).
+    pub resizable: bool,
 }
 
 impl AppConfig {
-    /// Creates a config with a title and size.
+    /// Creates a config with a title and size; the window stays resizable
+    /// unless [`AppConfig::with_resizable`] says otherwise.
     pub fn new(source: impl Into<String>, title: impl Into<String>, size: Size) -> AppConfig {
         return AppConfig {
             source: source.into(),
             title: title.into(),
             size,
+            resizable: true,
         };
+    }
+
+    /// Builder: fixes whether the user may resize the window.
+    pub fn with_resizable(mut self, resizable: bool) -> AppConfig {
+        self.resizable = resizable;
+        return self;
     }
 }
 
@@ -143,6 +156,7 @@ impl ApplicationHandler for NuiAppHandler {
         }
         let attributes = Window::default_attributes()
             .with_title(self.config.title.clone())
+            .with_resizable(self.config.resizable)
             .with_inner_size(winit::dpi::LogicalSize::new(
                 self.config.size.width,
                 self.config.size.height,

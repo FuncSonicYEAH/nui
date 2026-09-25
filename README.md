@@ -61,6 +61,9 @@ cargo run -p nui --example playground --release -- --snap
 
 # hot reload: edit the .nui file while it runs
 cargo run -p nui-preview -- examples/counter.nui
+
+# fixed-size window (no user resizing; best-effort on Wayland)
+cargo run -p nui-preview -- examples/counter.nui --no-resize
 ```
 
 `NUI_BACKEND` forces a wgpu backend: `vulkan`, `gl`, `dx12`, `metal` or

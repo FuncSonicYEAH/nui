@@ -104,7 +104,7 @@ fn main() {
             .unwrap_or_default()
             .to_string_lossy()
     );
-    let config = AppConfig::new(source, title, arguments.size);
+    let config = AppConfig::new(source, title, arguments.size).with_resizable(arguments.resizable);
     let watcher = FileWatcher::new(arguments.path);
     return nui::Application::new(config)
         .with_watcher(Box::new(watcher))
@@ -114,13 +114,16 @@ fn main() {
 struct Arguments {
     path: PathBuf,
     size: Size,
+    resizable: bool,
 }
 
-/// Minimal CLI parsing: positional path plus optional `--width`/`--height`.
+/// Minimal CLI parsing: positional path plus optional
+/// `--width`/`--height`/`--no-resize`.
 fn parse_arguments() -> Option<Arguments> {
     let mut args = std::env::args().skip(1);
     let path = PathBuf::from(args.next()?);
     let mut size = Size::new(420.0, 300.0);
+    let mut resizable = true;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--width" => {
@@ -129,13 +132,20 @@ fn parse_arguments() -> Option<Arguments> {
             "--height" => {
                 size.height = args.next()?.parse().ok()?;
             }
+            "--no-resize" => {
+                resizable = false;
+            }
             other => {
                 eprintln!("nui-preview: unknown argument `{other}`");
                 return None;
             }
         }
     }
-    return Some(Arguments { path, size });
+    return Some(Arguments {
+        path,
+        size,
+        resizable,
+    });
 }
 
 #[cfg(test)]
