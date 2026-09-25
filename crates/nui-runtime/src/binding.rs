@@ -610,6 +610,12 @@ impl Engine {
     /// Advances timer nodes: fires each running timer whose accumulated
     /// interval elapsed, emitting the `timer` signal on the timer element.
     /// Returns the fired timer element ids.
+    ///
+    /// Declared `running`/`interval` properties are the reactive source of
+    /// truth: when a `Timer` declares `running` (optionally bound, e.g.
+    /// `running <- busy`), it overrides the timer state every tick, so
+    /// bindings drive start/stop. A `Timer` without a declared `running`
+    /// property stays fully method-controlled (`timer.start()`/`stop()`).
     pub fn tick_timers(
         &mut self,
         tree: &mut ElementTree,
@@ -617,6 +623,32 @@ impl Engine {
         elapsed: &mut HashMap<ElementId, f64>,
     ) -> Result<Vec<ElementId>, EvalError> {
         let mut fired = Vec::new();
+        // Property overrides first (read-only sweep, then write).
+        let mut overrides: Vec<(ElementId, Option<nui_core::Duration>)> = Vec::new();
+        tree.visit_pre_order(|id, element| {
+            if element.ty != "Timer" {
+                return;
+            }
+            let Some(running) = element
+                .get("running")
+                .and_then(|value| return value.as_bool().ok())
+            else {
+                return;
+            };
+            let interval = element
+                .get("interval")
+                .and_then(|value| return value.as_duration().ok())
+                .unwrap_or_else(|| return nui_core::Duration::from_millis(0.0));
+            let state = if running && interval.as_millis_f64() > 0.0 {
+                Some(interval)
+            } else {
+                None
+            };
+            overrides.push((id, state));
+        });
+        for (id, state) in overrides {
+            tree.arena[id].timer_interval = state;
+        }
         let mut ids: Vec<ElementId> = Vec::new();
         tree.visit_pre_order(|id, element| {
             if element.timer_interval.is_some() {
@@ -1715,5 +1747,67 @@ mod tests {
         };
         let value = engine.evaluate_free(&mut tree, root, &expr).unwrap();
         assert!((value.as_f64().unwrap() - 1.0).abs() < 1e-12);
+    }
+
+    fn timer_tree(running: Option<bool>) -> (ElementTree, crate::element::ElementId) {
+        let mut tree = ElementTree::new();
+        let mut ticker = Element::new("Timer", None);
+        ticker.set("interval", Value::Duration(nui_core::Duration::from_millis(100.0)));
+        if let Some(running) = running {
+            ticker.set("running", Value::Bool(running));
+        }
+        let id = tree.insert(ticker);
+        tree.push_root(id);
+        return (tree, id);
+    }
+
+    #[test]
+    fn declared_running_property_drives_the_timer() {
+        // `Timer { interval = 100ms, running = true }` loops forever: the
+        // declared properties override the state every tick and the timer
+        // keeps firing past its first interval.
+        let (mut tree, id) = timer_tree(Some(true));
+        let mut engine = Engine::new();
+        let mut elapsed = HashMap::new();
+        let fired = engine
+            .tick_timers(&mut tree, nui_core::Duration::from_millis(250.0), &mut elapsed)
+            .unwrap();
+        assert_eq!(fired.len(), 2, "250ms crosses two 100ms intervals");
+        let fired = engine
+            .tick_timers(&mut tree, nui_core::Duration::from_millis(150.0), &mut elapsed)
+            .unwrap();
+        assert_eq!(fired.len(), 2, "leftover 50ms + 150ms crosses two more");
+        assert!(tree.arena[id].timer_interval.is_some(), "keeps running");
+    }
+
+    #[test]
+    fn running_false_stops_a_declared_timer() {
+        let (mut tree, id) = timer_tree(Some(false));
+        let mut engine = Engine::new();
+        let mut elapsed = HashMap::new();
+        let fired = engine
+            .tick_timers(&mut tree, nui_core::Duration::from_millis(500.0), &mut elapsed)
+            .unwrap();
+        assert!(fired.is_empty(), "running = false never fires");
+        assert!(tree.arena[id].timer_interval.is_none());
+    }
+
+    #[test]
+    fn method_controlled_timers_survive_without_declared_running() {
+        // No `running` property: `timer.start()`/`stop()` own the state.
+        let (mut tree, id) = timer_tree(None);
+        tree.arena[id].timer_interval = Some(nui_core::Duration::from_millis(100.0));
+        let mut engine = Engine::new();
+        let mut elapsed = HashMap::new();
+        let fired = engine
+            .tick_timers(&mut tree, nui_core::Duration::from_millis(120.0), &mut elapsed)
+            .unwrap();
+        assert_eq!(fired, vec![id], "method-started timers keep working");
+        // A binding write to `running` takes over from that point on.
+        tree.arena[id].set("running", Value::Bool(false));
+        let fired = engine
+            .tick_timers(&mut tree, nui_core::Duration::from_millis(120.0), &mut elapsed)
+            .unwrap();
+        assert!(fired.is_empty(), "declared running = false stops it");
     }
 }

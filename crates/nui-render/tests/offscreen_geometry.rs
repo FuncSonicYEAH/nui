@@ -261,6 +261,84 @@ fn arc_quarter_sweep_stays_within_its_angles() {
 }
 
 #[test]
+fn waveline_levels_draw_a_flat_line_and_mirror_adds_the_twin() {
+    // levels = "1 1" (all full): the main line sits exactly `amplitude`
+    // above the middle (60/2 - 15 = 15); mirror = true adds the twin at 45.
+    let build = |mirror: bool| {
+        let mut tree = ElementTree::new();
+        let mut root = Element::new("Column", None);
+        root.set("width", Value::Float(100.0));
+        root.set("height", Value::Float(60.0));
+        let root_id = tree.insert(root);
+        tree.push_root(root_id);
+        let mut wave = Element::new("Waveline", None);
+        wave.set("width", Value::Float(100.0));
+        wave.set("height", Value::Float(60.0));
+        wave.set("amplitude", Value::Float(15.0));
+        wave.set("levels", Value::String("1 1".to_string()));
+        wave.set("stroke.width", Value::Float(6.0));
+        wave.set("color", Value::Color(Color::from_rgb8(255, 0, 0)));
+        if mirror {
+            wave.set("mirror", Value::Bool(true));
+        }
+        let wave_id = tree.insert(wave);
+        tree.append_child(root_id, wave_id);
+        return tree;
+    };
+
+    let mut single = build(false);
+    let (data, stride) = render_pixels(&mut single, nui_core::Size::new(100.0, 60.0));
+    let main = pixel(&data, stride, 50, 15);
+    assert!(main[0] > 180, "full-level line is red, got {main:?}");
+    let below = pixel(&data, stride, 50, 45);
+    assert!(below[0] < 60, "no twin without mirror, got {below:?}");
+
+    let mut mirrored = build(true);
+    let (data, stride) = render_pixels(&mut mirrored, nui_core::Size::new(100.0, 60.0));
+    let top = pixel(&data, stride, 50, 15);
+    let twin = pixel(&data, stride, 50, 45);
+    assert!(top[0] > 180, "mirrored main line is red, got {top:?}");
+    assert!(twin[0] > 180, "mirrored twin is red, got {twin:?}");
+}
+
+#[test]
+fn waveline_wave_stays_within_its_amplitude_envelope() {
+    // Procedural wave (no levels): every x column must stroke somewhere
+    // within amplitude + stroke width of the middle, and nothing may paint
+    // outside the envelope.
+    let mut tree = ElementTree::new();
+    let mut root = Element::new("Column", None);
+    root.set("width", Value::Float(100.0));
+    root.set("height", Value::Float(60.0));
+    let root_id = tree.insert(root);
+    tree.push_root(root_id);
+    let mut wave = Element::new("Waveline", None);
+    wave.set("width", Value::Float(100.0));
+    wave.set("height", Value::Float(60.0));
+    wave.set("amplitude", Value::Float(10.0));
+    wave.set("frequency", Value::Float(2.0));
+    wave.set("phase", Value::Float(40.0));
+    wave.set("stroke.width", Value::Float(4.0));
+    wave.set("color", Value::Color(Color::from_rgb8(255, 0, 0)));
+    let wave_id = tree.insert(wave);
+    tree.append_child(root_id, wave_id);
+
+    let (data, stride) = render_pixels(&mut tree, nui_core::Size::new(100.0, 60.0));
+    let mut stroked = 0;
+    for y in 21..39 {
+        let probe = pixel(&data, stride, 50, y);
+        if probe[0] > 180 {
+            stroked += 1;
+        }
+    }
+    assert!(stroked > 0, "the wave crosses the probe column");
+    let far_above = pixel(&data, stride, 50, 5);
+    let far_below = pixel(&data, stride, 50, 55);
+    assert!(far_above[0] < 60, "nothing above the envelope, got {far_above:?}");
+    assert!(far_below[0] < 60, "nothing below the envelope, got {far_below:?}");
+}
+
+#[test]
 fn clip_cuts_the_polyline() {
     // `clip = true` on the 60-wide root clips the inherited clip onto the
     // child: the line stops at x = 60 even though it extends to 90.

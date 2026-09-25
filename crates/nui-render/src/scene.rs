@@ -281,6 +281,9 @@ impl SceneBuilder {
             "Arc" => {
                 self.collect_arc_one(element, x, y, clip);
             }
+            "Waveline" => {
+                self.collect_waveline_one(element, bounds, clip);
+            }
             _ => {
                 self.draw_rect(element, id, bounds, clip);
             }
@@ -677,6 +680,47 @@ impl SceneBuilder {
         });
     }
 
+    /// Extracts one `Waveline` element's stroke: a procedural multi-harmonic
+    /// wave, or a data-driven line when `levels` is set (Cava-style
+    /// normalized samples, the iNiR visualizer look). `mirror = true` adds
+    /// the point-reflected twin. Both render through the stroke pipeline.
+    fn collect_waveline_one(
+        &mut self,
+        element: &nui_runtime::Element,
+        bounds: Rect,
+        clip: Option<ClipDraw>,
+    ) {
+        let Some((width, cap, color)) = stroke_style_of(element) else {
+            return;
+        };
+        let amplitude = f_property(element, "amplitude").unwrap_or(10.0);
+        if bounds.size.width <= 0.0 || amplitude <= 0.0 {
+            return;
+        }
+        let frequency = f_property(element, "frequency").unwrap_or(2.0);
+        let phase = f_property(element, "phase").unwrap_or(0.0);
+        // ~3dp between samples is smooth enough at stroke widths of 1-8dp.
+        let samples = (bounds.size.width / 3.0).clamp(24.0, 160.0) as usize;
+        let mirror = bool_property(element, "mirror");
+        let levels = element
+            .get("levels")
+            .and_then(|value| return value.as_str().ok())
+            .map(parse_levels)
+            .filter(|levels| return levels.len() >= 2);
+        let points = match &levels {
+            Some(levels) => level_points(bounds, amplitude, levels, samples, false),
+            None => wave_points(bounds, amplitude, frequency, phase, samples, false),
+        };
+        self.push_stroke(points, width, cap, color, clip, bounds.origin);
+        if mirror {
+            let twin = match &levels {
+                Some(levels) => level_points(bounds, amplitude, levels, samples, true),
+                None => wave_points(bounds, amplitude, frequency, phase, samples, true),
+            };
+            self.push_stroke(twin, width, cap, color, clip, bounds.origin);
+        }
+    }
+
     /// Shapes one line of glyphs and pushes the quads.
     #[allow(clippy::too_many_arguments)]
     fn push_glyphs(
@@ -828,6 +872,74 @@ fn arc_points(cx: f32, cy: f32, radius: f32, start_deg: f32, end_deg: f32) -> Ve
     };
     if closed {
         points.pop();
+    }
+    return points;
+}
+
+/// Parses `"0.2 0.5 1.0"` normalized samples (whitespace-separated, values
+/// clamped to 0..=1). Malformed entries are skipped.
+fn parse_levels(text: &str) -> Vec<f32> {
+    return text
+        .split_whitespace()
+        .filter_map(|token| return token.parse::<f32>().ok())
+        .map(|level| return level.clamp(0.0, 1.0))
+        .collect();
+}
+
+/// Builds a wave polyline across `bounds`: three sine harmonics (weights
+/// sum to 1.0) give the line an organic, Cava-idle-like motion instead of
+/// a geometric sine. Points are element-local around the vertical middle;
+/// `flip` reflects the line for `mirror = true`.
+fn wave_points(
+    bounds: Rect,
+    amplitude: f32,
+    frequency: f32,
+    phase_deg: f32,
+    samples: usize,
+    flip: bool,
+) -> Vec<Point> {
+    let width = bounds.size.width;
+    let center = bounds.size.height * 0.5;
+    let sign = if flip { 1.0 } else { -1.0 };
+    let phase = phase_deg.to_radians();
+    let mut points = Vec::with_capacity(samples + 1);
+    for step in 0..=samples {
+        let t = step as f32 / samples as f32;
+        let angle = t * frequency * std::f32::consts::TAU + phase;
+        let wave = angle.sin() * 0.62
+            + (angle * 2.3 + 1.7).sin() * 0.23
+            + (angle * 0.71 + 4.1).sin() * 0.15;
+        points.push(Point::new(t * width, center + sign * wave * amplitude));
+    }
+    return points;
+}
+
+/// Builds a polyline from normalized `levels` (0..=1, linear interpolation
+/// between samples): `level * amplitude` above the middle, mirrored below
+/// when `flip`. This is the data-driven Cava mode.
+fn level_points(
+    bounds: Rect,
+    amplitude: f32,
+    levels: &[f32],
+    samples: usize,
+    flip: bool,
+) -> Vec<Point> {
+    let width = bounds.size.width;
+    let center = bounds.size.height * 0.5;
+    let sign = if flip { 1.0 } else { -1.0 };
+    let count = levels.len();
+    let mut points = Vec::with_capacity(samples + 1);
+    for step in 0..=samples {
+        let t = step as f32 / samples as f32;
+        let index = t * (count - 1) as f32;
+        let lower = index.floor() as usize;
+        let upper = (lower + 1).min(count - 1);
+        let mix = index - lower as f32;
+        let level = levels[lower] + (levels[upper] - levels[lower]) * mix;
+        points.push(Point::new(
+            t * width,
+            center + sign * level.clamp(0.0, 1.0) * amplitude,
+        ));
     }
     return points;
 }
@@ -1068,6 +1180,99 @@ mod tests {
         arc_no_radius.set("end", Value::Float(180.0));
         let arc_id = tree.insert(arc_no_radius);
         tree.push_root(arc_id);
+        let scene = SceneBuilder::build_with_context(
+            &tree,
+            &mut nui_text::TextSystem::with_embedded_font(),
+            SceneContext {
+                focused: None,
+                image_keys: &HashMap::new(),
+            },
+        );
+        assert_eq!(scene.polylines.len(), 0);
+    }
+
+    #[test]
+    fn wave_points_stay_in_the_envelope_and_mirror_symmetrically() {
+        let bounds = Rect::new(Point::ZERO, Size::new(90.0, 60.0));
+        let wave = wave_points(bounds, 10.0, 2.0, 0.0, 30, false);
+        assert_eq!(wave.len(), 31);
+        for point in &wave {
+            assert!(
+                (point.y - 30.0).abs() <= 10.0 + 1e-3,
+                "harmonics must not exceed the amplitude"
+            );
+        }
+        let flipped = wave_points(bounds, 10.0, 2.0, 0.0, 30, true);
+        for (main, twin) in wave.iter().zip(&flipped) {
+            assert_eq!(main.x, twin.x);
+            assert!(
+                (main.y + twin.y - 60.0).abs() < 1e-3,
+                "mirror twins reflect about the middle"
+            );
+        }
+        // Full levels draw a flat line exactly `amplitude` above the middle.
+        let flat = level_points(bounds, 15.0, &[1.0, 1.0], 30, false);
+        assert!(flat.iter().all(|point| return (point.y - 15.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn waveline_element_becomes_one_or_two_strokes() {
+        let build = |mirror: bool| {
+            let mut tree = ElementTree::new();
+            let mut wave = Element::new("Waveline", None);
+            wave.set("x", Value::Float(5.0));
+            wave.set("width", Value::Float(100.0));
+            wave.set("height", Value::Float(60.0));
+            wave.set("amplitude", Value::Float(10.0));
+            wave.set("stroke.width", Value::Float(2.0));
+            wave.set("color", Value::Color(Color::from_rgb8(255, 0, 0)));
+            if mirror {
+                wave.set("mirror", Value::Bool(true));
+            }
+            let id = tree.insert(wave);
+            tree.push_root(id);
+            return SceneBuilder::build_with_context(
+                &tree,
+                &mut nui_text::TextSystem::with_embedded_font(),
+                SceneContext {
+                    focused: None,
+                    image_keys: &HashMap::new(),
+                },
+            );
+        };
+        let single = build(false);
+        assert_eq!(single.polylines.len(), 1);
+        // Points are element-local, offset by the origin (5, 0); the wave
+        // starts somewhere inside the amplitude envelope around the middle.
+        let first = single.polylines[0].points[0];
+        assert_eq!(first.x, 5.0);
+        assert!((first.y - 30.0).abs() <= 10.0 + 1e-3, "inside the envelope");
+        assert_eq!(single.polylines[0].points.last().unwrap().x, 105.0);
+        let mirrored = build(true);
+        assert_eq!(mirrored.polylines.len(), 2, "mirror adds the twin");
+    }
+
+    #[test]
+    fn levels_parse_clamps_and_skip_garbage() {
+        assert_eq!(parse_levels("0.5 2 -0.3 bad 1"), vec![0.5, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn waveline_without_width_or_amplitude_is_skipped() {
+        let mut tree = ElementTree::new();
+        let mut no_width = Element::new("Waveline", None);
+        no_width.set("height", Value::Float(60.0));
+        no_width.set("amplitude", Value::Float(10.0));
+        no_width.set("stroke.width", Value::Float(2.0));
+        let no_width_id = tree.insert(no_width);
+        tree.push_root(no_width_id);
+        let mut zero_amplitude = Element::new("Waveline", None);
+        zero_amplitude.set("width", Value::Float(100.0));
+        zero_amplitude.set("height", Value::Float(60.0));
+        zero_amplitude.set("amplitude", Value::Float(0.0));
+        zero_amplitude.set("stroke.width", Value::Float(2.0));
+        let zero_amplitude_id = tree.insert(zero_amplitude);
+        tree.push_root(zero_amplitude_id);
         let scene = SceneBuilder::build_with_context(
             &tree,
             &mut nui_text::TextSystem::with_embedded_font(),

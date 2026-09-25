@@ -227,13 +227,28 @@ impl WindowHost {
         return self.needs_redraw;
     }
 
-    /// Whether dirty bindings, pending model syncs, animations, or a redraw
-    /// remain (frame scheduling input, plan §2 on-demand redraw).
+    /// Whether dirty bindings, pending model syncs, animations, timers, or
+    /// a redraw remain (frame scheduling input, plan §2 on-demand redraw).
+    /// Running timers must keep the loop polling: once the loop falls back
+    /// to `Wait` no frames run, so no timer would ever fire again.
     pub fn has_pending_work(&self) -> bool {
         return self.engine.has_dirty_bindings()
             || self.engine.has_pending_model_sync()
             || self.engine.has_active_animations()
+            || self.has_running_timers()
             || self.needs_redraw;
+    }
+
+    /// Whether any `Timer` node is currently running (its interval is set,
+    /// via a declared `running` property or a `timer.start()` call).
+    fn has_running_timers(&self) -> bool {
+        let mut found = false;
+        self.tree.visit_pre_order(|_id, element| {
+            if element.timer_interval.is_some() {
+                found = true;
+            }
+        });
+        return found;
     }
 
     /// Handles a normalized winit event; returns `true` when consumed as a
