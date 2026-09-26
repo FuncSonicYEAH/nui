@@ -258,14 +258,80 @@ impl ApplicationHandler for NuiAppHandler {
 /// (innermost wins: smaller area = more specific); `Scroll` ancestors
 /// translate their subtree, so scrolled content hit-tests correctly (M9).
 pub fn hit_test(tree: &ElementTree, position: Point) -> Option<crate::host::HitTarget> {
+    return element_bounds_walk(tree, position).map(|(id, _)| {
+        return crate::host::HitTarget { element: id };
+    });
+}
+
+/// The element's absolute dp rect.
+///
+/// Layout writes `x`/`y` **already accumulated** (`nui-layout`'s
+/// `write_back` hands each child its parent's absolute origin as the base),
+/// so an element's own `x`/`y` is its window position — summing the
+/// ancestor chain again double-counts every ancestor's offset.
+///
+/// `scroll_y` is the only per-ancestor adjustment: it is a viewport
+/// translation applied at draw and hit-test time rather than baked into a
+/// child's `y`, so every `Scroll`/`ListView` ancestor shifts the rect up.
+/// This matches [`element_bounds_walk`] and the scene walk, so the two
+/// coordinate paths always agree.
+pub fn element_bounds(tree: &ElementTree, id: nui_runtime::ElementId) -> Option<nui_core::Rect> {
+    let element = &tree.arena[id];
+    let width = f_of(element, "width")?;
+    let height = f_of(element, "height")?;
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let mut origin = Point::new(f_of(element, "x")?, f_of(element, "y")?);
+    let mut current = element.parent;
+    while let Some(handle) = current {
+        let ancestor = &tree.arena[handle];
+        if ancestor.ty == "Scroll" || ancestor.ty == "ListView" {
+            origin = Point::new(
+                origin.x,
+                origin.y - f_of(ancestor, "scroll_y").unwrap_or(0.0),
+            );
+        }
+        current = ancestor.parent;
+    }
+    return Some(nui_core::Rect::new(origin, Size::new(width, height)));
+}
+
+/// Innermost non-empty element rect containing `position`, with its area.
+///
+/// `offset` carries **only the accumulated `Scroll` translation**, never
+/// the element positions: layout writes `x`/`y` already absolute, so each
+/// element's own `x`/`y` is used as-is. (Keeping the offset at zero is why
+/// this path was always right while [`element_bounds`] was not — see its
+/// doc for the double-counting bug.)
+fn element_bounds_walk(
+    tree: &ElementTree,
+    position: Point,
+) -> Option<(nui_runtime::ElementId, f32)> {
     fn walk(
         tree: &ElementTree,
         id: nui_runtime::ElementId,
         offset: Point,
         position: Point,
-        best: &mut Option<(crate::host::HitTarget, f32)>,
+        best: &mut Option<(nui_runtime::ElementId, f32)>,
     ) {
         let element = &tree.arena[id];
+        // Prune what the scene never draws: `visible = false` and closed
+        // overlays drop the whole subtree in the scene walk, and the hit
+        // test must apply the *same* predicate — not "no box, no hit".
+        // `write_back` skips a hidden subtree, so its last laid-out boxes
+        // stay in the element slots; without this prune a hidden page's
+        // stale geometry wins the smallest-area contest and steals the
+        // click (the focus report that motivated the gallery's "a text
+        // field cannot be opened" bug).
+        if !nui_runtime::widget::is_visible(element) {
+            return;
+        }
+        if nui_runtime::widget::is_overlay(element) && !nui_runtime::widget::is_open(element) {
+            return;
+        }
+        // `scroll_y` is the only thing passed down: it translates the
+        // whole subtree without being baked into any child's `y`.
         let scroll = if element.ty == "Scroll" || element.ty == "ListView" {
             f_of(element, "scroll_y").unwrap_or(0.0)
         } else {
@@ -275,7 +341,9 @@ pub fn hit_test(tree: &ElementTree, position: Point) -> Option<crate::host::HitT
         for child in element.children.clone() {
             walk(tree, child, child_offset, position, best);
         }
-        let x = f_of(element, "x").unwrap_or(0.0) + offset.x;
+        // `x`/`y` are absolute already (layout accumulates them), so the
+        // offset stays out of this sum.
+        let x = f_of(element, "x").unwrap_or(0.0);
         let y = f_of(element, "y").unwrap_or(0.0) + offset.y;
         let width = f_of(element, "width").unwrap_or(0.0);
         let height = f_of(element, "height").unwrap_or(0.0);
@@ -286,15 +354,15 @@ pub fn hit_test(tree: &ElementTree, position: Point) -> Option<crate::host::HitT
                 .as_ref()
                 .is_none_or(|(_, best_area)| return area < *best_area)
             {
-                *best = Some((crate::host::HitTarget { element: id }, area));
+                *best = Some((id, area));
             }
         }
     }
-    let mut best: Option<(crate::host::HitTarget, f32)> = None;
+    let mut best: Option<(nui_runtime::ElementId, f32)> = None;
     for root in tree.roots.clone() {
         walk(tree, root, Point::ZERO, position, &mut best);
     }
-    return best.map(|(target, _)| return target);
+    return best;
 }
 
 /// Reads an f32 property.

@@ -121,6 +121,9 @@ pub enum NodeArg {
     Id(Ident),
     /// Property assignment.
     Property(PropertyAssignment),
+    /// Event handler (`on click => ...`), allowed among the arguments so
+    /// compact widgets fit on one line.
+    Handler(Handler),
 }
 
 /// Members allowed inside a node body.

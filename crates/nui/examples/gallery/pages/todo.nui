@@ -1,0 +1,31 @@
+// Todo list — `For` rows over a host model, with custom Rust components
+// (`TodoCheckbox` / `TodoRemove`) that mutate that model from their
+// behavior, a `when`-style done colour, and an animated `tween` on each
+// row's opacity.
+//
+// The two custom types are the host-interop seam: a `.nui` page names
+// them, `build_registry` supplies a behavior, and the behavior gets the
+// row's scope back through `BehaviorContext` — which is how a click on a
+// row can write to the model row that produced it.
+Column(id = todo_page, spacing = 10dp, padding = 16dp) {
+
+    Text(content = "For + Model + host behaviors", font.size = 16dp,
+         color = #e8ecf2)
+
+    For(item in root.todoItems) {
+        Row(id = todo_row, spacing = 10dp, height = 44dp) {
+            Rectangle(id = todo_swatch, width = 18dp, height = 18dp,
+                      radius = 9dp,
+                      fill <- item.done ? #3f9d55 : #64748b,
+                      opacity <- tween(item.done ? 1.0 : 0.4, duration = 200ms,
+                                       easing = ease-out))
+            Text(content <- item.label, width = 220dp, height = 24dp,
+                 color = #e8ecf2)
+            TodoCheckbox(width = 24dp, height = 24dp, fill = #475569)
+            TodoRemove(width = 24dp, height = 24dp, fill = #b45454)
+        }
+    }
+
+    Text(content = "click the swatch to toggle, the red one to remove",
+         font.size = 13dp, color = #9aa4b2)
+}

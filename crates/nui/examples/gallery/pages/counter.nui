@@ -1,0 +1,17 @@
+// Counter — the smallest end-to-end document: a property, a binding that
+// re-renders a label, and a click handler that mutates it.
+//
+// State lives on this page's own root element (`counter_page.count`), so
+// the fragment is self-contained: nothing is hoisted into the gallery
+// component, and no other page can collide with it.
+Column(id = counter_page, spacing = 12dp, padding = 24dp, count = 0) {
+    Rectangle(id = counter_panel, width = 300dp, height = 90dp, radius = 12dp,
+              fill = #336699, opacity = 0.25)
+
+    Text(id = counter_label, content <- "clicked {counter_page.count} times",
+         font.size = 16dp, color = #e8ecf2)
+
+    Button(id = counter_increment, label = "+1", width = 140dp, height = 38dp) {
+        on click => counter_page.count += 1
+    }
+}

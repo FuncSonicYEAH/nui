@@ -238,11 +238,7 @@ impl PathPipeline {
             });
         }
         if !vertices.is_empty() {
-            queue.write_buffer(
-                &self.vertex_buffer,
-                0,
-                bytemuck::cast_slice(vertices),
-            );
+            queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(vertices));
         }
         if !indices.is_empty() {
             queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(indices));

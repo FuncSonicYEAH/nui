@@ -1,0 +1,33 @@
+// Scroll + layers — a `Scroll` viewport whose content is clipped and
+// wheel-scrolled, group compositing through `layer.opacity`, and a
+// two-pass gaussian offscreen layer through `layer.blur`. No new GPU
+// pipeline: both go through the offscreen texture the renderer already has.
+Column(id = showcase_page, spacing = 16dp, padding = 24dp) {
+
+    Text(content = "layer.opacity / layer.blur", font.size = 16dp,
+         color = #e8ecf2)
+
+    Rectangle(id = showcase_card, width = 340dp, height = 84dp, radius = 12dp,
+              fill = #2b3240,
+              shadow.dx = 0dp, shadow.dy = 8dp,
+              shadow.blur = 14dp, shadow.color = #000000aa) {
+        layer.opacity = 0.85
+    }
+
+    Rectangle(id = showcase_pill, width = 180dp, height = 36dp, radius = 9dp,
+              fill = #336699) {
+        layer.blur = 3dp
+    }
+
+    Text(content = "Scroll — wheel over this list", font.size = 13dp,
+         color = #9aa4b2)
+
+    Scroll(id = showcase_scroll, width = 340dp, height = 200dp, radius = 10dp,
+           fill = #161a22) {
+        For(item in root.showcaseRows) {
+            Rectangle(id = showcase_row, width = 316dp, height = 36dp,
+                      radius = 6dp,
+                      fill <- item.hot ? #3d6a9e : #2b3240)
+        }
+    }
+}

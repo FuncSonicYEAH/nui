@@ -130,6 +130,15 @@ fn dump_node(node: &NodeDecl, output: &mut String, level: usize) {
                 output.push_str(&format!("{}  (id {})\n", indent(level), id.name));
             }
             NodeArg::Property(assignment) => dump_assignment(assignment, output, level + 1),
+            NodeArg::Handler(handler) => {
+                output.push_str(&format!(
+                    "{}  (handler {}\n",
+                    indent(level),
+                    handler.signal.name
+                ));
+                dump_statements(&handler.effect, output, level + 2);
+                output.push_str(&format!("{}  )\n", indent(level)));
+            }
         }
     }
     for member in &node.body {

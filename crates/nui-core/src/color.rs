@@ -165,6 +165,27 @@ impl Color {
         return self.alpha;
     }
 
+    /// Red component as a byte (0..=255), clamped and rounded — the
+    /// integer counterpart of [`Color::red`] for palette math.
+    pub fn red8(&self) -> u8 {
+        return component_to_u8(self.red);
+    }
+
+    /// Green component as a byte (0..=255), clamped and rounded.
+    pub fn green8(&self) -> u8 {
+        return component_to_u8(self.green);
+    }
+
+    /// Blue component as a byte (0..=255), clamped and rounded.
+    pub fn blue8(&self) -> u8 {
+        return component_to_u8(self.blue);
+    }
+
+    /// Alpha component as a byte (0..=255), clamped and rounded.
+    pub fn alpha8(&self) -> u8 {
+        return component_to_u8(self.alpha);
+    }
+
     /// Returns a copy with the alpha component replaced.
     pub const fn with_alpha(self, alpha: f32) -> Color {
         return Color {

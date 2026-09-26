@@ -127,8 +127,13 @@ pub(crate) fn instantiate_scoped_node(
         });
     }
     let id = tree.insert(element);
-    if node.ty == "TextInput" {
+    // The keyboard focus order: text fields plus every control a user can
+    // *operate* from the keyboard (see `widget::is_focusable_type` — a
+    // Dialog is interactive but is not a tab stop).
+    if node.ty == "TextInput" || crate::widget::is_focusable_type(&node.ty) {
         tree.arena[id].focusable = true;
+    }
+    if node.ty == "TextInput" {
         let seed = match tree.arena[id].get("text") {
             Some(Value::String(text)) => text.clone(),
             _ => String::new(),
@@ -279,6 +284,15 @@ fn link_two_way_pairs(tree: &mut ElementTree) {
         }
     });
     for (element, property, partner, partner_property) in links {
+        // A pair starts *in sync*. The slot holds the `Int(0)` placeholder a
+        // reactive assignment left behind (it exists so reads succeed before
+        // the first write), and that placeholder is nobody's value: a
+        // `Float` model would arrive in the field as an integer, so a
+        // stepper or slider on it could only ever move in whole units. The
+        // partner — the model side of `<=>` — seeds the pair.
+        if let Some(value) = tree.arena[partner].get(&partner_property).cloned() {
+            tree.arena[element].set(&property, value);
+        }
         tree.arena[element].set_two_way(
             &property,
             crate::binding::TwoWayLink {

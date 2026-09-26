@@ -158,9 +158,15 @@ fn polyline_strokes_its_segments() {
     let on_line = pixel(&data, stride, 50, 30);
     assert!(on_line[0] > 180, "line center is red, got {on_line:?}");
     let above = pixel(&data, stride, 50, 10);
-    assert!(above[0] < 60, "far above the line stays black, got {above:?}");
+    assert!(
+        above[0] < 60,
+        "far above the line stays black, got {above:?}"
+    );
     let below = pixel(&data, stride, 50, 55);
-    assert!(below[0] < 60, "far below the line stays black, got {below:?}");
+    assert!(
+        below[0] < 60,
+        "far below the line stays black, got {below:?}"
+    );
 }
 
 #[test]
@@ -218,7 +224,10 @@ fn arc_draws_a_ring() {
     let center = pixel(&data, stride, 50, 50);
     assert!(center[1] < 60, "ring interior stays black, got {center:?}");
     let outside = pixel(&data, stride, 50, 2);
-    assert!(outside[1] < 60, "beyond the ring stays black, got {outside:?}");
+    assert!(
+        outside[1] < 60,
+        "beyond the ring stays black, got {outside:?}"
+    );
 }
 
 #[test]
@@ -334,8 +343,14 @@ fn waveline_wave_stays_within_its_amplitude_envelope() {
     assert!(stroked > 0, "the wave crosses the probe column");
     let far_above = pixel(&data, stride, 50, 5);
     let far_below = pixel(&data, stride, 50, 55);
-    assert!(far_above[0] < 60, "nothing above the envelope, got {far_above:?}");
-    assert!(far_below[0] < 60, "nothing below the envelope, got {far_below:?}");
+    assert!(
+        far_above[0] < 60,
+        "nothing above the envelope, got {far_above:?}"
+    );
+    assert!(
+        far_below[0] < 60,
+        "nothing below the envelope, got {far_below:?}"
+    );
 }
 
 #[test]
@@ -349,7 +364,13 @@ fn clip_cuts_the_polyline() {
     root.set("clip", Value::Bool(true));
     let (data, stride) = render_pixels(&mut tree, nui_core::Size::new(100.0, 60.0));
     let inside = pixel(&data, stride, 30, 30);
-    assert!(inside[0] > 180, "inside the clip the line is red, got {inside:?}");
+    assert!(
+        inside[0] > 180,
+        "inside the clip the line is red, got {inside:?}"
+    );
     let clipped = pixel(&data, stride, 70, 30);
-    assert!(clipped[0] < 60, "past the clip the line is cut, got {clipped:?}");
+    assert!(
+        clipped[0] < 60,
+        "past the clip the line is cut, got {clipped:?}"
+    );
 }

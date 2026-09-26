@@ -148,9 +148,24 @@ pub fn parse_path(d: &str) -> Result<Vec<PathCommand>, PathError> {
                 commands.push(PathCommand::LineTo(current));
             }
             Command::Cubic(_) => {
-                let c1 = offset(kind, current, parser.number("cubic")?, parser.number("cubic")?);
-                let c2 = offset(kind, current, parser.number("cubic")?, parser.number("cubic")?);
-                let to = offset(kind, current, parser.number("cubic")?, parser.number("cubic")?);
+                let c1 = offset(
+                    kind,
+                    current,
+                    parser.number("cubic")?,
+                    parser.number("cubic")?,
+                );
+                let c2 = offset(
+                    kind,
+                    current,
+                    parser.number("cubic")?,
+                    parser.number("cubic")?,
+                );
+                let to = offset(
+                    kind,
+                    current,
+                    parser.number("cubic")?,
+                    parser.number("cubic")?,
+                );
                 current = to;
                 commands.push(PathCommand::CubicTo { c1, c2, to });
             }
@@ -158,14 +173,34 @@ pub fn parse_path(d: &str) -> Result<Vec<PathCommand>, PathError> {
                 // S: the first control point reflects the previous C/S c2
                 // about `current`.
                 let c1 = reflect(last_c2_of(&commands, smooth_cubic_source, current), current);
-                let c2 = offset(kind, current, parser.number("cubic")?, parser.number("cubic")?);
-                let to = offset(kind, current, parser.number("cubic")?, parser.number("cubic")?);
+                let c2 = offset(
+                    kind,
+                    current,
+                    parser.number("cubic")?,
+                    parser.number("cubic")?,
+                );
+                let to = offset(
+                    kind,
+                    current,
+                    parser.number("cubic")?,
+                    parser.number("cubic")?,
+                );
                 current = to;
                 commands.push(PathCommand::CubicTo { c1, c2, to });
             }
             Command::Quadratic(_) => {
-                let ctrl = offset(kind, current, parser.number("quadratic")?, parser.number("quadratic")?);
-                let to = offset(kind, current, parser.number("quadratic")?, parser.number("quadratic")?);
+                let ctrl = offset(
+                    kind,
+                    current,
+                    parser.number("quadratic")?,
+                    parser.number("quadratic")?,
+                );
+                let to = offset(
+                    kind,
+                    current,
+                    parser.number("quadratic")?,
+                    parser.number("quadratic")?,
+                );
                 current = to;
                 commands.push(PathCommand::QuadraticTo { ctrl, to });
             }
@@ -174,7 +209,12 @@ pub fn parse_path(d: &str) -> Result<Vec<PathCommand>, PathError> {
                     last_ctrl_of(&commands, smooth_quadratic_source, current),
                     current,
                 );
-                let to = offset(kind, current, parser.number("quadratic")?, parser.number("quadratic")?);
+                let to = offset(
+                    kind,
+                    current,
+                    parser.number("quadratic")?,
+                    parser.number("quadratic")?,
+                );
                 current = to;
                 commands.push(PathCommand::QuadraticTo { ctrl, to });
             }
@@ -386,9 +426,9 @@ impl Parser<'_> {
             b't' => Command::SmoothQuadratic(true),
             b'Z' | b'z' => Command::Close,
             b'A' | b'a' => {
-                return Err(self.error(
-                    "elliptical arc (A) is not supported yet; use curves or polylines",
-                ));
+                return Err(
+                    self.error("elliptical arc (A) is not supported yet; use curves or polylines")
+                );
             }
             _ => {
                 if Self::starts_number(byte) {
@@ -536,8 +576,8 @@ mod tests {
 
     #[test]
     fn cubic_and_quadratic_store_absolute_points() {
-        let commands = parse_path("M 0 0 C 5 5 10 5 15 0 S 25 -5 30 0 Q 35 10 40 0 T 50 0")
-            .expect("parses");
+        let commands =
+            parse_path("M 0 0 C 5 5 10 5 15 0 S 25 -5 30 0 Q 35 10 40 0 T 50 0").expect("parses");
         assert_eq!(
             commands[1],
             PathCommand::CubicTo {
@@ -606,14 +646,20 @@ mod tests {
         assert!(parse_path("M 0 0 C 1 1 2 2").is_err());
         // A bare number with no command behind it.
         assert!(parse_path("42").is_err());
-        assert!(parse_path("M 0 0 Z 5").is_err(), "close takes no parameters");
+        assert!(
+            parse_path("M 0 0 Z 5").is_err(),
+            "close takes no parameters"
+        );
     }
 
     #[test]
     fn empty_input_and_stray_separators_are_tolerated() {
         assert_eq!(parse_path("").expect("empty is ok"), Vec::new());
-        assert!(parse_path("  , ").expect("separators only") .is_empty());
-        assert!(parse_path("M 0 0 ,,,,").is_ok(), "stray separators are tolerated");
+        assert!(parse_path("  , ").expect("separators only").is_empty());
+        assert!(
+            parse_path("M 0 0 ,,,,").is_ok(),
+            "stray separators are tolerated"
+        );
     }
 
     #[test]
@@ -649,8 +695,14 @@ mod tests {
         let commands = parse_path("M 0 0 C 55.2 0 100 44.8 100 100").expect("parses");
         let coarse = flatten(&commands, 5.0);
         let fine = flatten(&commands, 0.1);
-        assert!(coarse[0].len() >= 4, "coarse still subdivides to hit the arc");
-        assert!(fine[0].len() > coarse[0].len(), "smaller tolerance subdivides more");
+        assert!(
+            coarse[0].len() >= 4,
+            "coarse still subdivides to hit the arc"
+        );
+        assert!(
+            fine[0].len() > coarse[0].len(),
+            "smaller tolerance subdivides more"
+        );
         // Every sampled point lies close to the true quarter arc.
         for point in &fine[0] {
             let radius = (point.x - 0.0).hypot(point.y - 100.0);
@@ -663,7 +715,8 @@ mod tests {
 
     #[test]
     fn flatten_produces_one_loop_per_subpath() {
-        let commands = parse_path("M 0 0 L 10 0 L 10 10 Z M 20 0 L 30 0 L 30 10 Z").expect("parses");
+        let commands =
+            parse_path("M 0 0 L 10 0 L 10 10 Z M 20 0 L 30 0 L 30 10 Z").expect("parses");
         let loops = flatten(&commands, 0.1);
         assert_eq!(loops.len(), 2);
         assert_eq!(loops[0][0], Point::new(0.0, 0.0));

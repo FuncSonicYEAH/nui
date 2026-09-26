@@ -1,0 +1,26 @@
+// Virtualized list — 10,000 rows in a `ListView`, of which only the ones
+// inside the viewport exist as elements (~11). Scrolling re-instantiates
+// the window while the element count stays bound.
+//
+// `row_height` is the contract: each row occupies exactly that slot, so
+// the row at index `r` sits at `r * row_height` however deep the scroll
+// goes. That agreement between the virtualizer's window arithmetic and
+// taffy's stacking is what the row card (32dp in a 36dp slot) has to
+// respect — it fills the remainder with a bottom margin, not by growing.
+//
+// The model comes from the host: `root.listRows`, registered in
+// `build_registry`.
+Column(id = list_page, spacing = 12dp, padding = 20dp) {
+
+    Text(content = "10,000 rows — scroll me", font.size = 16dp,
+         width = 260dp, height = 24dp, color = #e8ecf2)
+
+    ListView(item in root.listRows, id = list_view, width = 360dp,
+             height = 560dp, row_height = 36dp) {
+        Rectangle(id = list_row, width = 344dp, height = 32dp, radius = 6dp,
+                  fill <- item.hot ? #3d6a9e : #2b3240) {
+            Text(content <- item.label, padding = 9dp, font.size = 13dp,
+                 color <- item.hot ? #dfe7f2 : #9aa4b2)
+        }
+    }
+}

@@ -332,6 +332,9 @@ impl<'source> ComponentBinder<'source> {
             ..NodeIr::default()
         };
         let mut assignments_from_args = Vec::new();
+        // Argument handlers land in the same list as body handlers and are
+        // applied in `bind_node_members` order further down.
+        let mut handlers_from_args = Vec::new();
         for arg in &decl.args {
             match arg {
                 NodeArg::Id(id) => {
@@ -346,9 +349,15 @@ impl<'source> ComponentBinder<'source> {
                 NodeArg::Property(assignment) => {
                     assignments_from_args.push(self.bind_node_assignment(assignment, &node));
                 }
+                NodeArg::Handler(handler) => {
+                    handlers_from_args.push(self.bind_handler(handler));
+                }
             }
         }
+        // Argument assignments run before body members, so a body `on click`
+        // can still read a property set in the argument list.
         node.assignments = assignments_from_args;
+        node.handlers = handlers_from_args;
         // `ListView` shares `For`'s binding path (M10): the runtime
         // virtualizes its rows against the visible window.
         if decl.ty.name == "For" || decl.ty.name == "ListView" {
@@ -2185,6 +2194,96 @@ component CanvasDemo {
 }
 "#;
         let outcome = compile(demo);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+    }
+
+    #[test]
+    fn handlers_are_allowed_in_node_arguments() {
+        // `on signal => ...` used to be a body-only member: an argument
+        // list rejected it with "expected an identifier, found keyword
+        // `on`". Compact widgets need it next to their properties.
+        let outcome = compile(
+            r#"component A { property c: Int = 0 Window(id = root) { Button(id = b, label = "x", variant = "primary", on click => c += 1) } }"#,
+        );
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let node = &outcome.document.components[0].roots[0];
+        let button = &node.children[0];
+        assert_eq!(button.ty, "Button");
+        assert_eq!(button.handlers.len(), 1);
+        assert_eq!(button.handlers[0].signal, "click");
+        // The argument assignments still bind (`variant` among them).
+        assert!(button.assignments.iter().any(|assignment| {
+            return assignment.path == vec!["variant".to_string()];
+        }));
+    }
+
+    #[test]
+    fn argument_and_body_handlers_coexist() {
+        let outcome = compile(
+            r#"component A { property c: Int = 0 Window(id = root) { Button(on click => c += 1, label = "x") { on press => c -= 1 } } }"#,
+        );
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let button = &outcome.document.components[0].roots[0].children[0];
+        let signals: Vec<&str> = button
+            .handlers
+            .iter()
+            .map(|handler| return handler.signal.as_str())
+            .collect();
+        // Argument handlers precede body handlers.
+        assert_eq!(signals, vec!["click", "press"]);
+        assert_eq!(
+            button
+                .assignments
+                .iter()
+                .map(|assignment| return assignment.path.join("."))
+                .collect::<Vec<_>>(),
+            vec!["label"]
+        );
+    }
+
+    #[test]
+    fn temporary_widget_demo_source_check() {
+        let demo = r#"
+component Widgets {
+    property listOpen: Bool = true
+
+    Window(id = root) {
+        Column(id = content, spacing = 16dp, padding = 24dp) {
+            Text(content = "widget foundation — states, capture, keyboard")
+
+            Button(id = primary, label = "Primary", variant = "primary",
+                   on click => listOpen = !listOpen)
+
+            Button(id = danger, label = "Danger", variant = "danger",
+                   icon = "!", enabled <- listOpen)
+
+            CheckBox(id = agree, label = "Enable the dialog", checked = true)
+            Switch(id = toggle, label = "Switch", checked <- agree.checked)
+            Slider(id = volume, min = 0, max = 100, value = 40, step = 5)
+            RadioButton(id = optionA, label = "Fahrenheit", group = "units", selected = true)
+
+            Dialog(id = sheet, open <- !listOpen, title = "Are you sure?")
+        }
+    }
+}
+"#;
+        let outcome = compile(demo);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+    }
+
+    #[test]
+    fn the_widgets_gallery_page_compiles_clean() {
+        // The gallery's `widgets` page (see
+        // `crates/nui/examples/gallery/pages/widgets.nui`) is the living
+        // copy of the widget set; if it stops compiling, the shipped demo
+        // is broken and this test says so without needing a display. The
+        // fragment is a single top-level element binding only its own
+        // root's properties, so the smallest hosting window is enough.
+        let demo = format!(
+            "component WidgetsPage {{\n    Window(id = root) {{\n{}\n    }}\n}}\n",
+            include_str!("../../nui/examples/gallery/pages/widgets.nui")
+        );
+        let outcome = compile(&demo);
         assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
     }
 }

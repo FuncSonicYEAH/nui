@@ -52,12 +52,10 @@ Requires a recent stable Rust toolchain (edition 2024). A software GPU adapter
 works: lavapipe or llvmpipe on Linux, WARP on Windows.
 
 ```sh
-cargo run -p nui --example counter     # minimal counter
-cargo run -p nui --example showcase    # scroll, group opacity, blur
-cargo run -p nui --example playground  # everything at once
+cargo run -p nui --example gallery  # every feature, one window with a sidebar
 
-# offscreen mode: no window needed, writes PNGs to snapshots/
-cargo run -p nui --example playground --release -- --snap
+# offscreen mode: no window needed, writes one PNG per page to snapshots/
+cargo run -p nui --example gallery --release -- --snap
 
 # hot reload: edit the .nui file while it runs
 cargo run -p nui-preview -- examples/counter.nui
@@ -67,7 +65,7 @@ cargo run -p nui-preview -- examples/counter.nui --no-resize
 ```
 
 `NUI_BACKEND` forces a wgpu backend: `vulkan`, `gl`, `dx12`, `metal` or
-`primary` (e.g. `NUI_BACKEND=gl cargo run -p nui --example counter`).
+`primary` (e.g. `NUI_BACKEND=gl cargo run -p nui --example gallery`).
 
 ## Documentation
 

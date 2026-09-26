@@ -1,0 +1,26 @@
+// Rotation & gradient — click the diamond to spin it (`rotation` driven by
+// a binding), two gradient bars showing `gradient.from/to/angle`, and a
+// label exercising the math builtins inside an interpolated string.
+//
+// Rotating about the element's own centre is what makes a click-to-spin
+// control possible at all: the `rotation` property is the transform, and
+// the click handler is the only imperative line on the page.
+Column(id = transform_page, spacing = 16dp, padding = 24dp, spin = 45.0) {
+
+    Text(content = "rotation + gradient + math builtins", font.size = 14dp,
+         color = #e8ecf2)
+
+    Rectangle(width = 80dp, height = 80dp, radius = 14dp, fill = #e05555,
+              rotation <- transform_page.spin) {
+        on click => transform_page.spin += 15
+    }
+
+    Rectangle(height = 40dp, gradient.from = #ff5544, gradient.to = #4466ff,
+              gradient.angle = 0)
+
+    Rectangle(height = 40dp, radius = 20dp, gradient.from = #ffb347,
+              gradient.to = #7a4c9e)
+
+    Text(content <- "floor(sin(1.57) * 100) / 100 = {floor(sin(1.57) * 100.0) / 100.0}",
+         font.size = 13dp, color = #9aa4b2)
+}

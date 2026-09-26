@@ -1,0 +1,76 @@
+// Containers — `Panel` / `Card`, `Grid`, `Wrap`, `Stack` (with a badge on
+// the corner), `Separator`, `Spacer`, and the container alignment
+// properties.
+//
+// The page declares `height = 100%`, so it fills the viewport it is given
+// and the trailing `Spacer` has free space to push against.
+Column(id = containers_page, spacing = 14dp, padding = 24dp, height = 100%,
+       clicks = 0) {
+
+    Text(content = "Panel / Card", font.size = 16dp, color = #e8ecf2)
+
+    Row(spacing = 12dp, height = 96dp) {
+        Panel(id = containers_settings, title = "Settings", width = 200dp) {
+            Text(content = "Flat surface, 16dp inset.",
+                 font.size = 13dp, color = #9aa4b2)
+        }
+        Card(id = containers_stats, title = "Stats", width = 200dp) {
+            Text(content = "Elevated, soft shadow.",
+                 font.size = 13dp, color = #9aa4b2)
+        }
+    }
+
+    Separator(id = containers_rule)
+
+    Text(content = "Grid", font.size = 16dp, color = #e8ecf2)
+
+    Grid(id = containers_swatches, columns = 3, row_spacing = 8dp,
+         column_spacing = 8dp) {
+        Rectangle(fill = #2a3140, radius = 6dp, height = 28dp)
+        Rectangle(fill = #2a3140, radius = 6dp, height = 28dp)
+        Rectangle(fill = #2a3140, radius = 6dp, height = 28dp)
+        Rectangle(fill = #2a3140, radius = 6dp, height = 28dp)
+        Rectangle(fill = #2a3140, radius = 6dp, height = 28dp)
+        Rectangle(fill = #2a3140, radius = 6dp, height = 28dp)
+    }
+
+    Text(content = "Wrap", font.size = 16dp, color = #e8ecf2)
+
+    // A fixed width so the wrap is a property of *this* page, not of
+    // whatever viewport it lands in: three 140dp chips per line, the
+    // fourth pushed to line two — the same demo in the gallery, in a
+    // standalone window, and under test.
+    Wrap(id = containers_chips, spacing = 8dp, width = 476dp) {
+        Button(label = "alpha", variant = "ghost", width = 140dp, height = 30dp)
+        Button(label = "beta", variant = "ghost", width = 140dp, height = 30dp)
+        Button(label = "gamma", variant = "ghost", width = 140dp, height = 30dp)
+        Button(label = "delta", variant = "ghost", width = 140dp, height = 30dp)
+        Button(label = "epsilon", variant = "ghost", width = 140dp, height = 30dp)
+    }
+
+    Text(content = "Stack", font.size = 16dp, color = #e8ecf2)
+
+    Row(spacing = 16dp, height = 72dp, align = "center") {
+        Stack(id = containers_avatar, width = 72dp, height = 72dp) {
+            Rectangle(fill = #33608f, radius = 36dp)
+            Rectangle(fill = #e24b4a, radius = 10dp, width = 20dp,
+                      height = 20dp, align_self = "end", justify_self = "end")
+        }
+        Column(spacing = 6dp, align = "start") {
+            Text(content = "A Stack puts every child in one cell,",
+                 font.size = 13dp, color = #9aa4b2)
+            Text(content = "so the badge lands on the corner.",
+                 font.size = 13dp, color = #9aa4b2)
+            Button(label = "Count clicks", width = 130dp, height = 30dp) {
+                on click => containers_page.clicks += 1
+            }
+        }
+        Text(content <- "clicks = {containers_page.clicks}", font.size = 13dp,
+             color = #9aa4b2)
+    }
+
+    Spacer(id = containers_filler)
+
+    Text(content = "Spacer pushes this line to the bottom.",
+         font.size = 13dp, color = #9aa4b2)
+}

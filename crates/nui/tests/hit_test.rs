@@ -40,3 +40,82 @@ fn hit_test_accounts_for_scroll_offset() {
     let hit = hit_test(&tree, Point::new(50.0, -10.0));
     assert_eq!(hit.map(|target| return target.element), Some(row));
 }
+
+/// A hidden page keeps the *stale* boxes of its last layout (`write_back`
+/// skips an invisible subtree), so "no box, no hit" is false — the boxes
+/// are very much there. The walk must prune on `visible` itself, or a
+/// hidden page's geometry wins the smallest-area contest and steals the
+/// click from whatever is visible underneath (the gallery bug where a
+/// second text field could not be clicked into).
+#[test]
+fn an_invisible_page_cannot_steal_a_hit_with_its_stale_boxes() {
+    let mut tree = nui_runtime::ElementTree::new();
+    let mut hidden = Element::new("Column", None);
+    hidden.set("visible", Value::Bool(false));
+    let hidden_id = tree.insert(hidden);
+    tree.push_root(hidden_id);
+    // A small element at the stale position the click will land on. Its
+    // area is far smaller than the visible field's, so unpruned it wins.
+    let mut stale = Element::new("Rectangle", None);
+    stale.set("x", Value::Float(200.0));
+    stale.set("y", Value::Float(160.0));
+    stale.set("width", Value::Float(60.0));
+    stale.set("height", Value::Float(20.0));
+    let stale_id = tree.insert(stale);
+    tree.append_child(hidden_id, stale_id);
+
+    // The visible page: its field covers the same point.
+    let shown = Element::new("Column", None);
+    let shown_id = tree.insert(shown);
+    tree.push_root(shown_id);
+    let mut field = Element::new("TextInput", None);
+    field.set("x", Value::Float(200.0));
+    field.set("y", Value::Float(160.0));
+    field.set("width", Value::Float(360.0));
+    field.set("height", Value::Float(40.0));
+    let field_id = tree.insert(field);
+    tree.append_child(shown_id, field_id);
+
+    let hit = hit_test(&tree, Point::new(210.0, 170.0));
+    assert_eq!(
+        hit.map(|target| return target.element),
+        Some(field_id),
+        "the visible field wins; the hidden page's stale box must not"
+    );
+}
+
+/// Same rule for a closed overlay: the scene walk drops the subtree, so
+/// its stale box must not catch clicks either.
+#[test]
+fn a_closed_overlay_cannot_steal_a_hit_with_its_stale_boxes() {
+    let mut tree = nui_runtime::ElementTree::new();
+    let mut dialog = Element::new("Dialog", None);
+    dialog.set("open", Value::Bool(false));
+    let dialog_id = tree.insert(dialog);
+    tree.push_root(dialog_id);
+    let mut stale = Element::new("Button", None);
+    stale.set("x", Value::Float(40.0));
+    stale.set("y", Value::Float(40.0));
+    stale.set("width", Value::Float(80.0));
+    stale.set("height", Value::Float(24.0));
+    let stale_id = tree.insert(stale);
+    tree.append_child(dialog_id, stale_id);
+
+    let shown = Element::new("Column", None);
+    let shown_id = tree.insert(shown);
+    tree.push_root(shown_id);
+    let mut field = Element::new("TextInput", None);
+    field.set("x", Value::Float(40.0));
+    field.set("y", Value::Float(40.0));
+    field.set("width", Value::Float(200.0));
+    field.set("height", Value::Float(40.0));
+    let field_id = tree.insert(field);
+    tree.append_child(shown_id, field_id);
+
+    let hit = hit_test(&tree, Point::new(50.0, 50.0));
+    assert_eq!(
+        hit.map(|target| return target.element),
+        Some(field_id),
+        "the closed dialog's stale box must not catch the click"
+    );
+}

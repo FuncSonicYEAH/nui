@@ -1,0 +1,74 @@
+// Widgets — every control the framework ships, with live hover / press /
+// focus / toggle / drag state, plus a dialog opened from a button.
+//
+// The page's state lives on its root element (`widgets_page.volume` and
+// friends), not in a component property: `Slider`'s `<=>` writes back
+// through it and the readout at the bottom picks the value up next frame.
+Column(id = widgets_page, spacing = 16dp, padding = 28dp,
+       volume = 40.0, notifications = true, wifi = false, plan = "pro",
+       sheetOpen = false, confirms = 0) {
+
+    Text(content = "Buttons", font.size = 18dp, color = #e8ecf2)
+
+    Row(spacing = 10dp) {
+        Button(label = "Save", width = 110dp, height = 38dp) {
+            on click => widgets_page.confirms += 1
+        }
+        Button(label = "Preview", variant = "ghost", width = 110dp, height = 38dp)
+        Button(label = "Delete", variant = "danger", width = 110dp, height = 38dp)
+        Button(label = "Disabled", enabled = false, width = 110dp, height = 38dp)
+    }
+
+    Text(content = "Toggles", font.size = 18dp, color = #e8ecf2)
+
+    Column(spacing = 10dp) {
+        CheckBox(label = "Notify on save", checked <=> widgets_page.notifications,
+                 width = 220dp, height = 22dp)
+        Switch(label = "Wi-Fi", checked <=> widgets_page.wifi,
+               width = 220dp, height = 24dp)
+    }
+
+    Text(content = "Radio group", font.size = 18dp, color = #e8ecf2)
+
+    Column(spacing = 8dp) {
+        RadioButton(label = "Free", group = "plan", selected = false,
+                    width = 220dp, height = 22dp) {
+            on click => widgets_page.plan = "free"
+        }
+        RadioButton(label = "Pro", group = "plan", selected = true,
+                    width = 220dp, height = 22dp) {
+            on click => widgets_page.plan = "pro"
+        }
+        RadioButton(label = "Team", group = "plan", selected = false,
+                    width = 220dp, height = 22dp) {
+            on click => widgets_page.plan = "team"
+        }
+    }
+
+    Text(content = "Slider", font.size = 18dp, color = #e8ecf2)
+
+    Slider(value <=> widgets_page.volume, min = 0, max = 100, step = 5,
+           width = 320dp, height = 22dp)
+
+    Text(content <- "Volume: {widgets_page.volume}  Plan: {widgets_page.plan}  Saves: {widgets_page.confirms}",
+         font.size = 14dp, color = #9aa4b2)
+
+    Button(label = "Open dialog", width = 140dp, height = 38dp) {
+        on click => widgets_page.sheetOpen = true
+    }
+
+    Dialog(open <=> widgets_page.sheetOpen, title = "Confirm delete",
+           width = 320dp, height = 170dp) {
+        Text(content = "This cannot be undone.", font.size = 14dp,
+             color = #9aa4b2, padding = 20dp)
+        Row(spacing = 10dp) {
+            Button(label = "Cancel", variant = "ghost", width = 100dp, height = 34dp) {
+                on click => widgets_page.sheetOpen = false
+            }
+            Button(label = "Delete", variant = "danger", width = 100dp, height = 34dp) {
+                on click => widgets_page.sheetOpen = false
+            }
+        }
+        on closed => widgets_page.confirms += 1
+    }
+}

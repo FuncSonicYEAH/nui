@@ -46,19 +46,17 @@ component Counter {
 Linux 上的 lavapipe 或 llvmpipe，Windows 上的 WARP。
 
 ```sh
-cargo run -p nui --example counter     # 最小計數器
-cargo run -p nui --example showcase    # 捲動、群組透明度、模糊
-cargo run -p nui --example playground  # 全部功能
+cargo run -p nui --example gallery  # 全部功能，一個帶側邊欄的視窗
 
-# 離屏模式：無需視窗，PNG 輸出到 snapshots/
-cargo run -p nui --example playground --release -- --snap
+# 離屏模式：無需視窗，每頁一張 PNG 輸出到 snapshots/
+cargo run -p nui --example gallery --release -- --snap
 
 # 熱重載：執行時直接編輯 .nui 檔案
 cargo run -p nui-preview -- examples/counter.nui
 ```
 
 `NUI_BACKEND` 可強制指定 wgpu 後端：`vulkan`、`gl`、`dx12`、`metal` 或
-`primary`（例如 `NUI_BACKEND=gl cargo run -p nui --example counter`）。
+`primary`（例如 `NUI_BACKEND=gl cargo run -p nui --example gallery`）。
 
 ## 文件
 

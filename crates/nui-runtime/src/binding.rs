@@ -382,6 +382,12 @@ impl Engine {
         if changed {
             self.invalidate(element, property);
             self.record_change(element, property, value, ChangeSource::Host);
+            // A `<=>` pair is symmetric: a write from either side has to
+            // reach the other. Host and widget writes arrive here — a
+            // slider drag, a stepper step, a dialog closing — and without
+            // this the partner would only ever see writes that went through
+            // a binding, which is exactly the case `<=>` exists to avoid.
+            self.sync_two_way_partner(tree, element, property);
         }
         return changed;
     }
@@ -1752,7 +1758,10 @@ mod tests {
     fn timer_tree(running: Option<bool>) -> (ElementTree, crate::element::ElementId) {
         let mut tree = ElementTree::new();
         let mut ticker = Element::new("Timer", None);
-        ticker.set("interval", Value::Duration(nui_core::Duration::from_millis(100.0)));
+        ticker.set(
+            "interval",
+            Value::Duration(nui_core::Duration::from_millis(100.0)),
+        );
         if let Some(running) = running {
             ticker.set("running", Value::Bool(running));
         }
@@ -1770,11 +1779,19 @@ mod tests {
         let mut engine = Engine::new();
         let mut elapsed = HashMap::new();
         let fired = engine
-            .tick_timers(&mut tree, nui_core::Duration::from_millis(250.0), &mut elapsed)
+            .tick_timers(
+                &mut tree,
+                nui_core::Duration::from_millis(250.0),
+                &mut elapsed,
+            )
             .unwrap();
         assert_eq!(fired.len(), 2, "250ms crosses two 100ms intervals");
         let fired = engine
-            .tick_timers(&mut tree, nui_core::Duration::from_millis(150.0), &mut elapsed)
+            .tick_timers(
+                &mut tree,
+                nui_core::Duration::from_millis(150.0),
+                &mut elapsed,
+            )
             .unwrap();
         assert_eq!(fired.len(), 2, "leftover 50ms + 150ms crosses two more");
         assert!(tree.arena[id].timer_interval.is_some(), "keeps running");
@@ -1786,7 +1803,11 @@ mod tests {
         let mut engine = Engine::new();
         let mut elapsed = HashMap::new();
         let fired = engine
-            .tick_timers(&mut tree, nui_core::Duration::from_millis(500.0), &mut elapsed)
+            .tick_timers(
+                &mut tree,
+                nui_core::Duration::from_millis(500.0),
+                &mut elapsed,
+            )
             .unwrap();
         assert!(fired.is_empty(), "running = false never fires");
         assert!(tree.arena[id].timer_interval.is_none());
@@ -1800,13 +1821,21 @@ mod tests {
         let mut engine = Engine::new();
         let mut elapsed = HashMap::new();
         let fired = engine
-            .tick_timers(&mut tree, nui_core::Duration::from_millis(120.0), &mut elapsed)
+            .tick_timers(
+                &mut tree,
+                nui_core::Duration::from_millis(120.0),
+                &mut elapsed,
+            )
             .unwrap();
         assert_eq!(fired, vec![id], "method-started timers keep working");
         // A binding write to `running` takes over from that point on.
         tree.arena[id].set("running", Value::Bool(false));
         let fired = engine
-            .tick_timers(&mut tree, nui_core::Duration::from_millis(120.0), &mut elapsed)
+            .tick_timers(
+                &mut tree,
+                nui_core::Duration::from_millis(120.0),
+                &mut elapsed,
+            )
             .unwrap();
         assert!(fired.is_empty(), "declared running = false stops it");
     }

@@ -19,6 +19,6 @@
 pub mod app;
 pub mod host;
 
-pub use app::{AppConfig, Application, DocumentWatcher, ReloadWaker, hit_test};
+pub use app::{AppConfig, Application, DocumentWatcher, ReloadWaker, element_bounds, hit_test};
 pub use host::{HitTarget, WindowHost};
 pub use nui_runtime::{ElementTree, Engine, instantiate};

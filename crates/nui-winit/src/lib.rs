@@ -85,8 +85,14 @@ impl EventTranslator {
                     },
                     winit::event::MouseScrollDelta::LineDelta(x, y) => WheelDelta::Lines { x, y },
                 };
+                // winit's MouseWheel carries no position, and `(0, 0)` is
+                // not a substitute: the host routes the wheel by hit
+                // test, so a zero origin scrolls whatever sits in the
+                // window's top-left corner — or nothing. The tracked
+                // cursor is the position the user is actually pointing
+                // at (the same reuse `mouse_input` does).
                 vec![Event::WheelScrolled {
-                    position: Point::ZERO,
+                    position: self.cursor,
                     delta: scaled,
                 }]
             }
@@ -330,6 +336,28 @@ mod cursor_tests {
             nui_core::Size::new(800.0, 600.0),
         );
         assert!(matches!(commit.as_slice(), [Event::TextInput { text }] if text == "你"));
+    }
+
+    #[test]
+    fn wheel_reuses_the_tracked_cursor() {
+        // winit's MouseWheel carries no position, and the host routes the
+        // wheel by hit test — a zero origin would scroll (or miss) whatever
+        // sits in the window's top-left corner instead of the content under
+        // the pointer.
+        let mut translator = EventTranslator::new(1.0);
+        let _ = translator.cursor_moved(winit::dpi::PhysicalPosition::new(400.0, 300.0));
+        let scrolled = translator.translate(
+            winit::event::WindowEvent::MouseWheel {
+                device_id: winit::event::DeviceId::dummy(),
+                delta: winit::event::MouseScrollDelta::LineDelta(0.0, 1.0),
+                phase: winit::event::TouchPhase::Started,
+            },
+            nui_core::Size::new(800.0, 600.0),
+        );
+        assert!(
+            matches!(scrolled.as_slice(), [Event::WheelScrolled { position, .. }] if *position == Point::new(400.0, 300.0)),
+            "the wheel must land where the pointer is, got {scrolled:?}"
+        );
     }
 
     #[test]

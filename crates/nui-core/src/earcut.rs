@@ -157,7 +157,13 @@ mod tests {
     fn triangle_area(triangles: &[[u32; 3]], points: &[Point]) -> f32 {
         let mut area = 0.0;
         for [a, b, c] in triangles {
-            let area_tri = (cross(points[*a as usize], points[*b as usize], points[*c as usize])).abs() * 0.5;
+            let area_tri = (cross(
+                points[*a as usize],
+                points[*b as usize],
+                points[*c as usize],
+            ))
+            .abs()
+                * 0.5;
             area += area_tri;
         }
         return area;

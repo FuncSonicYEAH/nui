@@ -26,6 +26,7 @@ pub mod model;
 pub mod notify;
 pub mod registry;
 pub mod text_input;
+pub mod widget;
 
 pub use animation::{AnimationClock, AnimationKind, Easing};
 pub use binding::{Binding, BindingIndex, Engine, EvalError, TwoWayLink};
@@ -40,3 +41,4 @@ pub use registry::{
     HostFunction, PropertyDescriptor, Registry,
 };
 pub use text_input::TextInputState;
+pub use widget::{PointerInput, WidgetKind, WidgetState, WidgetStates, is_widget_type};

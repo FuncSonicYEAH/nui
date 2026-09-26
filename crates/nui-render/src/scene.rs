@@ -12,9 +12,36 @@ use nui_core::{Color, Point, Rect, Size};
 use nui_runtime::element::{ElementId, ElementTree};
 
 use crate::image::ImageDraw;
+use crate::props::{bool_property, color_property, dp_of, f_property};
 
 /// Default font size (dp) for `Text` elements without `font.size`.
 const DEFAULT_FONT_SIZE_DP: f32 = 16.0;
+
+/// Line height as a multiple of the font size, for the metrics the scene
+/// needs to *predict* (the one-line field's baseline, its selection and
+/// caret box) rather than read from a shaped layout.
+///
+/// Matches `nui-text`'s shaping constant; the wrapped path does not use it,
+/// because it reads each line's height from the layout instead.
+const TEXT_LINE_HEIGHT_FACTOR: f32 = 1.2;
+
+/// Placeholder text color (muted, blue-grey).
+const PLACEHOLDER_COLOR: Color = Color::from_rgb8(0x8a, 0x93, 0xa5);
+
+/// Selection highlight: a translucent blue behind the glyphs.
+const SELECTION_COLOR: Color = Color::from_rgb8(0x33, 0x66, 0x99);
+
+/// The caret's color. Fixed rather than `color`-derived: a caret has to be
+/// visible against the field's own fill, not against its text.
+const CARET_COLOR: Color = Color::WHITE;
+
+/// The glyph a password field draws, one per char.
+const MASK_CHAR: &str = "\u{2022}";
+
+/// A `required` label's asterisk: the same red the `danger` variant uses,
+/// so a form's "this one is mandatory" and its "this one deletes" at least
+/// belong to the same palette.
+const REQUIRED_COLOR: Color = Color::from_rgb8(0xc0, 0x43, 0x43);
 
 /// A rounded clip region in dp, resolved per draw (shader-side clipping).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -184,6 +211,56 @@ pub struct Scene {
     pub paths: Vec<PathDraw>,
     /// Offscreen layers in paint order (drawn last, M9).
     pub layers: Vec<LayerDraw>,
+    /// Overlay content (对话框 / Toast / 下拉) in paint order. Drawn after
+    /// `layers`, so an overlay outranks every ordinary element regardless
+    /// of where it sits in the tree (FUTURE 批次 4).
+    ///
+    /// Kept as a full sub-[`Scene`] rather than a flat list because an
+    /// overlay is free to use any primitive (a dialog scrim is a rect, a
+    /// tooltip is text, a dropdown is both) and nesting an overlay inside
+    /// another must keep working.
+    pub overlays: Vec<OverlayDraw>,
+}
+
+/// One overlay layer: a subtree hoisted out of normal paint order and
+/// composited on top of everything else.
+///
+/// Unlike [`LayerDraw`] there is no texture: the overlay's draws are
+/// appended to the main pass directly, just later. That keeps the cost at
+/// zero extra render targets for the common case (an opaque scrim plus a
+/// panel) and reuses every existing pipeline.
+#[derive(Debug, Clone)]
+pub struct OverlayDraw {
+    /// Absolute dp origin of the overlay's own box.
+    pub origin: Point,
+    /// The overlay subtree's draws, already flattened and in window
+    /// coordinates (the hoist walk reuses the parent's offset).
+    pub scene: Box<Scene>,
+}
+
+impl Scene {
+    /// Appends `inner`'s draws to this scene's tails: rects to rects,
+    /// glyphs to glyphs, and so on.
+    ///
+    /// This is what keeps an overlay on top. The renderer draws one
+    /// pipeline at a time — all rects, then all paths, then all strokes,
+    /// then all images, then all glyphs — so tail-appending an overlay's
+    /// scrim to `rects` and its label to `texts` puts both after every
+    /// ordinary draw in their own bucket. An overlay that mixed the two
+    /// the other way round (label before scrim) would still be correct,
+    /// because a glyph can never be covered by a later rect: the scrim
+    /// paints in an earlier pipeline.
+    pub fn absorb_overlay(&mut self, inner: Scene) {
+        self.rects.extend(inner.rects);
+        self.sources.extend(inner.sources);
+        self.texts.extend(inner.texts);
+        self.images.extend(inner.images);
+        self.polylines.extend(inner.polylines);
+        self.paths.extend(inner.paths);
+        self.layers.extend(inner.layers);
+        // `inner.overlays` is empty: the overlay walk builds its own
+        // sub-scene, which flattens any overlay it contained already.
+    }
 }
 
 /// Per-frame context the scene builder needs beyond the tree.
@@ -205,6 +282,12 @@ pub struct SceneBuilder {
     polylines: Vec<PolylineDraw>,
     paths: Vec<PathDraw>,
     layers: Vec<LayerDraw>,
+    overlays: Vec<OverlayDraw>,
+    /// Window size in dp, taken from the first root element's box. A
+    /// `Dialog`'s backdrop must cover the whole window while the dialog's
+    /// own layout box is only the panel, so the scrim size cannot come
+    /// from the element itself.
+    viewport: Size,
 }
 
 impl SceneBuilder {
@@ -234,6 +317,16 @@ impl SceneBuilder {
     ) -> Scene {
         let mut builder = SceneBuilder::new();
         for root in tree.roots.clone() {
+            // The first root's box is the window: `layout_with_text` sizes
+            // an unsized root to the viewport, so this is the only place
+            // that knows the window extent while walking.
+            let element = &tree.arena[root];
+            let width = f_property(element, "width").unwrap_or(0.0);
+            let height = f_property(element, "height").unwrap_or(0.0);
+            builder.viewport = Size::new(
+                builder.viewport.width.max(width),
+                builder.viewport.height.max(height),
+            );
             builder.walk_element(tree, root, Point::ZERO, None, text, &context, false);
         }
         return builder.build();
@@ -255,11 +348,45 @@ impl SceneBuilder {
         layer_root: bool,
     ) {
         let element = &tree.arena[id];
+        // `visible = false` removes the element *and its subtree* from the
+        // frame. Layout already gave it no box, but the box is only
+        // consulted by some of the arms below — text, images, paths and
+        // strokes paint from `x`/`y` directly — so the walk stops here
+        // instead of relying on a zero rect to prune each of them.
+        if !nui_runtime::widget::is_visible(element) {
+            return;
+        }
         let width = f_property(element, "width").unwrap_or(0.0);
         let height = f_property(element, "height").unwrap_or(0.0);
         let x = f_property(element, "x").unwrap_or(0.0) + offset.x;
         let y = f_property(element, "y").unwrap_or(0.0) + offset.y;
         let bounds = Rect::new(Point::new(x, y), Size::new(width, height));
+
+        // Overlay hoist (FUTURE 批次 4): an element with `overlay = true`
+        // leaves the normal paint order entirely and is composited after
+        // `layers` — i.e. above everything. `open = false` removes it
+        // (subtree included) rather than hiding it, so a closed dialog
+        // costs nothing and cannot be hit.
+        //
+        // `layer_root` guards against re-hoisting: the overlay's own walk
+        // runs with it set, exactly like the M9 capture path.
+        if !layer_root && nui_runtime::widget::is_overlay(element) {
+            if !nui_runtime::widget::is_open(element) {
+                return;
+            }
+            // Walked with the same offset and absolute `x`/`y`, so the
+            // sub-scene stays in *window* coordinates and the flattening
+            // step needs no re-origining. The viewport is carried over so
+            // a dialog's backdrop still knows how big the window is.
+            let mut sub = SceneBuilder::new();
+            sub.viewport = self.viewport;
+            sub.walk_element(tree, id, offset, None, text, context, true);
+            self.overlays.push(OverlayDraw {
+                origin: Point::new(x, y),
+                scene: Box::new(sub.build()),
+            });
+            return;
+        }
 
         // Layer capture (M9): `layer.opacity < 1` or `layer.blur > 0`
         // routes the whole subtree into an offscreen texture. The texture
@@ -269,6 +396,7 @@ impl SceneBuilder {
         let layer_blur = f_property(element, "layer.blur").unwrap_or(0.0);
         if !layer_root && width > 0.0 && height > 0.0 && (layer_opacity < 1.0 || layer_blur > 0.0) {
             let mut sub = SceneBuilder::new();
+            sub.viewport = self.viewport;
             // Texture-local coordinates: the element's own rect starts at
             // (0, 0) inside the layer texture. `layer_root` suppresses
             // re-capturing the same element.
@@ -309,6 +437,14 @@ impl SceneBuilder {
             "Canvas" => {
                 self.collect_canvas_one(element, bounds);
             }
+            // Built-in controls (FUTURE 批次 1-5): each resolves to widget
+            // parts painted in control-local space. `Panel` / `Card` /
+            // `Separator` are containers with chrome — their children are
+            // laid out normally below, this paints what is behind them.
+            "Button" | "CheckBox" | "Switch" | "Slider" | "RadioButton" | "Dialog" | "Panel"
+            | "Card" | "Separator" | "SpinBox" => {
+                self.collect_control_one(element, id, bounds, clip, text);
+            }
             _ => {
                 self.draw_rect(element, id, bounds, clip);
             }
@@ -334,6 +470,55 @@ impl SceneBuilder {
         }
         for child in element.children.clone() {
             self.walk_element(tree, child, child_offset, child_clip, text, context, false);
+        }
+    }
+
+    /// Paints one built-in control by resolving it to
+    /// [`crate::widget::WidgetPart`]s and appending them to the draw list.
+    ///
+    /// Each control is a handful of primitives — a surface, an indicator
+    /// box, a track, a thumb, a label — instead of a bespoke shader. The
+    /// state styling comes from [`crate::widget::Palette`] +
+    /// [`crate::widget::VisualState`], so a control's look is data.
+    fn collect_control_one(
+        &mut self,
+        element: &nui_runtime::Element,
+        id: ElementId,
+        bounds: Rect,
+        clip: Option<ClipDraw>,
+        text: &mut nui_text::TextSystem,
+    ) {
+        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+            return;
+        }
+        let state = crate::widget::VisualState::of(element);
+        let base = crate::widget::Palette::of(element);
+        let variant = element
+            .get("variant")
+            .and_then(|value| return value.as_enum().ok())
+            .map(|name| return name.to_string())
+            .unwrap_or_else(|| return "default".to_string());
+        let palette = crate::widget::variant_palette(&variant, base);
+        let opacity = f_property(element, "opacity")
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        if opacity <= 0.0 {
+            return;
+        }
+        let parts = crate::widget::parts_for(
+            element.ty.as_str(),
+            element,
+            bounds,
+            self.viewport,
+            state,
+            palette,
+        );
+        let mut painted_surface = false;
+        for part in parts {
+            painted_surface |= paint_part(self, part, bounds, clip, opacity, text);
+        }
+        if painted_surface {
+            self.sources.push(id);
         }
     }
 
@@ -437,12 +622,36 @@ impl SceneBuilder {
             .unwrap_or(1.0)
             .clamp(0.0, 1.0);
         let tint = color.with_alpha(color.alpha() * opacity);
-        self.push_glyphs(text, content, font_size, x, y, tint, clip);
+        let shaped = text.shape(content, font_size);
+        let content_width = shaped.width;
+        self.push_placed(text, &shaped.glyphs, Point::new(x, y), tint, clip);
+        if nui_runtime::widget::is_required(element) {
+            // The asterisk trails the text, at the colour a form marker has
+            // to be to read as one (批次 6).
+            let marker_x = x + content_width + nui_runtime::widget::ASTERISK_GAP_DP;
+            self.push_glyphs(
+                text,
+                nui_runtime::widget::REQUIRED_MARK,
+                font_size,
+                marker_x,
+                y,
+                REQUIRED_COLOR.with_alpha(opacity),
+                clip,
+            );
+        }
         let _ = id;
     }
 
     /// Extracts one `TextInput` element's visuals: background, text or
     /// placeholder, selection highlight, and the cursor when focused.
+    ///
+    /// One-line and multi-line fields share everything except how the text
+    /// is placed: a one-line field centres its single line in the box and
+    /// clips the overflow, a multi-line one starts at the inset, wraps, and
+    /// keeps its caret on whichever visual line the cursor is on. The
+    /// `password` mask is applied to the *display* string before either
+    /// path measures anything, so the caret, the selection and the IME
+    /// underline all follow the dots.
     #[allow(clippy::too_many_arguments)]
     fn collect_input_one(
         &mut self,
@@ -477,81 +686,141 @@ impl SceneBuilder {
         });
         self.sources.push(id);
 
-        let font_size = element
-            .get("font.size")
-            .and_then(|value| return dp_of(value))
-            .unwrap_or(DEFAULT_FONT_SIZE_DP);
-        let padding = f_property(element, "padding").unwrap_or(8.0);
-        let line_height = font_size * 1.2;
+        let font_size = nui_runtime::widget::chrome::text_size(element);
+        let inset = nui_runtime::widget::chrome::text_inset(element);
         let text_color = color_property(element, "color").unwrap_or(Color::WHITE);
         let Some(state) = element.text_input.as_ref() else {
             return;
         };
-        let baseline_y = y + (height - line_height) / 2.0;
+        let is_focused = focused == Some(id);
         // Composition display (fcitx5/ibus/XIM): the preedit text is shown
         // inline at the cursor; the cursor moves to its end and an
         // underline marks the composed span.
-        let composing = focused == Some(id) && !state.preedit.is_empty();
-        let chars: Vec<char> = state.text.chars().collect();
+        let composing = is_focused && !state.preedit.is_empty();
+        let preedit_chars = state.preedit.chars().count();
+        let cursor = (state.cursor + if composing { preedit_chars } else { 0 })
+            .min(state.text.chars().count() + preedit_chars);
         let display = if composing {
-            let before: String = chars[..state.cursor].iter().collect();
-            let after: String = chars[state.cursor..].iter().collect();
+            let chars: Vec<char> = state.text.chars().collect();
+            let before: String = chars[..state.cursor.min(chars.len())].iter().collect();
+            let after: String = chars[state.cursor.min(chars.len())..].iter().collect();
             format!("{before}{}{after}", state.preedit)
         } else {
             state.text.clone()
         };
-        if display.is_empty() {
-            let placeholder = element
-                .get("placeholder")
-                .and_then(|value| return value.as_str().ok())
-                .unwrap_or("");
+        let content = InputContent {
+            display: if element.is_password() {
+                // A password field draws one dot per char, the preedit
+                // included: the mask is applied to the *display* string, so
+                // the caret, the selection and the underline all follow the
+                // dots' widths. The char count is unchanged, which is what
+                // keeps every index in `content` meaningful.
+                mask_text(&display)
+            } else {
+                display
+            },
+            cursor,
+            caret_text: state.cursor,
+            preedit_chars,
+            selection: state.selection(),
+            composing,
+        };
+        let tint = text_color.with_alpha(text_color.alpha() * opacity);
+        let placeholder = element
+            .get("placeholder")
+            .and_then(|value| return value.as_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bounds = Rect::new(Point::new(x, y), Size::new(width, height));
+        if element.is_multiline() {
+            self.paint_wrapped_input(
+                &content,
+                &placeholder,
+                bounds,
+                inset,
+                font_size,
+                tint,
+                opacity,
+                radius,
+                clip,
+                text,
+                is_focused,
+            );
+        } else {
+            self.paint_line_input(
+                &content,
+                &placeholder,
+                bounds,
+                inset,
+                font_size,
+                tint,
+                opacity,
+                clip,
+                text,
+                is_focused,
+            );
+        }
+    }
+
+    /// Paints a one-line field: its single line centred in the box, the
+    /// selection, the caret, and the IME underline.
+    ///
+    /// The field does not clip its own text: a one-line field with more
+    /// content than width is a *document* mistake (`max_length`, a wider
+    /// box, or `multiline`), and silently cutting it in half would hide it.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_line_input(
+        &mut self,
+        content: &InputContent,
+        placeholder: &str,
+        bounds: Rect,
+        inset: f32,
+        font_size: f32,
+        tint: Color,
+        opacity: f32,
+        clip: Option<ClipDraw>,
+        text: &mut nui_text::TextSystem,
+        focused: bool,
+    ) {
+        let (x, y) = (bounds.origin.x, bounds.origin.y);
+        let height = bounds.size.height;
+        let line_height = font_size * TEXT_LINE_HEIGHT_FACTOR;
+        let origin_y = y + (height - line_height) / 2.0;
+        if content.display.is_empty() {
             if !placeholder.is_empty() {
-                let dim = Color::from_rgb8(0x8a, 0x93, 0xa5).with_alpha(opacity);
-                self.push_glyphs(
-                    text,
-                    placeholder,
-                    font_size,
-                    x + padding,
-                    baseline_y,
-                    dim,
-                    clip,
-                );
+                let dim = PLACEHOLDER_COLOR.with_alpha(opacity);
+                self.push_glyphs(text, placeholder, font_size, x + inset, origin_y, dim, clip);
             }
         } else {
-            let tint = text_color.with_alpha(text_color.alpha() * opacity);
             self.push_glyphs(
                 text,
-                &display,
+                &content.display,
                 font_size,
-                x + padding,
-                baseline_y,
+                x + inset,
+                origin_y,
                 tint,
                 clip,
             );
         }
-        if focused != Some(id) {
+        if !focused {
             return;
         }
-        if composing {
+        let chars: Vec<char> = content.display.chars().collect();
+        if content.composing {
             // Underline under the composed span.
-            let preedit_chars = state.preedit.chars().count();
-            let display_chars: Vec<char> = display.chars().collect();
-            let underline_start =
-                x + padding + measure_width(text, &display_chars[..state.cursor], font_size);
-            let underline_end = x
-                + padding
-                + measure_width(
-                    text,
-                    &display_chars[..state.cursor + preedit_chars],
-                    font_size,
-                );
+            let from = measure_width(
+                text,
+                &chars[..content.caret_text.min(chars.len())],
+                font_size,
+            );
+            let to = measure_width(text, &chars[..content.cursor.min(chars.len())], font_size);
             self.rects.push(RectDraw {
                 geometry: Rect::new(
-                    Point::new(underline_start, y + height * 0.82),
-                    Size::new((underline_end - underline_start).max(2.0), 2.0),
+                    Point::new(x + inset + from, y + height * 0.82),
+                    Size::new((to - from).max(2.0), 2.0),
                 ),
                 corner_radius: 0.0,
-                fill: text_color.with_alpha(text_color.alpha() * opacity),
+                fill: tint,
                 shadow: None,
                 clip,
                 rotation: 0.0,
@@ -559,45 +828,137 @@ impl SceneBuilder {
             });
         }
         // Selection highlight under the glyphs.
-        if state.has_selection() {
-            let (start, end) = state.selection();
-            let chars: Vec<char> = state.text.chars().collect();
-            let start_x = measure_width(text, &chars[..start], font_size);
-            let end_x = measure_width(text, &chars[..end], font_size);
-            let selection_color = Color::from_rgb8(0x33, 0x66, 0x99).with_alpha(0.5 * opacity);
+        let (select_from, select_to) = content.selection_display_range();
+        if select_from < select_to {
+            let start_x = measure_width(text, &chars[..select_from.min(chars.len())], font_size);
+            let end_x = measure_width(text, &chars[..select_to.min(chars.len())], font_size);
             self.rects.push(RectDraw {
                 geometry: Rect::new(
-                    Point::new(x + padding + start_x, baseline_y),
+                    Point::new(x + inset + start_x, origin_y),
                     Size::new((end_x - start_x).max(1.0), line_height),
                 ),
                 corner_radius: 2.0,
-                fill: selection_color,
+                fill: SELECTION_COLOR.with_alpha(0.5 * opacity),
                 shadow: None,
                 clip,
                 rotation: 0.0,
                 gradient: None,
             });
         }
-        // Cursor: a 2dp caret, centered vertically; during composition it
+        // Cursor: a 2dp caret, centred vertically; during composition it
         // sits after the preedit text.
-        let cursor_chars = (state.cursor
-            + if composing {
-                state.preedit.chars().count()
-            } else {
-                0
-            })
-        .min(display.chars().count());
-        let display_chars: Vec<char> = display.chars().collect();
-        let cursor_x = x + padding + measure_width(text, &display_chars[..cursor_chars], font_size);
+        let cursor_x =
+            x + inset + measure_width(text, &chars[..content.cursor.min(chars.len())], font_size);
         self.rects.push(RectDraw {
             geometry: Rect::new(
                 Point::new(cursor_x, y + height * 0.2),
                 Size::new(2.0, height * 0.6),
             ),
             corner_radius: 1.0,
-            fill: Color::WHITE.with_alpha(opacity),
+            fill: CARET_COLOR.with_alpha(opacity),
             shadow: None,
             clip,
+            rotation: 0.0,
+            gradient: None,
+        });
+    }
+
+    /// Paints a multi-line field: the wrapped lines laid out from the
+    /// inset, with the selection and the caret on their own visual lines.
+    ///
+    /// The content is clipped to the field's own box — unlike the one-line
+    /// painter — because a multi-line field with a declared `height` is
+    /// *meant* to hold more than it shows (that is what makes it scrollable
+    /// later); letting the overflow paint outside would cover its
+    /// neighbours.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_wrapped_input(
+        &mut self,
+        content: &InputContent,
+        placeholder: &str,
+        bounds: Rect,
+        inset: f32,
+        font_size: f32,
+        tint: Color,
+        opacity: f32,
+        radius: f32,
+        clip: Option<ClipDraw>,
+        text: &mut nui_text::TextSystem,
+        focused: bool,
+    ) {
+        let wrap_width = (bounds.size.width - inset * 2.0).max(1.0);
+        let layout = text.layout_wrapped(&content.display, font_size, wrap_width);
+        let inner_clip = push_clip(clip, bounds, radius);
+        let origin = Point::new(bounds.origin.x + inset, bounds.origin.y + inset);
+        if content.display.is_empty() {
+            if !placeholder.is_empty() {
+                let dim = PLACEHOLDER_COLOR.with_alpha(opacity);
+                self.push_glyphs(
+                    text,
+                    placeholder,
+                    font_size,
+                    origin.x,
+                    origin.y,
+                    dim,
+                    inner_clip,
+                );
+            }
+        } else {
+            self.push_placed(text, &layout.glyphs, origin, tint, inner_clip);
+        }
+        if !focused {
+            return;
+        }
+        // The selection, line by line: a range crossing a wrap is two rects.
+        let (select_from, select_to) = content.selection_display_range();
+        for (line, from, to) in range_spans(&layout, select_from, select_to) {
+            let metrics = &layout.lines[line];
+            self.rects.push(RectDraw {
+                geometry: Rect::new(
+                    Point::new(origin.x + from, origin.y + metrics.top),
+                    Size::new((to - from).max(1.0), metrics.height),
+                ),
+                corner_radius: 2.0,
+                fill: SELECTION_COLOR.with_alpha(0.5 * opacity),
+                shadow: None,
+                clip: inner_clip,
+                rotation: 0.0,
+                gradient: None,
+            });
+        }
+        // The IME underline, on whichever line the composition landed.
+        if content.composing {
+            let span_end = content.cursor;
+            for (line, from, to) in range_spans(&layout, content.caret_text, span_end) {
+                let metrics = &layout.lines[line];
+                let bottom = origin.y + metrics.top + metrics.height;
+                self.rects.push(RectDraw {
+                    geometry: Rect::new(
+                        Point::new(origin.x + from, bottom - 2.0),
+                        Size::new((to - from).max(2.0), 2.0),
+                    ),
+                    corner_radius: 0.0,
+                    fill: tint,
+                    shadow: None,
+                    clip: inner_clip,
+                    rotation: 0.0,
+                    gradient: None,
+                });
+            }
+        }
+        let (caret_x, caret_top, caret_height) = layout.caret_box(content.cursor);
+        self.rects.push(RectDraw {
+            geometry: Rect::new(
+                Point::new(
+                    origin.x + caret_x,
+                    origin.y + caret_top + caret_height * 0.1,
+                ),
+                Size::new(2.0, caret_height * 0.8),
+            ),
+            corner_radius: 1.0,
+            fill: CARET_COLOR.with_alpha(opacity),
+            shadow: None,
+            clip: inner_clip,
             rotation: 0.0,
             gradient: None,
         });
@@ -787,7 +1148,14 @@ impl SceneBuilder {
         }
         if let Some((width, cap, color)) = stroke_style_of(element) {
             for loop_points in &loops {
-                self.push_stroke(loop_points.clone(), width, cap, color, clip, Point::new(x, y));
+                self.push_stroke(
+                    loop_points.clone(),
+                    width,
+                    cap,
+                    color,
+                    clip,
+                    Point::new(x, y),
+                );
             }
         }
     }
@@ -799,11 +1167,7 @@ impl SceneBuilder {
     /// buffer every frame. The element's inherited clip does not reach the
     /// sub-scene — the layer texture bounds ARE the clip, matching how
     /// `layer.*` capture works.
-    fn collect_canvas_one(
-        &mut self,
-        element: &nui_runtime::Element,
-        bounds: Rect,
-    ) {
+    fn collect_canvas_one(&mut self, element: &nui_runtime::Element, bounds: Rect) {
         let Some(painter) = element.canvas.as_ref() else {
             return;
         };
@@ -860,14 +1224,38 @@ impl SceneBuilder {
         clip: Option<ClipDraw>,
     ) {
         let shaped = text.shape(content, font_size);
-        for glyph in &shaped.glyphs {
+        self.push_placed(
+            text,
+            &shaped.glyphs,
+            Point::new(origin_x, origin_y),
+            tint,
+            clip,
+        );
+    }
+
+    /// Pushes the quads for already-shaped glyphs, placed relative to the
+    /// block origin.
+    ///
+    /// The multi-line path shapes through a wrap (so it has to own the
+    /// layout) while the single-line path shapes per call; both end here,
+    /// because turning a glyph into a texture quad is the same work either
+    /// way.
+    fn push_placed(
+        &mut self,
+        text: &mut nui_text::TextSystem,
+        glyphs: &[nui_text::ShapedGlyph],
+        origin: Point,
+        tint: Color,
+        clip: Option<ClipDraw>,
+    ) {
+        for glyph in glyphs {
             let Some(quad) = text.glyph_quad(&glyph.key) else {
                 continue;
             };
             self.texts.push(TextDraw {
                 origin: Point::new(
-                    origin_x + glyph.x + quad.left as f32,
-                    origin_y + glyph.y + quad.top as f32,
+                    origin.x + glyph.x + quad.left as f32,
+                    origin.y + glyph.y + quad.top as f32,
                 ),
                 size: Size::new(quad.slot.width as f32, quad.slot.height as f32),
                 mask: (quad.slot.x, quad.slot.y, quad.slot.width, quad.slot.height),
@@ -879,8 +1267,19 @@ impl SceneBuilder {
     }
 
     /// Finalizes the scene.
-    pub fn build(self) -> Scene {
-        return Scene {
+    ///
+    /// Overlays are *flattened in* here, at the tail of each draw list.
+    /// That is what gives them their z-order: the renderer paints rects,
+    /// then paths, then strokes, then images, then glyphs, so appending an
+    /// overlay's scrim to `rects` and its label to `texts` puts both above
+    /// every ordinary element.
+    ///
+    /// The overlay walk already flattened nested overlays (it calls
+    /// `build` on its own sub-builder), so one level of flattening here is
+    /// enough — `inner.overlays` is always empty.
+    pub fn build(mut self) -> Scene {
+        let overlays = std::mem::take(&mut self.overlays);
+        let mut scene = Scene {
             rects: self.rects,
             sources: self.sources,
             texts: self.texts,
@@ -888,7 +1287,14 @@ impl SceneBuilder {
             polylines: self.polylines,
             paths: self.paths,
             layers: self.layers,
+            overlays: Vec::new(),
         };
+        for overlay in overlays {
+            // The hoist already built the sub-scene, so this is a plain
+            // append: no second `build` pass, no coordinate shift.
+            scene.absorb_overlay(*overlay.scene);
+        }
+        return scene;
     }
 }
 
@@ -899,6 +1305,84 @@ fn push_clip(inherited: Option<ClipDraw>, bounds: Rect, radius: f32) -> Option<C
         Some(current) => Some(current.intersect(next)),
         None => Some(next),
     };
+}
+
+/// One text field's resolved content: what to draw, and where the caret and
+/// the selection are *in that string*.
+///
+/// Resolving this once — preedit inlined, password masked — is what keeps
+/// the one-line and multi-line painters pure placement: neither has to know
+/// about IME or masking, only about where things go.
+struct InputContent {
+    /// The string to shape and draw.
+    display: String,
+    /// Caret position in `display`, as a char index.
+    cursor: usize,
+    /// Caret position in the *text* (i.e. with the preedit excluded).
+    caret_text: usize,
+    /// How many chars the preedit contributes to `display`.
+    preedit_chars: usize,
+    /// Selection range in the *text*.
+    selection: (usize, usize),
+    /// Whether an IME composition is live.
+    composing: bool,
+}
+
+impl InputContent {
+    /// Maps a text char index to its index in `display`, skipping the
+    /// preedit's chars when the index is past the caret.
+    fn display_index(&self, index: usize) -> usize {
+        if !self.composing || index <= self.caret_text {
+            return index;
+        }
+        return index + self.preedit_chars;
+    }
+
+    /// The selection as indices into `display`.
+    fn selection_display_range(&self) -> (usize, usize) {
+        return (
+            self.display_index(self.selection.0),
+            self.display_index(self.selection.1),
+        );
+    }
+}
+
+/// Replaces every char with a bullet, keeping the char count — the caret
+/// and the selection positions in `display` stay valid.
+fn mask_text(text: &str) -> String {
+    return MASK_CHAR.repeat(text.chars().count());
+}
+
+/// Where a char range `start..end` sits in a wrapped layout: one
+/// `(line index, x0, x1)` span per visual line the range touches, x
+/// measured from the layout's origin.
+///
+/// One range can be several rects — that is what a selection crossing a
+/// wrap looks like. Shared by the selection highlight and the IME
+/// underline, which cover the same geometry at different heights.
+fn range_spans(
+    layout: &nui_text::WrappedLayout,
+    start: usize,
+    end: usize,
+) -> Vec<(usize, f32, f32)> {
+    let mut spans = Vec::new();
+    for (index, line) in layout.lines.iter().enumerate() {
+        let from = start.max(line.start);
+        let to = end.min(line.end);
+        if from >= to {
+            continue;
+        }
+        // `caret_x` at a line's *end* reports the next line's start, so the
+        // end of a span is the line's own width.
+        let x0 = layout.caret_x(from);
+        let x1 = if to >= line.end {
+            line.width
+        } else {
+            layout.caret_x(to)
+        };
+        spans.push((index, x0.min(x1), x0.max(x1)));
+    }
+    return spans;
 }
 
 /// The text color: `color` property first, `fill` fallback, white default.
@@ -916,46 +1400,6 @@ fn text_color_of(element: &nui_runtime::Element) -> Color {
 fn measure_width(text: &mut nui_text::TextSystem, chars: &[char], font_size: f32) -> f32 {
     let prefix: String = chars.iter().collect();
     return text.measure(&prefix, font_size).0;
-}
-
-/// Extracts a dp f32 from a property value.
-fn dp_of(value: &nui_core::Value) -> Option<f32> {
-    return match value {
-        nui_core::Value::Int(inner) => Some(*inner as f32),
-        nui_core::Value::Float(inner) => Some(*inner as f32),
-        nui_core::Value::Length(nui_core::Length::Dp(inner)) => Some(*inner),
-        _ => None,
-    };
-}
-
-/// Reads an `f32`-shaped property.
-fn f_property(element: &nui_runtime::Element, name: &str) -> Option<f32> {
-    return element.get(name).and_then(|value| {
-        return match value {
-            nui_core::Value::Int(inner) => Some(*inner as f32),
-            nui_core::Value::Float(inner) => Some(*inner as f32),
-            nui_core::Value::Length(nui_core::Length::Dp(inner)) => Some(*inner),
-            _ => None,
-        };
-    });
-}
-
-/// Reads a color property.
-fn color_property(element: &nui_runtime::Element, name: &str) -> Option<Color> {
-    return element.get(name).and_then(|value| {
-        return match value {
-            nui_core::Value::Color(color) => Some(*color),
-            _ => None,
-        };
-    });
-}
-
-/// Reads a bool property.
-fn bool_property(element: &nui_runtime::Element, name: &str) -> bool {
-    return element
-        .get(name)
-        .and_then(|value| return value.as_bool().ok())
-        .unwrap_or(false);
 }
 
 /// Parses `"x,y x,y ..."` point pairs (whitespace between pairs, comma
@@ -1071,10 +1515,265 @@ fn level_points(
     return points;
 }
 
-/// Reads the stroke style: `stroke.width` (dp) is required, `stroke.cap`
-/// maps `"round"`/`"butt"` (default round), and the color comes from
-/// `color` then `stroke.color` (white default) with the element's opacity
-/// folded in.
+/// Paints one widget part into the draw list. Returns whether it drew a
+/// surface (so the caller can register the element as a hit-test source).
+fn paint_part(
+    builder: &mut SceneBuilder,
+    part: crate::widget::WidgetPart,
+    bounds: Rect,
+    clip: Option<ClipDraw>,
+    opacity: f32,
+    text: &mut nui_text::TextSystem,
+) -> bool {
+    use crate::widget::WidgetPart;
+    let origin = bounds.origin;
+    let scale = |color: Color| return color.with_alpha(color.alpha() * opacity);
+    return match part {
+        WidgetPart::Rect {
+            x,
+            y,
+            width,
+            height,
+            radius,
+            color,
+        } => {
+            builder.rects.push(RectDraw {
+                geometry: Rect::new(
+                    Point::new(origin.x + x, origin.y + y),
+                    Size::new(width, height),
+                ),
+                corner_radius: radius,
+                fill: scale(color),
+                shadow: None,
+                clip,
+                rotation: 0.0,
+                gradient: None,
+            });
+            true
+        }
+        WidgetPart::Surface {
+            x,
+            y,
+            width,
+            height,
+            radius,
+            fill,
+            border,
+            shadow,
+        } => {
+            builder.rects.push(RectDraw {
+                geometry: Rect::new(
+                    Point::new(origin.x + x, origin.y + y),
+                    Size::new(width, height),
+                ),
+                corner_radius: radius,
+                fill: scale(fill),
+                shadow: shadow.map(|shadow| {
+                    return Shadow {
+                        offset: Point::new(shadow.dx, shadow.dy),
+                        blur: shadow.blur,
+                        color: scale(shadow.color),
+                    };
+                }),
+                clip,
+                rotation: 0.0,
+                gradient: None,
+            });
+            if let Some((stroke, color)) = border {
+                push_rect_outline(
+                    builder,
+                    origin,
+                    x,
+                    y,
+                    width,
+                    height,
+                    stroke,
+                    radius,
+                    scale(color),
+                    clip,
+                );
+            }
+            true
+        }
+        WidgetPart::Outline {
+            x,
+            y,
+            width,
+            height,
+            stroke,
+            radius,
+            color,
+        } => {
+            push_rect_outline(
+                builder,
+                origin,
+                x,
+                y,
+                width,
+                height,
+                stroke,
+                radius,
+                scale(color),
+                clip,
+            );
+            false
+        }
+        WidgetPart::Line {
+            points,
+            stroke,
+            color,
+        } => {
+            if points.len() < 2 {
+                return false;
+            }
+            let points = points
+                .into_iter()
+                .map(|(px, py)| return Point::new(origin.x + px, origin.y + py))
+                .collect();
+            // Widget outlines are crisp: round joins via capsule segments,
+            // butt caps so a check mark's tips stay square.
+            builder.push_stroke(
+                points,
+                stroke,
+                LineCap::Round,
+                scale(color),
+                clip,
+                Point::ZERO,
+            );
+            false
+        }
+        WidgetPart::Label {
+            text: content,
+            size,
+            color,
+            padding,
+            center_y,
+        } => {
+            let line_height = text_measure_height(text, &content, size);
+            let baseline = origin.y + center_y - line_height / 2.0;
+            builder.push_glyphs(
+                text,
+                &content,
+                size,
+                origin.x + padding,
+                baseline,
+                scale(color),
+                clip,
+            );
+            false
+        }
+    };
+}
+
+/// The shaped height of a line, for vertical centering.
+fn text_measure_height(text: &mut nui_text::TextSystem, content: &str, size: f32) -> f32 {
+    return text.shape(content, size).height.max(size * 1.2);
+}
+
+/// Strokes a rectangle outline as four polyline segments (the capsule
+/// pipeline has no closed-ring primitive; four segments with round caps
+/// meet at the corners).
+#[allow(clippy::too_many_arguments)]
+fn push_rect_outline(
+    builder: &mut SceneBuilder,
+    origin: Point,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    stroke: f32,
+    radius: f32,
+    color: Color,
+    clip: Option<ClipDraw>,
+) {
+    if width <= 0.0 || height <= 0.0 || stroke <= 0.0 {
+        return;
+    }
+    let inset = stroke / 2.0;
+    let left = origin.x + x + inset;
+    let top = origin.y + y + inset;
+    let right = origin.x + x + width - inset;
+    let bottom = origin.y + y + height - inset;
+    let corner = radius.clamp(0.0, (right - left).min(bottom - top) / 2.0);
+    let mut points: Vec<Point> = Vec::new();
+    // Top-left corner arc: a quarter circle approximated by three points
+    // (the capsule pipeline renders joins, so coarse is fine).
+    if corner > 0.0 {
+        points.push(Point::new(left + corner, top));
+        points.push(Point::new(right - corner, top));
+        push_corner(
+            &mut points,
+            right - corner,
+            top + corner,
+            corner,
+            -90.0,
+            0.0,
+        );
+        points.push(Point::new(right, bottom - corner));
+        push_corner(
+            &mut points,
+            right - corner,
+            bottom - corner,
+            corner,
+            0.0,
+            90.0,
+        );
+        points.push(Point::new(left + corner, bottom));
+        push_corner(
+            &mut points,
+            left + corner,
+            bottom - corner,
+            corner,
+            90.0,
+            180.0,
+        );
+        points.push(Point::new(left, top + corner));
+        push_corner(
+            &mut points,
+            left + corner,
+            top + corner,
+            corner,
+            180.0,
+            270.0,
+        );
+        points.push(Point::new(left + corner, top));
+    } else {
+        points.extend([
+            Point::new(left, top),
+            Point::new(right, top),
+            Point::new(right, bottom),
+            Point::new(left, bottom),
+            Point::new(left, top),
+        ]);
+    }
+    builder.push_stroke(points, stroke, LineCap::Round, color, clip, Point::ZERO);
+}
+
+/// Appends `steps` points along an arc centered at `(cx, cy)`, from
+/// `start_deg` to `end_deg`.
+fn push_corner(
+    points: &mut Vec<Point>,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    start_deg: f32,
+    end_deg: f32,
+) {
+    const STEPS: usize = 4;
+    for step in 0..=STEPS {
+        let t = step as f32 / STEPS as f32;
+        let angle = (start_deg + (end_deg - start_deg) * t).to_radians();
+        points.push(Point::new(
+            cx + radius * angle.cos(),
+            cy + radius * angle.sin(),
+        ));
+    }
+}
+
+/// Reads the stroke style: `stroke.width` (dp) is the gate — no width, no
+/// stroke. The cap is `cap`, maps `"round"`/`"butt"` (default round), and
+/// the color comes from `color` then `stroke.color` (white default) with
+/// the element's opacity folded in.
 fn stroke_style_of(element: &nui_runtime::Element) -> Option<(f32, LineCap, Color)> {
     let width = f_property(element, "stroke.width").unwrap_or(0.0);
     if width <= 0.0 {
@@ -1100,6 +1799,7 @@ fn stroke_style_of(element: &nui_runtime::Element) -> Option<(f32, LineCap, Colo
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::testkit::{build, widget, window_tree};
     use nui_core::Value;
     use nui_runtime::Element;
 
@@ -1138,6 +1838,57 @@ mod tests {
         assert_eq!(draw.corner_radius, 8.0);
         // Premultiplied by opacity at build time.
         assert!((draw.fill.alpha() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_hidden_element_is_not_painted_and_takes_its_subtree_with_it() {
+        let mut tree = ElementTree::new();
+        let mut hidden = sized_element(10.0, 10.0);
+        hidden.set("visible", Value::Bool(false));
+        let hidden_id = tree.insert(hidden);
+        // A visible child under a hidden parent: nothing under a hidden
+        // node is reachable, so the subtree goes too.
+        let child = tree.insert(sized_element(10.0, 10.0));
+        tree.append_child(hidden_id, child);
+        let shown = tree.insert(sized_element(10.0, 10.0));
+        for id in [hidden_id, shown] {
+            tree.push_root(id);
+        }
+        let scene = SceneBuilder::build_with_context(
+            &tree,
+            &mut nui_text::TextSystem::with_embedded_font(),
+            SceneContext {
+                focused: None,
+                image_keys: &HashMap::new(),
+            },
+        );
+        assert_eq!(scene.rects.len(), 1);
+        assert_eq!(scene.sources, vec![shown]);
+    }
+
+    #[test]
+    fn a_hidden_label_never_reaches_the_text_system() {
+        // Text paints from `x`/`y` and never consults `width`/`height`, so
+        // it is exactly the element class a zero-box pruning rule would
+        // have missed. The walk has to stop before the shaping call, which
+        // is why this asserts on `texts` and not on a rect.
+        let mut tree = ElementTree::new();
+        let mut hidden = Element::new("Text", None);
+        hidden.set("content", Value::String("hidden".to_string()));
+        hidden.set("width", Value::Length(nui_core::Length::Dp(80.0)));
+        hidden.set("height", Value::Length(nui_core::Length::Dp(20.0)));
+        hidden.set("visible", Value::Bool(false));
+        let hidden_id = tree.insert(hidden);
+        tree.push_root(hidden_id);
+        let scene = SceneBuilder::build_with_context(
+            &tree,
+            &mut nui_text::TextSystem::with_embedded_font(),
+            SceneContext {
+                focused: None,
+                image_keys: &HashMap::new(),
+            },
+        );
+        assert!(scene.texts.is_empty(), "no glyph quads: {:?}", scene.texts);
     }
 
     #[test]
@@ -1339,7 +2090,10 @@ mod tests {
         }
         // Full levels draw a flat line exactly `amplitude` above the middle.
         let flat = level_points(bounds, 15.0, &[1.0, 1.0], 30, false);
-        assert!(flat.iter().all(|point| return (point.y - 15.0).abs() < 1e-3));
+        assert!(
+            flat.iter()
+                .all(|point| return (point.y - 15.0).abs() < 1e-3)
+        );
     }
 
     #[test]
@@ -1433,10 +2187,7 @@ mod tests {
         let mut path = Element::new("Path", None);
         path.set("x", Value::Float(5.0));
         path.set("y", Value::Float(6.0));
-        path.set(
-            "d",
-            Value::String("M 0 0 L 48 0 L 24 42 Z".to_string()),
-        );
+        path.set("d", Value::String("M 0 0 L 48 0 L 24 42 Z".to_string()));
         path.set("fill", Value::Color(Color::from_rgb8(255, 0, 0)));
         path.set("stroke.width", Value::Float(2.0));
         path.set("stroke.color", Value::Color(Color::from_rgb8(0, 0, 255)));
@@ -1460,7 +2211,11 @@ mod tests {
         assert!((fill.fill.alpha() - 0.5).abs() < 1e-6, "opacity folded");
         // Stroke: the same ring goes through the polyline pipeline.
         assert_eq!(scene.polylines.len(), 1);
-        assert_eq!(scene.polylines[0].points.len(), 4, "closed ring of 3 points");
+        assert_eq!(
+            scene.polylines[0].points.len(),
+            4,
+            "closed ring of 3 points"
+        );
         assert_eq!(scene.polylines[0].width, 2.0);
     }
 
@@ -1492,5 +2247,163 @@ mod tests {
         // No fill anywhere; only the stroke-only path produces a polyline.
         assert_eq!(scene.paths.len(), 0);
         assert_eq!(scene.polylines.len(), 1);
+    }
+
+    #[test]
+    fn an_overlay_element_paints_after_the_content_it_covers() {
+        // A plain rect declared *after* an overlay must still end up
+        // beneath it: the overlay is hoisted, not merely later in the
+        // document.
+        let mut overlay = widget("Rectangle", 100.0, 50.0);
+        overlay.set("overlay", Value::Bool(true));
+        overlay.set("fill", Value::Color(nui_core::Color::from_rgb8(255, 0, 0)));
+        let mut plain = widget("Rectangle", 100.0, 50.0);
+        plain.set("fill", Value::Color(nui_core::Color::from_rgb8(0, 255, 0)));
+        let tree = window_tree(vec![overlay, plain]);
+        let scene = build(&tree);
+        // Two rects, and the overlay's is last: the renderer paints rects
+        // in list order, so last = topmost.
+        assert_eq!(scene.rects.len(), 2);
+        assert_eq!(scene.rects[0].fill, nui_core::Color::from_rgb8(0, 255, 0));
+        assert_eq!(scene.rects[1].fill, nui_core::Color::from_rgb8(255, 0, 0));
+        assert!(scene.overlays.is_empty(), "flattened at build time");
+    }
+
+    #[test]
+    fn a_closed_dialog_paints_nothing_at_all() {
+        let mut dialog = widget("Dialog", 240.0, 160.0);
+        dialog.set("open", Value::Bool(false));
+        let mut plain = widget("Rectangle", 100.0, 50.0);
+        plain.set("fill", Value::Color(nui_core::Color::from_rgb8(0, 255, 0)));
+        let tree = window_tree(vec![dialog, plain]);
+        let scene = build(&tree);
+        assert_eq!(scene.rects.len(), 1, "only the plain rect remains");
+        assert_eq!(scene.rects[0].fill, nui_core::Color::from_rgb8(0, 255, 0));
+    }
+
+    #[test]
+    fn an_overlay_inside_a_layer_still_reaches_the_front() {
+        // The M9 layer path walks a subtree; an overlay in there must be
+        // hoisted to the top of that sub-scene, not swallowed by it.
+        let mut layer = widget("Rectangle", 200.0, 100.0);
+        layer.set("layer.blur", Value::Float(2.0));
+        let mut dialog = widget("Dialog", 120.0, 80.0);
+        dialog.set("open", Value::Bool(true));
+        let mut tree = ElementTree::new();
+        let mut root = Element::new("Column", None);
+        root.set("width", Value::Float(400.0));
+        root.set("height", Value::Float(300.0));
+        let root_id = tree.insert(root);
+        tree.push_root(root_id);
+        let layer_id = tree.insert(layer);
+        tree.append_child(root_id, layer_id);
+        let dialog_id = tree.insert(dialog);
+        tree.append_child(layer_id, dialog_id);
+        let scene = build(&tree);
+        // One M9 layer, whose own scene holds the dialog's draws at the
+        // tail (backdrop + panel) rather than losing them.
+        assert_eq!(scene.layers.len(), 1);
+        let inner = &scene.layers[0].scene;
+        assert_eq!(inner.rects.len(), 2, "backdrop + panel: {:?}", inner.rects);
+    }
+
+    #[test]
+    fn a_multi_line_field_draws_its_wrapped_lines_stacked() {
+        // A field 100dp wide holding 31 chars: at 16dp the text cannot fit
+        // on one line, so the glyphs must arrive at more than one `y`. This
+        // is the draw-side half of the wrap — `nui-layout` decides the box,
+        // this decides that the painted lines follow the same breaks.
+        let content = "alpha beta gamma delta epsilon";
+        let mut field = widget("TextInput", 100.0, 60.0);
+        field.set("text", Value::String(content.to_string()));
+        field.set("multiline", Value::Bool(true));
+        field.text_input = Some(nui_runtime::TextInputState::from_text(content));
+        let tree = window_tree(vec![field]);
+        let scene = build(&tree);
+
+        assert!(!scene.texts.is_empty(), "the content reaches the scene");
+        let top = scene
+            .texts
+            .iter()
+            .map(|quad| return quad.origin.y)
+            .fold(f32::INFINITY, f32::min);
+        let bottom = scene
+            .texts
+            .iter()
+            .map(|quad| return quad.origin.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            bottom - top > 12.0,
+            "glyphs on more than one line: spread {top}..{bottom}"
+        );
+        // ... and they stay inside the box, inset by the field's own 8dp.
+        for quad in &scene.texts {
+            assert!(
+                quad.origin.x >= 7.5 && quad.origin.y >= 7.5,
+                "drawn inside the inset: {:?}",
+                quad.origin
+            );
+            assert!(
+                quad.clip.is_some(),
+                "a wrapped field clips its overflow at its own edge"
+            );
+        }
+    }
+
+    #[test]
+    fn a_password_field_draws_every_char_as_the_same_glyph() {
+        let content = "secret";
+        let field = |password: bool| {
+            let mut element = widget("TextInput", 200.0, 40.0);
+            element.set("text", Value::String(content.to_string()));
+            element.set("password", Value::Bool(password));
+            element.text_input = Some(nui_runtime::TextInputState::from_text(content));
+            return element;
+        };
+        let scene = build(&window_tree(vec![field(true)]));
+
+        assert_eq!(scene.texts.len(), 6, "one glyph per character");
+        let masks: std::collections::HashSet<(u32, u32, u32, u32)> =
+            scene.texts.iter().map(|quad| return quad.mask).collect();
+        assert_eq!(masks.len(), 1, "every char is the mask glyph");
+
+        // The same field without the flag draws the real characters, which
+        // is what makes the assertion above about masking and not about a
+        // font that happens to have one glyph.
+        let scene = build(&window_tree(vec![field(false)]));
+        let masks: std::collections::HashSet<(u32, u32, u32, u32)> =
+            scene.texts.iter().map(|quad| return quad.mask).collect();
+        assert!(masks.len() > 1, "the plain field shows distinct glyphs");
+    }
+
+    #[test]
+    fn a_required_label_draws_its_marker_after_the_text() {
+        let mut label = widget("Text", 60.0, 20.0);
+        label.set("content", Value::String("Name".to_string()));
+        label.set("for", Value::String("field".to_string()));
+        label.set("required", Value::Bool(true));
+        let tree = window_tree(vec![label]);
+        let scene = build(&tree);
+
+        // Four letters plus the asterisk.
+        assert_eq!(scene.texts.len(), 5);
+        let marker = scene
+            .texts
+            .iter()
+            .max_by(|left, right| return left.origin.x.total_cmp(&right.origin.x))
+            .expect("glyphs");
+        assert_eq!(
+            marker.color, REQUIRED_COLOR,
+            "the marker is the trailing glyph, in the form-marker red"
+        );
+        assert_eq!(
+            scene
+                .texts
+                .iter()
+                .filter(|quad| return quad.color == REQUIRED_COLOR)
+                .count(),
+            1,
+            "exactly one marker"
+        );
     }
 }

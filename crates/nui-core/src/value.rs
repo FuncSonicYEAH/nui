@@ -72,6 +72,22 @@ impl Value {
         };
     }
 
+    /// Reads an enum variant name; returns [`Error::TypeMismatch`] on a
+    /// wrong type. String-typed values are accepted too, because a bare
+    /// identifier in `.nui` resolves to an `Enum` (`bold`) while a quoted
+    /// one resolves to a `String` (`"bold"`) — property surfaces that take
+    /// a variant name should accept both spellings.
+    pub fn as_enum(&self) -> Result<&str> {
+        return match self {
+            Value::Enum(name) => Ok(name.as_str()),
+            Value::String(text) => Ok(text.as_str()),
+            other => Err(Error::TypeMismatch {
+                expected: "Enum",
+                found: other.type_name(),
+            }),
+        };
+    }
+
     /// Reads a number: `Int` and `Float` unify into f64 (the numeric channel
     /// for binding expressions); other types return [`Error::TypeMismatch`].
     ///
@@ -245,6 +261,18 @@ mod tests {
     fn as_bool_and_as_str_succeed_on_match() {
         assert!(!Value::from(false).as_bool().unwrap());
         assert_eq!(Value::from("hello").as_str().unwrap(), "hello");
+    }
+
+    #[test]
+    fn as_enum_accepts_enum_and_string() {
+        assert_eq!(Value::Enum("bold".to_string()).as_enum().unwrap(), "bold");
+        // A quoted spelling is a `String` at runtime; variant readers take
+        // both so `variant = "primary"` and `variant = primary` agree.
+        assert_eq!(
+            Value::String("primary".to_string()).as_enum().unwrap(),
+            "primary"
+        );
+        assert!(Value::Int(3).as_enum().is_err());
     }
 
     #[test]

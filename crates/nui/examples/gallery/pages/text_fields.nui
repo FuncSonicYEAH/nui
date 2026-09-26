@@ -1,0 +1,64 @@
+// Text fields — the whole `TextInput` family: a multi-line area, the
+// password mask, `read_only` / `max_length` / `select_all_on_focus`, a
+// `validator` with its `invalid` write-back, form labels with `for` /
+// `required`, and two `SpinBox` steppers (integer and fractional, which is
+// where the formatting of a step shows).
+//
+// State on the root element, one property per field. `text_mail.invalid`
+// is the validator's write-back — the host recomputes it whenever the text
+// changes, and the `fill` binding above it reads it like any other
+// property.
+Column(id = text_fields_page, spacing = 10dp, padding = 24dp,
+       name = "", secret = "", bio = "", email = "ada@",
+       count = 3.0, fine = 0.5, saved = false) {
+
+    Text(content = "Text fields", font.size = 18dp, color = #e8ecf2)
+
+    Text(content = "Full name", for = "text_name", required = true,
+         font.size = 13dp, color = #9aa4b2)
+    TextInput(id = text_name, width = 360dp, height = 40dp,
+              placeholder = "Ada Lovelace", max_length = 16,
+              select_all_on_focus = true, text <=> text_fields_page.name)
+
+    Text(content = "Password", for = "text_secret", required = true,
+         font.size = 13dp, color = #9aa4b2)
+    TextInput(id = text_secret, width = 360dp, height = 40dp,
+              placeholder = "hunter2", password = true,
+              text <=> text_fields_page.secret)
+
+    Text(content = "Read only (select and copy, no edits)",
+         for = "text_frozen", font.size = 13dp, color = #9aa4b2)
+    TextInput(id = text_frozen, width = 360dp, height = 40dp,
+              read_only = true, text = "generated-0001")
+
+    Text(content = "Notes — wraps, grows, Enter makes a new line",
+         for = "text_bio", font.size = 13dp, color = #9aa4b2)
+    TextInput(id = text_bio, width = 360dp, multiline = true,
+              placeholder = "a few lines about yourself",
+              text <=> text_fields_page.bio)
+
+    Text(content = "Email — validator = \"email\" turns the box red",
+         for = "text_mail", font.size = 13dp, color = #9aa4b2)
+    TextInput(id = text_mail, width = 360dp, height = 40dp,
+              placeholder = "you@example.com", validator = "email",
+              fill <- text_mail.invalid ? #3a2426 : #262b33,
+              text <=> text_fields_page.email)
+
+    Text(content = "Quantity / Step 0.25", font.size = 13dp, color = #9aa4b2)
+    Row(spacing = 12dp, height = 40dp) {
+        SpinBox(id = text_count, min = 0, max = 10, step = 1,
+                width = 140dp, height = 36dp,
+                value <=> text_fields_page.count)
+        SpinBox(id = text_fine, min = 0, max = 1, step = 0.25,
+                width = 140dp, height = 36dp,
+                value <=> text_fields_page.fine)
+    }
+
+    Button(id = text_save, label <- "Save ({text_fields_page.name} = {text_fields_page.count})",
+           width = 200dp, height = 40dp) {
+        on click => text_fields_page.saved = true
+    }
+
+    Text(content <- text_fields_page.saved ? "saved" : "not saved yet",
+         font.size = 13dp, color = #9aa4b2)
+}

@@ -1,0 +1,21 @@
+// Canvas — the imperative escape hatch. The `.nui` side is only a shell;
+// the host registers a behavior whose painter records a command buffer
+// (see `ChartBehavior` in host.rs), and the scene builder re-interprets
+// it every frame.
+//
+// Fill goes through ear clipping, strokes reuse the capsule pipeline, and
+// the result composites through the offscreen layer pipeline — zero new
+// GPU code.
+//
+// The type stays `Canvas`: that is the built-in element the render layer
+// knows how to collect, and `build_registry` attaches the painter to it.
+Column(id = canvas_page, spacing = 16dp, padding = 24dp) {
+
+    Text(content = "Canvas — the host paints through a command buffer",
+         font.size = 14dp, color = #e8ecf2)
+
+    Canvas(id = canvas_chart, width = 240dp, height = 230dp, clip = true)
+
+    Text(content = "area fill (ear clipping) + stroked 270° gauge",
+         font.size = 13dp, color = #9aa4b2)
+}

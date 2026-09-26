@@ -191,7 +191,10 @@ fn canvas_interprets_fills_and_strokes_through_the_layer_pipeline() {
     );
     // Outside the canvas content.
     let outside = pixel(&data, stride, 115, 95);
-    assert!(outside[0] < 60, "empty canvas area stays black, got {outside:?}");
+    assert!(
+        outside[0] < 60,
+        "empty canvas area stays black, got {outside:?}"
+    );
 }
 
 #[test]
@@ -209,5 +212,8 @@ fn canvas_without_a_painter_paints_nothing() {
     tree.append_child(root_id, canvas_id);
     let (data, stride) = render_pixels(&mut tree, nui_core::Size::new(60.0, 60.0));
     let probe = pixel(&data, stride, 30, 30);
-    assert!(probe[0] < 60, "a shell without a painter paints nothing, got {probe:?}");
+    assert!(
+        probe[0] < 60,
+        "a shell without a painter paints nothing, got {probe:?}"
+    );
 }

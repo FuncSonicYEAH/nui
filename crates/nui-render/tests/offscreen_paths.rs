@@ -152,13 +152,22 @@ fn triangle_fill_covers_interior_not_outside() {
     let mut tree = path_tree("M 10 5 L 90 5 L 50 55 Z", (100.0, 60.0));
     let (data, stride) = render_pixels(&mut tree, nui_core::Size::new(100.0, 60.0));
     let top = pixel(&data, stride, 50, 10);
-    assert!(top[0] > 180, "triangle interior near the top edge is red, got {top:?}");
+    assert!(
+        top[0] > 180,
+        "triangle interior near the top edge is red, got {top:?}"
+    );
     let middle = pixel(&data, stride, 50, 30);
     assert!(middle[0] > 180, "triangle center is red, got {middle:?}");
     let outside_left = pixel(&data, stride, 4, 30);
-    assert!(outside_left[0] < 60, "left of the triangle stays black, got {outside_left:?}");
+    assert!(
+        outside_left[0] < 60,
+        "left of the triangle stays black, got {outside_left:?}"
+    );
     let outside_bottom = pixel(&data, stride, 50, 58);
-    assert!(outside_bottom[0] < 60, "below the apex stays black, got {outside_bottom:?}");
+    assert!(
+        outside_bottom[0] < 60,
+        "below the apex stays black, got {outside_bottom:?}"
+    );
 }
 
 #[test]
@@ -189,10 +198,16 @@ fn concave_star_fills_the_arms_but_not_the_notches() {
     // The notch between the top arm and the upper-right arm (36 degrees
     // off vertical, radius 30 > the 16dp valley) is outside.
     let notch = pixel(&data, stride, 68, 26);
-    assert!(notch[0] < 60, "the notch between arms stays black, got {notch:?}");
+    assert!(
+        notch[0] < 60,
+        "the notch between arms stays black, got {notch:?}"
+    );
     // Outside the bounding ring entirely.
     let outside = pixel(&data, stride, 95, 95);
-    assert!(outside[0] < 60, "beyond the star stays black, got {outside:?}");
+    assert!(
+        outside[0] < 60,
+        "beyond the star stays black, got {outside:?}"
+    );
 }
 
 #[test]
@@ -210,7 +225,10 @@ fn stroke_draws_on_top_of_the_fill() {
         path.set("d", Value::String("M 10 5 L 90 5 L 50 55 Z".to_string()));
         path.set("fill", Value::Color(Color::from_rgb8(255, 0, 0)));
         path.set("stroke.width", Value::Float(4.0));
-        path.set("stroke.color", Value::Color(Color::from_rgb8(255, 255, 255)));
+        path.set(
+            "stroke.color",
+            Value::Color(Color::from_rgb8(255, 255, 255)),
+        );
         let path_id = tree.insert(path);
         tree.append_child(root_id, path_id);
         tree
@@ -234,5 +252,8 @@ fn collinear_degenerate_path_paints_nothing() {
     let mut tree = path_tree("M 0 0 L 50 50 L 100 100", (100.0, 60.0));
     let (data, stride) = render_pixels(&mut tree, nui_core::Size::new(100.0, 60.0));
     let probe = pixel(&data, stride, 50, 50);
-    assert!(probe[0] < 60, "a zero-area ring paints nothing, got {probe:?}");
+    assert!(
+        probe[0] < 60,
+        "a zero-area ring paints nothing, got {probe:?}"
+    );
 }

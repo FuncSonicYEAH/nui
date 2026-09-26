@@ -234,7 +234,7 @@ impl Engine {
                 tree.remove_subtree(child);
             }
             for row in 0..desired {
-                instantiate_row(
+                let _ = instantiate_row(
                     tree,
                     self,
                     id,
@@ -316,7 +316,13 @@ impl Engine {
         let spacer = if has_spacer {
             children[0]
         } else {
-            let spacer = tree.insert(crate::element::Element::new("Spacer", None));
+            let mut spacer_element = crate::element::Element::new("Spacer", None);
+            // A `Spacer` eats free space by default (FUTURE 批次 5), but
+            // this one is a fixed pre-window offset: growing it would push
+            // the visible rows down whenever the list is taller than its
+            // content.
+            spacer_element.set("flex_grow", nui_core::Value::Float(0.0));
+            let spacer = tree.insert(spacer_element);
             tree.append_child(id, spacer);
             // Move the spacer to the front (it was appended last).
             let list = &mut tree.arena[id].children;
@@ -340,7 +346,7 @@ impl Engine {
             if row >= total {
                 break;
             }
-            instantiate_row(
+            let Some(row_root) = instantiate_row(
                 tree,
                 self,
                 id,
@@ -348,7 +354,10 @@ impl Engine {
                 model,
                 row,
                 &binding.prototype,
-            );
+            ) else {
+                continue;
+            };
+            fit_row_to_slot(tree, row_root, row_height);
             rebuilt += 1;
         }
         return rebuilt;
@@ -411,6 +420,10 @@ fn collect_subtree(tree: &ElementTree, id: ElementId, out: &mut Vec<ElementId>) 
 
 /// Clones one row's prototype children under `for_element`, tagging every
 /// element of the row subtree with the row's scope.
+///
+/// Returns the row's root element (the first prototype node's instance),
+/// which the `ListView` path sizes to its slot; `None` for a prototype
+/// with no nodes.
 pub(crate) fn instantiate_row(
     tree: &mut ElementTree,
     engine: &mut Engine,
@@ -419,15 +432,39 @@ pub(crate) fn instantiate_row(
     model: ModelId,
     row: usize,
     prototype: &[nui_compiler::NodeIr],
-) {
+) -> Option<ElementId> {
     let scope = crate::element::RowScope {
         variable: variable.to_string(),
         model,
         row,
     };
+    let mut root = None;
     for node in prototype {
         let child =
             crate::instantiate::instantiate_scoped_node(tree, engine, node, Some(scope.clone()));
         tree.append_child(for_element, child);
+        root.get_or_insert(child);
+    }
+    return root;
+}
+
+/// Sizes one `ListView` row to its slot, so taffy stacks the window's rows
+/// at exactly the positions the virtualizer computed (`row * row_height`).
+///
+/// The row is a fresh clone of the prototype, so its `height` slot still
+/// holds the document's declaration rather than a written-back
+/// measurement — which is what makes "did the row declare a height?"
+/// answerable here at all.
+fn fit_row_to_slot(tree: &mut ElementTree, row_root: ElementId, row_height: f32) {
+    let declared = tree.arena[row_root].get("height").and_then(dp_value);
+    let slot = crate::widget::row_slot(row_height, declared);
+    if let Some(height) = slot.height {
+        tree.arena[row_root].set("height", Value::Length(nui_core::Length::Dp(height)));
+    }
+    if slot.margin_bottom > 0.0 {
+        tree.arena[row_root].set(
+            "margin_bottom",
+            Value::Length(nui_core::Length::Dp(slot.margin_bottom)),
+        );
     }
 }

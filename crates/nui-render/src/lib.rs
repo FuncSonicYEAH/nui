@@ -12,10 +12,15 @@
 pub mod image;
 pub mod layer;
 pub mod path;
+pub mod props;
 pub mod rect;
 pub mod scene;
 pub mod stroke;
 pub mod text;
+pub mod widget;
+
+#[cfg(test)]
+mod testkit;
 
 pub use image::{
     DecodedImage, ImageDraw, ImageInstance, ImageLoadError, ImagePipeline, cache_key, content_hash,
@@ -27,6 +32,7 @@ pub use rect::{CameraUniform, RectInstance, RectPipeline};
 pub use scene::{LineCap, PathDraw, PolylineDraw, Scene, SceneBuilder, SceneContext, TextDraw};
 pub use stroke::{StrokeInstance, StrokePipeline};
 pub use text::{TextInstance, TextPipeline};
+pub use widget::{Palette, VisualState, WidgetPart, variant_palette};
 
 use std::collections::HashMap;
 

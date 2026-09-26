@@ -1,0 +1,32 @@
+// Waveline — an infinitely looping `Timer` drives `phase`, which feeds two
+// procedural waves (one breathing via `sin(phase)`, one mirrored) and a
+// static Cava-style `levels` line. Everything goes through the stroke
+// pipeline; no new GPU code.
+//
+// The timer is gated on the page's own `visible` flag. That flag is the
+// gallery's selection (`document()` binds it), and a page that is not on
+// screen must not keep ticking: an always-running timer would make the
+// window redraw forever, which is exactly the kind of cost the `visible`
+// switch exists to remove.
+Column(id = waves_page, spacing = 16dp, padding = 24dp, tick = 0.0) {
+
+    Text(content = "waveline — an infinite timer drives the phase",
+         font.size = 14dp, color = #e8ecf2)
+
+    Timer(interval = 33ms, running <- waves_page.visible) {
+        on timer => waves_page.tick += 11
+    }
+
+    Waveline(width = 292dp, height = 80dp,
+             amplitude <- 16 + 7 * sin(waves_page.tick * 0.017),
+             frequency = 3, phase <- waves_page.tick,
+             stroke.width = 3dp, color = #55aaee)
+
+    Waveline(width = 292dp, height = 120dp,
+             amplitude = 26, frequency = 2.5, phase <- waves_page.tick,
+             mirror = true, stroke.width = 2dp, color = #e05555)
+
+    Waveline(width = 292dp, height = 70dp,
+             levels = "0.2 0.45 0.85 0.5 0.75 0.3 0.6 0.25 0.55 0.4 0.7 0.3 0.5 0.65 0.35 0.55",
+             amplitude = 26, stroke.width = 2dp, color = #7bc47f)
+}

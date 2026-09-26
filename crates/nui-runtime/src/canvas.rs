@@ -91,14 +91,21 @@ impl CanvasPainter {
 
     /// Appends a cubic bezier to `(x, y)`.
     pub fn cubic_to(&self, c1x: f32, c1y: f32, c2x: f32, c2y: f32, x: f32, y: f32) {
-        self.ops
-            .borrow_mut()
-            .push(CanvasOp::CubicTo { c1x, c1y, c2x, c2y, x, y });
+        self.ops.borrow_mut().push(CanvasOp::CubicTo {
+            c1x,
+            c1y,
+            c2x,
+            c2y,
+            x,
+            y,
+        });
     }
 
     /// Appends a quadratic bezier to `(x, y)`.
     pub fn quadratic_to(&self, cx: f32, cy: f32, x: f32, y: f32) {
-        self.ops.borrow_mut().push(CanvasOp::QuadraticTo { cx, cy, x, y });
+        self.ops
+            .borrow_mut()
+            .push(CanvasOp::QuadraticTo { cx, cy, x, y });
     }
 
     /// Closes the current subpath back to its start.
@@ -136,12 +143,7 @@ pub struct CanvasFrame {
     /// Flattened rings to fill, in command order.
     pub fills: Vec<(nui_core::Color, Vec<Vec<nui_core::Point>>)>,
     /// Subpaths to stroke, in command order.
-    pub strokes: Vec<(
-        nui_core::Color,
-        f32,
-        CanvasCap,
-        Vec<Vec<nui_core::Point>>,
-    )>,
+    pub strokes: Vec<(nui_core::Color, f32, CanvasCap, Vec<Vec<nui_core::Point>>)>,
 }
 
 /// Interprets a command buffer into fill rings and stroke subpaths.
@@ -235,11 +237,7 @@ pub fn interpret(ops: &[CanvasOp], tolerance: f32) -> CanvasFrame {
                     frame.fills.push((color, loops));
                 }
             }
-            CanvasOp::Stroke {
-                width,
-                cap,
-                color,
-            } => {
+            CanvasOp::Stroke { width, cap, color } => {
                 let mut loops: Vec<Vec<Point>> = subpaths.clone();
                 if current.len() >= 2 {
                     loops.push(current.clone());

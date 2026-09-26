@@ -2,13 +2,17 @@
 //! window, wgpu surface, engine, and layout adapter for one document.
 
 use nui_compiler::DocumentIr;
-use nui_core::{Event, Key, PointerButton, Size};
+use nui_core::{Event, Key, Size};
 use nui_runtime::element::ElementId;
 use nui_runtime::{ElementTree, Engine};
 use winit::event::WindowEvent;
 use winit::window::Window;
 
 use crate::app::hit_test;
+
+mod interaction;
+
+use interaction::PointerGesture;
 
 use nui_render::{Renderer, SceneBuilder};
 
@@ -30,14 +34,6 @@ pub struct HitTarget {
     pub element: ElementId,
 }
 
-/// Signals a `click` on the hit element's subtree (M3 mapping: a press+release
-/// pair on the same element emits `click`).
-#[derive(Debug, Default)]
-struct PendingClick {
-    /// Element pressed (if any).
-    pressed: Option<ElementId>,
-}
-
 /// Per-window state: gpu + engine + layout bookkeeping.
 pub struct WindowHost {
     window: std::sync::Arc<Window>,
@@ -55,7 +51,9 @@ pub struct WindowHost {
     needs_redraw: bool,
     /// Surface configuration (reconfigured on resize).
     surface_format: wgpu::TextureFormat,
-    click: PendingClick,
+    click: PointerGesture,
+    /// Widget interaction state (hover/press/arm/focus, pointer capture).
+    widgets: nui_runtime::WidgetStates,
     /// Timer elapsed accumulators.
     timer_elapsed: std::collections::HashMap<ElementId, f64>,
     /// Last frame timestamp, for the animation/timer frame delta.
@@ -165,7 +163,8 @@ impl WindowHost {
             scale,
             needs_redraw: true,
             surface_format,
-            click: PendingClick::default(),
+            click: PointerGesture::default(),
+            widgets: nui_runtime::WidgetStates::new(),
             timer_elapsed: std::collections::HashMap::new(),
             last_frame: None,
             text: nui_text::TextSystem::with_system_fonts(),
@@ -212,6 +211,10 @@ impl WindowHost {
             self.tree = instance.tree;
             self.engine = instance.engine;
             self.timer_elapsed.clear();
+            // Handles are generational: the old capture refers to a dead
+            // tree, and latched widget state would point at stale ids.
+            self.click = PointerGesture::default();
+            self.widgets.reset();
             self.needs_redraw = true;
         }
         return outcome;
@@ -268,23 +271,22 @@ impl WindowHost {
 
     /// Normalized event dispatch: hit testing + signal emission + engine
     /// propagation. Returns whether anything became dirty.
+    ///
+    /// The pointer arms, the modal gates and Space/Enter activation are
+    /// one-line delegations to `interaction` — see that module for what
+    /// each phase does and why the gates come first.
     pub fn dispatch_event(&mut self, event: Event) -> bool {
         return match event {
-            Event::PointerMoved { position } => {
-                self.cursor = position;
-                false
-            }
+            Event::PointerMoved { position } => self.on_pointer_moved(position),
             Event::PointerPressed {
                 button, position, ..
-            } => {
-                if button == PointerButton::Left {
-                    let hit = hit_test(&self.tree, position).map(|hit| return hit.element);
-                    self.click.pressed = hit;
-                    self.focus_hit(hit);
-                }
-                false
-            }
+            } => self.on_pointer_pressed(button, position),
             Event::KeyPressed { key, modifiers } => {
+                // Modal gate (批次 4): Escape dismisses the top dialog and
+                // every other key is swallowed unless focus is inside it.
+                if let Some(blocked) = self.modal_key_gate(key) {
+                    return blocked;
+                }
                 if modifiers.ctrl {
                     match key {
                         Key::Character('c') | Key::Character('C') => {
@@ -314,6 +316,19 @@ impl WindowHost {
                         _ => {}
                     }
                 }
+                // Up/Down with focus (批次 6): a multi-line field walks its
+                // shaped lines, a stepper takes a step. Both need the host —
+                // a real font for the line table, a direction — so they are
+                // asked before the generic key handling.
+                if matches!(key, Key::ArrowUp | Key::ArrowDown)
+                    && self.move_vertical(key == Key::ArrowUp, modifiers.shift)
+                {
+                    return true;
+                }
+                // Widget activation (批次 0).
+                if self.activate_focused(key) {
+                    return true;
+                }
                 let handled = self.engine.handle_key(&mut self.tree, key, modifiers);
                 if handled {
                     self.run_frame_pipeline(nui_core::Duration::ZERO);
@@ -321,20 +336,52 @@ impl WindowHost {
                 return handled;
             }
             Event::WheelScrolled { position, delta } => {
+                // A modal dialog freezes scrolling outside its subtree.
+                if self.modal_covers(position) {
+                    return false;
+                }
                 // Route to the nearest `Scroll` ancestor of the hit element
                 // (M9 scrolling): wheel down moves content up.
                 let dy = match delta {
                     nui_core::WheelDelta::Lines { y, .. } => y * 40.0,
                     nui_core::WheelDelta::Pixels { y, .. } => y,
                 };
-                let mut current = hit_test(&self.tree, position).map(|hit| return hit.element);
+                // A stepper eats the wheel before a scroll container sees it
+                // (批次 6): one notch is one step, and scrolling *down* steps
+                // *down* the range, as every spinner does. The whole control
+                // is the stepper, not just its arrow strip. Pixels convert at
+                // the same 40 dp a line is worth, so a trackpad flick too
+                // small to be a notch steps nothing.
+                let hit = hit_test(&self.tree, position).map(|hit| return hit.element);
+                if let Some(id) = hit
+                    && self.tree.arena[id].ty == "SpinBox"
+                {
+                    let notches = match delta {
+                        nui_core::WheelDelta::Lines { y, .. } => f64::from(y.round()),
+                        nui_core::WheelDelta::Pixels { y, .. } => f64::from((y / 40.0).round()),
+                    };
+                    if notches == 0.0 {
+                        return false;
+                    }
+                    let _ = self.step_spin(id, -notches);
+                    return true;
+                }
+                let mut current = hit;
                 while let Some(id) = current {
                     if self.tree.arena[id].ty == "Scroll" || self.tree.arena[id].ty == "ListView" {
                         let scroll_y = match self.tree.arena[id].get("scroll_y") {
                             Some(nui_core::Value::Float(value)) => *value as f32,
                             _ => 0.0,
                         };
-                        let next = (scroll_y + dy).max(0.0);
+                        // Clamp at both ends. The upper bound is the one
+                        // that matters: without it the wheel scrolls the
+                        // content past its own bottom edge and leaves a
+                        // blank strip under the last row. The limit is a
+                        // judgement (content height vs viewport height), so
+                        // it lives in `nui-runtime` where a test can reach
+                        // it — the host has none.
+                        let limit = nui_runtime::widget::max_scroll_y(&self.engine, &self.tree, id);
+                        let next = (scroll_y + dy).clamp(0.0, limit);
                         self.engine.set_direct(
                             &mut self.tree,
                             id,
@@ -367,20 +414,7 @@ impl WindowHost {
             }
             Event::PointerReleased {
                 button, position, ..
-            } => {
-                if button == PointerButton::Left {
-                    let released_on = hit_test(&self.tree, position).map(|hit| return hit.element);
-                    if let (Some(pressed), Some(target)) = (self.click.pressed, released_on)
-                        && pressed == target
-                    {
-                        let _ = self.engine.emit_bubble(&mut self.tree, target, "click");
-                        self.run_frame_pipeline(nui_core::Duration::ZERO);
-                        return true;
-                    }
-                    self.click.pressed = None;
-                }
-                false
-            }
+            } => self.on_pointer_released(button, position),
             Event::WindowResized { size } => {
                 self.resize(size);
                 true
@@ -450,20 +484,6 @@ impl WindowHost {
         }
     }
 
-    /// Focuses the nearest focusable ancestor of the clicked element
-    /// (clicking empty space blurs).
-    fn focus_hit(&mut self, hit: Option<ElementId>) {
-        let mut current = hit;
-        while let Some(id) = current {
-            if self.tree.arena[id].is_focusable() {
-                self.engine.focus(id);
-                return;
-            }
-            current = self.tree.arena[id].parent;
-        }
-        self.engine.blur();
-    }
-
     /// The lazy clipboard (creation can fail without a display server).
     fn clipboard(&mut self) -> Option<&mut arboard::Clipboard> {
         if self.clipboard.is_none() {
@@ -501,6 +521,15 @@ impl WindowHost {
         }
         let _ = self.engine.apply_when_blocks(&mut self.tree);
         nui_layout::layout_with_text(&mut self.tree, self.size, Some(&mut self.text));
+        // Widget state mirrors focus and layout into element properties
+        // (批次 0). Run after layout so the first pass sees real boxes;
+        // `set_direct` only dirties the tree when a value actually moved.
+        let input = nui_runtime::PointerInput {
+            position: self.cursor,
+            inside: true,
+            down: self.click.captured.is_some(),
+        };
+        let _ = self.widgets.update(&mut self.engine, &mut self.tree, input);
         self.needs_redraw = true;
         // Drain change notifications (observers hook here).
         let _ = self.engine.take_changes();

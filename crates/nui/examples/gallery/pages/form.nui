@@ -1,0 +1,31 @@
+// Login form — `TextInput` with two-way bindings, Tab focus cycling,
+// keyboard editing, IME commits, the `accepted` signal on Enter, and a
+// `when` block that dims the panel once the form is submitted.
+//
+// The `when` sits at the page root, next to the element it guards, so the
+// rule reads where the state lives.
+Column(id = form_page, spacing = 12dp, padding = 36dp,
+       userName = "", password = "", submitted = false) {
+
+    Rectangle(id = form_panel, width = 360dp, height = 240dp, radius = 10dp,
+              fill = #1d222b)
+
+    Text(content <- form_page.submitted ? "Signed in as {form_page.userName}" : "Welcome back",
+         font.size = 20dp, color = #e8ecf2)
+
+    TextInput(width = 320dp, height = 40dp, placeholder = "username",
+              text <=> form_page.userName) {
+        on accepted => form_page.submitted = true
+    }
+    TextInput(width = 320dp, height = 40dp, placeholder = "password",
+              text <=> form_page.password) {
+        on accepted => form_page.submitted = true
+    }
+    Button(label = "Sign in", width = 320dp, height = 44dp) {
+        on click => form_page.submitted = true
+    }
+
+    when form_page.submitted {
+        form_panel.opacity = 0.55
+    }
+}

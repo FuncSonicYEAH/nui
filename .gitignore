@@ -23,3 +23,4 @@ Thumbs.db
 .vscode/
 
 # 注意：Cargo.lock 有意纳入版本库（workspace 内含可执行产物）
+.Trash-0/

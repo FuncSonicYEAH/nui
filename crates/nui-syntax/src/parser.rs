@@ -314,6 +314,17 @@ impl Parser {
                 loop {
                     match self.peek().clone() {
                         TokenKind::Punct(Punct::RParen) | TokenKind::Eof => break,
+                        // Handlers are allowed among the arguments so a
+                        // compact widget stays on one line
+                        // (`Button(label = "x", on click => run())`).
+                        TokenKind::Keyword(Keyword::On)
+                            if matches!(self.second(), TokenKind::Ident(_)) =>
+                        {
+                            match self.parse_handler() {
+                                Some(handler) => args.push(NodeArg::Handler(handler)),
+                                None => self.recover_arg(),
+                            }
+                        }
                         TokenKind::Ident(text)
                             if text == "id"
                                 && matches!(self.second(), TokenKind::Punct(Punct::Assign)) =>
@@ -869,7 +880,7 @@ mod tests {
             .iter()
             .filter_map(|arg| match arg {
                 NodeArg::Property(assignment) => return Some(assignment),
-                NodeArg::Id(_) => return None,
+                NodeArg::Id(_) | NodeArg::Handler(_) => return None,
             })
             .collect();
         assert_eq!(assignments.len(), 2);
