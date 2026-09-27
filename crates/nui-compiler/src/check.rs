@@ -34,21 +34,270 @@ pub fn check(document: &Document) -> CheckOutcome {
     return check_with(document, &[]);
 }
 
+/// A component's declared API, read syntactically before anything is bound.
+///
+/// A call site may appear before the component it names (or after it), so
+/// every signature has to be known before the first component is bound.
+/// This is deliberately a *syntactic* pre-pass rather than a lookup into
+/// the bound IR: the binders run in order, and a component must be
+/// checkable no matter where it sits in the file.
+#[derive(Debug, Clone)]
+struct ComponentSignature {
+    /// The declared component's name (for diagnostics).
+    name: String,
+    /// Declared property name -> declared type (`Unknown` when inferred
+    /// from a default, which the pre-pass does not evaluate).
+    properties: HashMap<String, Type>,
+    /// Declared signal names.
+    signals: HashSet<String>,
+    /// The declaration's span, for diagnostics.
+    span: Span,
+    /// How many top-level nodes the component declares. An instantiated
+    /// component must have exactly one (see [`ComponentIr::roots`]).
+    root_count: usize,
+}
+
+/// The document-wide view every per-component binder shares: what each
+/// declared component exposes, and which components are actually
+/// instantiated by something.
+///
+/// Built once from the AST, before any binding, so component references
+/// resolve in a single pass and entry points are known up front.
+#[derive(Debug, Default)]
+struct DocumentIndex {
+    signatures: HashMap<String, ComponentSignature>,
+    /// Names some component instantiates; everything else is an entry
+    /// point the runtime instantiates on its own.
+    referenced: HashSet<String>,
+    /// component -> the components it instantiates, with the span of the
+    /// node that named them. The edge set the recursion check walks.
+    edges: HashMap<String, Vec<(String, Span)>>,
+}
+
+impl DocumentIndex {
+    /// Indexes every declared component and every reference to one.
+    ///
+    /// Also reports the two whole-document errors that no single
+    /// component's binder can see: a component that instantiates itself
+    /// (directly or through a chain), and an instantiated component that
+    /// does not declare exactly one root.
+    fn build(document: &Document, diagnostics: &mut Vec<nui_syntax::Diagnostic>) -> DocumentIndex {
+        // Two passes, and the order matters: the edge pass has to see *every*
+        // signature, or a component that references one declared later in
+        // the file records no edge and a cycle through it goes unnoticed.
+        let mut signatures: HashMap<String, ComponentSignature> = HashMap::new();
+        for decl in &document.components {
+            let name = decl.name.name.clone();
+            if signatures
+                .insert(name.clone(), signature_of(decl))
+                .is_some()
+            {
+                diagnostics.push(nui_syntax::Diagnostic::error(
+                    decl.name.span,
+                    format!("duplicate component declaration `{name}`"),
+                ));
+            }
+        }
+        let mut edges: HashMap<String, Vec<(String, Span)>> = HashMap::new();
+        for decl in &document.components {
+            let mut outgoing = Vec::new();
+            for member in &decl.members {
+                let ComponentMember::Node(node) = member else {
+                    continue;
+                };
+                collect_node_references(node, &signatures, &mut outgoing);
+            }
+            edges.insert(decl.name.name.clone(), outgoing);
+        }
+        let referenced: HashSet<String> = edges
+            .values()
+            .flatten()
+            .map(|(name, _)| return name.clone())
+            .filter(|name| return signatures.contains_key(name))
+            .collect();
+        let index = DocumentIndex {
+            signatures,
+            referenced,
+            edges,
+        };
+        index.report_recursion(diagnostics);
+        index.report_root_counts(diagnostics);
+        return index;
+    }
+
+    /// Reports every cycle in the component reference graph.
+    ///
+    /// A cycle would expand forever, so it has to be a compile error
+    /// rather than a runtime guard. The walk is an explicit-colour DFS
+    /// over the edge set; a component already on the current path is the
+    /// back edge that closes a cycle.
+    fn report_recursion(&self, diagnostics: &mut Vec<nui_syntax::Diagnostic>) {
+        /// 1 = on the current path, 2 = fully explored.
+        const ON_PATH: u8 = 1;
+        const DONE: u8 = 2;
+
+        fn walk(
+            index: &DocumentIndex,
+            name: &str,
+            marks: &mut HashMap<String, u8>,
+            path: &mut Vec<String>,
+            diagnostics: &mut Vec<nui_syntax::Diagnostic>,
+        ) {
+            match marks.get(name) {
+                Some(&ON_PATH) => {
+                    diagnostics.push(nui_syntax::Diagnostic::error(
+                        index.signatures[name].span,
+                        format!(
+                            "component `{name}` instantiates itself: {}",
+                            cycle_path(path, name)
+                        ),
+                    ));
+                    return;
+                }
+                Some(&DONE) => return,
+                _ => {}
+            }
+            marks.insert(name.to_string(), ON_PATH);
+            path.push(name.to_string());
+            for (target, _) in index.edges.get(name).into_iter().flatten() {
+                if index.signatures.contains_key(target) {
+                    walk(index, target, marks, path, diagnostics);
+                }
+            }
+            path.pop();
+            marks.insert(name.to_string(), DONE);
+        }
+
+        let mut marks: HashMap<String, u8> = HashMap::new();
+        let mut path = Vec::new();
+        let mut names: Vec<&String> = self.edges.keys().collect();
+        names.sort();
+        for name in names {
+            walk(self, name, &mut marks, &mut path, diagnostics);
+        }
+    }
+
+    /// An instantiated component has to be instantiable: exactly one root
+    /// node, since the instance element *is* that root.
+    fn report_root_counts(&self, diagnostics: &mut Vec<nui_syntax::Diagnostic>) {
+        for (name, signature) in &self.signatures {
+            if !self.referenced.contains(name) || signature.root_count == 1 {
+                continue;
+            }
+            let found = signature.root_count;
+            diagnostics.push(nui_syntax::Diagnostic::error(
+                signature.span,
+                format!(
+                    "component `{name}` is instantiated, so it must declare exactly one \
+                     root node (found {found}); wrap them in a Column or Stack"
+                ),
+            ));
+        }
+    }
+
+    /// The signature of the component `ty` names, if it names one.
+    fn component(&self, ty: &str) -> Option<&ComponentSignature> {
+        return self.signatures.get(ty);
+    }
+}
+
+/// Appends the components `node` instantiates to `out`.
+///
+/// A component reference node has no children of its own (its body takes
+/// handlers only, which the checker enforces), so the walk stops there:
+/// the referenced component's own references are collected when *its*
+/// declaration is processed. That keeps the edge set one level per
+/// declaration, which is what the cycle walk above expects.
+fn collect_node_references(
+    node: &NodeDecl,
+    signatures: &HashMap<String, ComponentSignature>,
+    out: &mut Vec<(String, Span)>,
+) {
+    if signatures.contains_key(&node.ty.name) {
+        out.push((node.ty.name.clone(), node.ty.span));
+        return;
+    }
+    for member in &node.body {
+        if let NodeMember::Node(child) = member {
+            collect_node_references(child, signatures, out);
+        }
+    }
+}
+
+/// The declared API of one component declaration.
+fn signature_of(decl: &ComponentDecl) -> ComponentSignature {
+    let mut signature = ComponentSignature {
+        name: decl.name.name.clone(),
+        span: decl.name.span,
+        properties: HashMap::new(),
+        signals: HashSet::new(),
+        root_count: 0,
+    };
+    for member in &decl.members {
+        match member {
+            ComponentMember::Property(property) => {
+                let declared = property
+                    .declared_type
+                    .as_ref()
+                    .and_then(|name| return Type::from_name(&name.name));
+                signature.properties.insert(
+                    property.name.name.clone(),
+                    declared.unwrap_or(Type::Unknown),
+                );
+            }
+            ComponentMember::Signal(signal) => {
+                signature.signals.insert(signal.name.name.clone());
+            }
+            ComponentMember::Node(_) => {
+                signature.root_count += 1;
+            }
+            ComponentMember::Machine(_) => {}
+        }
+    }
+    return signature;
+}
+
+/// The chain `a -> b -> a` for a recursion diagnostic, as a readable path.
+fn cycle_path(path: &[String], repeated: &str) -> String {
+    let start = path
+        .iter()
+        .position(|name| return name == repeated)
+        .unwrap_or(0);
+    let mut names: Vec<&str> = path[start..].iter().map(String::as_str).collect();
+    names.push(repeated);
+    return names.join(" -> ");
+}
+
 /// Checks a parsed document with a set of host-registered function names
 /// (plan §5 宿主互操作): calls to those names lower to [`TypedExpr::HostCall`]
 /// instead of producing an unknown-function diagnostic.
 pub fn check_with(document: &Document, extern_functions: &[String]) -> CheckOutcome {
-    let mut components = Vec::new();
     let mut diagnostics = Vec::new();
+    let index = DocumentIndex::build(document, &mut diagnostics);
+    let mut components = Vec::new();
     for decl in &document.components {
-        let mut binder = ComponentBinder::new(decl, extern_functions);
+        let mut binder = ComponentBinder::new(decl, extern_functions, &index);
         let component = binder.bind();
         diagnostics.append(&mut binder.diagnostics);
         components.push(component);
     }
+    // Entry points are the components nothing instantiates. Decided after
+    // binding because only then is every call site known.
+    for component in &mut components {
+        component.referenced = index.referenced.contains(&component.name);
+    }
     return CheckOutcome {
         document: DocumentIr { components },
         diagnostics,
+    };
+}
+
+/// Maps a syntax-level data operator onto its IR counterpart.
+fn init_kind(op: InitOp) -> InitKind {
+    return match op {
+        InitOp::Static => InitKind::Static,
+        InitOp::Bind => InitKind::Bind,
+        InitOp::TwoWay => InitKind::TwoWay,
     };
 }
 
@@ -78,6 +327,8 @@ struct ComponentBinder<'source> {
     binding_edges: Vec<(String, String, Span)>,
     /// Host-registered function names; calls to them lower to `HostCall`.
     extern_functions: HashSet<String>,
+    /// The document-wide component index (shared by every binder).
+    index: &'source DocumentIndex,
     component: &'source ComponentDecl,
 }
 
@@ -85,6 +336,7 @@ impl<'source> ComponentBinder<'source> {
     fn new(
         component: &'source ComponentDecl,
         extern_functions: &[String],
+        index: &'source DocumentIndex,
     ) -> ComponentBinder<'source> {
         return ComponentBinder {
             diagnostics: Vec::new(),
@@ -97,6 +349,7 @@ impl<'source> ComponentBinder<'source> {
             local_count: 0,
             binding_edges: Vec::new(),
             extern_functions: extern_functions.iter().cloned().collect(),
+            index,
             component,
         };
     }
@@ -158,6 +411,13 @@ impl<'source> ComponentBinder<'source> {
         }
     }
 
+    /// Collects the ids a node declares.
+    ///
+    /// A component reference contributes only its own `id`: the ids inside
+    /// the referenced component belong to *its* scope and are namespaced
+    /// per instance at instantiation, so pulling them into the caller's
+    /// scope would both shadow the caller's own ids and collide between
+    /// two instances of the same component.
     fn collect_ids(&mut self, node: &NodeDecl) {
         for arg in &node.args {
             if let NodeArg::Id(id) = arg {
@@ -169,6 +429,9 @@ impl<'source> ComponentBinder<'source> {
                 }
                 self.ids.insert(id.name.clone(), node.ty.name.clone());
             }
+        }
+        if self.index.component(&node.ty.name).is_some() {
+            return;
         }
         for member in &node.body {
             if let NodeMember::Node(child) = member {
@@ -327,6 +590,13 @@ impl<'source> ComponentBinder<'source> {
     }
 
     fn bind_node(&mut self, decl: &NodeDecl) -> NodeIr {
+        // A node whose type names a component declared in this document is
+        // a *reference*, not an element: the subtree lives in that
+        // component, and this node carries the call site's arguments and
+        // handlers.
+        if let Some(signature) = self.index.component(&decl.ty.name).cloned() {
+            return self.bind_component_reference(decl, &signature);
+        }
         let mut node = NodeIr {
             ty: decl.ty.name.clone(),
             ..NodeIr::default()
@@ -375,6 +645,7 @@ impl<'source> ComponentBinder<'source> {
             });
             self.push_scope();
             self.declare_local(&binding.variable.name, Type::Unknown);
+            self.reject_component_in_for(decl);
             self.bind_node_members(&mut node, &decl.body);
             self.pop_scope();
             return node;
@@ -404,6 +675,204 @@ impl<'source> ComponentBinder<'source> {
                 }
             }
         }
+    }
+
+    /// Reports a component reference inside a `For` / `ListView` body.
+    ///
+    /// Row instantiation happens in the engine, which has no component
+    /// catalog, so the reference could not be expanded. The check lives
+    /// here rather than in `bind_node` because the offending shape is a
+    /// property of the *enclosing* loop, and the loop is what knows it is
+    /// a loop.
+    fn reject_component_in_for(&mut self, decl: &NodeDecl) {
+        if decl.ty.name != "For" && decl.ty.name != "ListView" {
+            return;
+        }
+        for member in &decl.body {
+            let NodeMember::Node(child) = member else {
+                continue;
+            };
+            if self.index.component(&child.ty.name).is_some() {
+                self.diagnostics.push(nui_syntax::Diagnostic::error(
+                    child.ty.span,
+                    format!(
+                        "`{}` cannot be instantiated inside a `For` body: rows are built \
+                         without the document, so there is nothing to expand it from",
+                        child.ty.name
+                    ),
+                ));
+            }
+        }
+    }
+
+    /// Binds a node that instantiates a component declared in this
+    /// document.
+    ///
+    /// The result carries no children: the subtree is the referenced
+    /// component's, and the runtime expands it per use site. What this
+    /// node *does* carry is the call site's half of the contract — its
+    /// `id`, the arguments written against the instance, and the handlers
+    /// for the component's declared signals.
+    ///
+    /// The body is deliberately narrow: handlers only. A child node, a
+    /// body assignment or a `when` block would each need a rule about
+    /// *where* in the referenced subtree it lands, and every such rule is
+    /// a silent-surprise waiting to happen. Properties go in the argument
+    /// list instead, which is checked against the component's declared
+    /// types.
+    fn bind_component_reference(&mut self, decl: &NodeDecl, target: &ComponentSignature) -> NodeIr {
+        let mut node = NodeIr {
+            ty: decl.ty.name.clone(),
+            component: Some(decl.ty.name.clone()),
+            ..NodeIr::default()
+        };
+        for arg in &decl.args {
+            match arg {
+                NodeArg::Id(id) => {
+                    if node.id.is_some() {
+                        self.diagnostics.push(nui_syntax::Diagnostic::error(
+                            id.span,
+                            format!("duplicate `id` argument on `{}`", decl.ty.name),
+                        ));
+                    }
+                    node.id = Some(id.name.clone());
+                }
+                NodeArg::Property(assignment) => {
+                    node.assignments
+                        .push(self.bind_component_argument(assignment, &node, target));
+                }
+                NodeArg::Handler(handler) => {
+                    self.require_component_signal(handler, target);
+                    node.handlers.push(self.bind_handler(handler));
+                }
+            }
+        }
+        if decl.for_binding.is_some() {
+            // `For(item in rows) { Chip(...) }` needs the component catalog
+            // at row-instantiation time, and the engine instantiates rows
+            // without the document. Rejecting the shape here beats letting
+            // it expand to nothing (or to a panic) at runtime.
+            self.diagnostics.push(nui_syntax::Diagnostic::error(
+                decl.ty.span,
+                format!(
+                    "a `For` cannot instantiate `{}`; move the reference into the loop body",
+                    decl.ty.name
+                ),
+            ));
+        }
+        for member in &decl.body {
+            match member {
+                // A handler is the one body member that means something at
+                // a call site: it subscribes to one of the component's
+                // signals. It has to be bound *and* checked against the
+                // component's declarations, not skipped.
+                NodeMember::Handler(handler) => {
+                    self.require_component_signal(handler, target);
+                    node.handlers.push(self.bind_handler(handler));
+                }
+                NodeMember::Node(node) => self.reject_reference_body_member(
+                    node.ty.span,
+                    decl.ty.name.as_str(),
+                    "child nodes",
+                ),
+                NodeMember::Assignment(assignment) => self.reject_reference_body_member(
+                    assignment.span,
+                    decl.ty.name.as_str(),
+                    "property assignments",
+                ),
+                NodeMember::When(when) => {
+                    self.reject_reference_body_member(
+                        when.span,
+                        decl.ty.name.as_str(),
+                        "`when` blocks",
+                    );
+                }
+            }
+        }
+        return node;
+    }
+
+    /// Reports a body member a component reference cannot take, pointing at
+    /// the argument list where the same intent belongs.
+    fn reject_reference_body_member(&mut self, span: Span, component: &str, what: &str) {
+        self.diagnostics.push(nui_syntax::Diagnostic::error(
+            span,
+            format!(
+                "a `{component}` reference takes no {what} in its body; \
+                 pass them as arguments or use `<-` on the argument"
+            ),
+        ));
+    }
+
+    /// Binds one call-site argument of a component reference.
+    ///
+    /// A name the component *declares* is its API and is type-checked
+    /// against the declaration. Any other name is an ordinary element
+    /// property of the instance's root element, which the checker does not
+    /// validate (element properties are open-ended, as everywhere else).
+    /// Declared wins on a name collision, so a component that declares
+    /// `radius` is not reachable through the element's own `radius`.
+    fn bind_component_argument(
+        &mut self,
+        assignment: &PropertyAssignment,
+        node: &NodeIr,
+        target: &ComponentSignature,
+    ) -> AssignmentIr {
+        let name = &assignment.target.parts[0].name;
+        let Some(declared) = target.properties.get(name) else {
+            return self.bind_node_assignment(assignment, node);
+        };
+        let value = self.check_expr(&assignment.value);
+        let value_ty = value.type_of();
+        if *declared != Type::Unknown && unify(*declared, value_ty).is_none() {
+            self.diagnostics.push(nui_syntax::Diagnostic::error(
+                assignment.span,
+                format!(
+                    "type mismatch for property `{name}` of `{}`: expected {declared}, found {value_ty}",
+                    node.ty
+                ),
+            ));
+        }
+        // No binding edge is recorded here, unlike `bind_assignment`. The
+        // edge a `<-` argument creates belongs to the *callee's* graph
+        // ("this component's property depends on that expression"), and the
+        // callee is a different component with its own cycle check.
+        // Recording it against the caller's identically named property
+        // would invent a cycle out of a name collision.
+        return AssignmentIr {
+            path: vec![name.clone()],
+            target: PropertyTarget::Id(
+                node.id
+                    .clone()
+                    .unwrap_or_else(|| return "<self>".to_string()),
+                name.clone(),
+            ),
+            kind: init_kind(assignment.op),
+            value,
+        };
+    }
+
+    /// Rejects a handler for a signal the referenced component does not
+    /// declare, naming the ones it does.
+    fn require_component_signal(&mut self, handler: &Handler, target: &ComponentSignature) {
+        let name = &handler.signal.name;
+        if target.signals.contains(name) {
+            return;
+        }
+        let declared = if target.signals.is_empty() {
+            String::from("it declares none")
+        } else {
+            let mut names: Vec<&str> = target.signals.iter().map(String::as_str).collect();
+            names.sort();
+            format!("declared signals: {}", names.join(", "))
+        };
+        self.diagnostics.push(nui_syntax::Diagnostic::error(
+            handler.signal.span,
+            format!(
+                "component `{}` has no signal `{name}` ({declared})",
+                target.name
+            ),
+        ));
     }
 
     /// Binds an assignment whose target is a node's own property
@@ -445,11 +914,7 @@ impl<'source> ComponentBinder<'source> {
                         .unwrap_or_else(|| return "<self>".to_string()),
                     assignment.target.parts[0].name.clone(),
                 ),
-                kind: match assignment.op {
-                    InitOp::Static => InitKind::Static,
-                    InitOp::Bind => InitKind::Bind,
-                    InitOp::TwoWay => InitKind::TwoWay,
-                },
+                kind: init_kind(assignment.op),
                 value,
             };
         }
@@ -484,11 +949,7 @@ impl<'source> ComponentBinder<'source> {
             target: self.resolve_write_target(&assignment.target).unwrap_or(
                 PropertyTarget::Component(assignment.target.parts[0].name.clone()),
             ),
-            kind: match assignment.op {
-                InitOp::Static => InitKind::Static,
-                InitOp::Bind => InitKind::Bind,
-                InitOp::TwoWay => InitKind::TwoWay,
-            },
+            kind: init_kind(assignment.op),
             value,
         };
     }
@@ -565,6 +1026,7 @@ impl<'source> ComponentBinder<'source> {
                     }
                     effects.push(Effect::Emit {
                         signal: signal.name.clone(),
+                        on: None,
                     });
                 }
                 Statement::Call { callee, args, .. } => {

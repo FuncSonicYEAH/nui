@@ -262,6 +262,42 @@ impl Engine {
         }
     }
 
+    /// Retires the binding attached to one property of one element.
+    ///
+    /// Same reasoning as [`Engine::retire_bindings`], narrowed to a single
+    /// slot: a document can *replace* a binding the tree already has — a
+    /// call site passing a static value for a property the component bound
+    /// itself, say — and the replaced binding has to stop writing back.
+    /// Detaching it from the element's slot
+    /// ([`Element::clear_binding`](crate::element::Element::clear_binding))
+    /// is only half of that: the engine's table is what `propagate` walks,
+    /// so the expression would keep running and overwrite the value on the
+    /// next pass.
+    ///
+    /// Returns whether a live binding was retired.
+    pub(crate) fn retire_binding(&mut self, element: ElementId, property: &str) -> bool {
+        let Some(index) = self.binding_at(element, property) else {
+            return false;
+        };
+        let record = &mut self.bindings[index.0];
+        if record.dead {
+            return false;
+        }
+        record.dead = true;
+        record.dirty = false;
+        let dependencies = std::mem::take(&mut record.dependencies);
+        for (dep_element, dep_property) in dependencies {
+            let key = (dep_element, dep_property);
+            if let Some(readers) = self.readers.get_mut(&key) {
+                readers.retain(|reader| return *reader != index.0);
+                if readers.is_empty() {
+                    self.readers.remove(&key);
+                }
+            }
+        }
+        return true;
+    }
+
     /// Buffers a property change (see [`crate::notify`]).
     pub(crate) fn record_change(
         &mut self,
@@ -890,10 +926,24 @@ impl Engine {
                 }
                 Ok(())
             }
-            nui_compiler::Effect::Emit { signal } => {
+            nui_compiler::Effect::Emit { signal, on } => {
                 // Signal delivery is engine-level; the host connects signals
                 // to handlers via `Engine::emit_signal`.
-                self.emit_signal(tree, element, signal)?;
+                //
+                // `on` names the element the signal is emitted *on*. It is
+                // `None` for a document's own signal ("wherever this
+                // handler runs") and set for a component's, whose signal
+                // belongs to the call site rather than to whichever inner
+                // element happened to trigger it.
+                let target = match on {
+                    Some(name) => tree.lookup_id(name).ok_or_else(|| {
+                        return EvalError::Unresolved {
+                            what: format!("unknown component instance `{name}`"),
+                        };
+                    }),
+                    None => Ok(element),
+                }?;
+                self.emit_signal(tree, target, signal)?;
                 Ok(())
             }
             nui_compiler::Effect::Call { callee, args } => {

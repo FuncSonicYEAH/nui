@@ -22,6 +22,7 @@ pub mod canvas;
 pub mod element;
 pub mod instantiate;
 pub mod machine;
+mod mangle;
 pub mod model;
 pub mod notify;
 pub mod registry;

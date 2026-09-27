@@ -24,8 +24,40 @@ pub struct ComponentIr {
     pub machines: Vec<MachineIr>,
     /// Ids declared inside the component (`id` -> node type name).
     pub ids: Vec<(String, String)>,
-    /// Root child nodes (components usually have exactly one).
+    /// Root child nodes.
+    ///
+    /// An *entry* component (one nothing else instantiates) may declare
+    /// several, and each becomes a tree root. A component something
+    /// instantiates must declare exactly one: the instance element **is**
+    /// that root, which is what lets the caller's `id`, declared properties,
+    /// handlers and machines land on a real element. The checker rejects
+    /// any other count.
     pub roots: Vec<NodeIr>,
+    /// Whether any component in the document instantiates this one.
+    ///
+    /// Decided by the checker, which sees every call site; the runtime uses
+    /// it to tell an entry point (instantiate its roots) from a library
+    /// component (instantiate nothing on its own).
+    pub referenced: bool,
+}
+
+impl ComponentIr {
+    /// The declared property with this name, if the component declares it.
+    ///
+    /// Decides what a call-site argument means: a declared name is the
+    /// component's own API (type-checked against `PropertyIr::ty`), while
+    /// any other name is an ordinary element property of the instance.
+    pub fn property(&self, name: &str) -> Option<&PropertyIr> {
+        return self
+            .properties
+            .iter()
+            .find(|property| return property.name == name);
+    }
+
+    /// Whether the component declares this signal (a legal `on` target).
+    pub fn declares_signal(&self, name: &str) -> bool {
+        return self.signals.iter().any(|signal| return signal == name);
+    }
 }
 
 /// A compiled property declaration.
@@ -88,6 +120,15 @@ pub struct TransitionIr {
 pub struct NodeIr {
     /// Node type name (`Window`, `Button`, `For`, ...).
     pub ty: String,
+    /// The component this node instantiates, when `ty` names a component
+    /// declared in the same document.
+    ///
+    /// `None` for an ordinary element type, which the renderer paints
+    /// directly. `Some(name)` is a *reference*: the subtree, declared
+    /// properties, machines and signals live in that
+    /// [`ComponentIr`](crate::document::ComponentIr), and the runtime
+    /// expands the reference per use site.
+    pub component: Option<String>,
     /// Declared `id`, if any.
     pub id: Option<String>,
     /// `For` binding, present on `For` nodes only.

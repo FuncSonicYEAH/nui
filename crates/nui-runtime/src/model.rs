@@ -441,7 +441,7 @@ pub(crate) fn instantiate_row(
     let mut root = None;
     for node in prototype {
         let child =
-            crate::instantiate::instantiate_scoped_node(tree, engine, node, Some(scope.clone()));
+            crate::instantiate::instantiate_prototype_node(tree, engine, node, Some(scope.clone()));
         tree.append_child(for_element, child);
         root.get_or_insert(child);
     }

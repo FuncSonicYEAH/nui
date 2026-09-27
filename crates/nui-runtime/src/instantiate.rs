@@ -9,8 +9,11 @@
 //! elements are instantiated per model row by
 //! [`Engine::sync_for_nodes`](crate::binding::Engine::sync_for_nodes).
 
+use std::collections::HashMap;
+
 use nui_compiler::{
-    AssignmentIr, DocumentIr, InitKind, MachineIr, NodeIr, PropertyDefaultIr, TypedExpr,
+    AssignmentIr, ComponentIr, DocumentIr, InitKind, MachineIr, NodeIr, PropertyDefaultIr,
+    TypedExpr,
 };
 use nui_core::Value;
 
@@ -36,22 +39,93 @@ pub fn instantiate(document: &DocumentIr) -> Instance {
 
 /// Instantiates a compiled document with a host registry: custom component
 /// types get their descriptor defaults and behaviors (plan §5 宿主互操作).
+///
+/// Only the document's *entry* components become tree roots. A component
+/// something else instantiates contributes no root of its own — its
+/// instances appear where they are written — which is what stops a library
+/// of components from painting itself at the origin.
 pub fn instantiate_with(document: &DocumentIr, registry: Registry) -> Instance {
     let mut tree = ElementTree::new();
     let mut engine = Engine::new();
     engine.registry = registry;
+    let catalog = ComponentCatalog::new(&document.components);
+    let mut instantiator = Instantiator::new(catalog);
     for component in &document.components {
+        if component.referenced {
+            continue;
+        }
         for node in &component.roots {
-            let root = instantiate_scoped_node(&mut tree, &mut engine, node, None);
+            let root =
+                instantiate_scoped_node(&mut tree, &mut engine, node, None, &mut instantiator);
             tree.push_root(root);
             attach_machines(&mut tree, root, &component.machines);
-            apply_component_properties(&mut tree, &mut engine, root, component);
+            apply_component_properties(&mut tree, &mut engine, root, &component.properties);
         }
     }
     build_id_index(&mut tree);
     let two_way = link_two_way_pairs(&mut tree);
     engine.index_two_way_links(two_way);
     return Instance { tree, engine };
+}
+
+/// The instantiable components of one document, by name.
+///
+/// A component reference is resolved through this rather than through a
+/// field on the engine, so the engine stays reactive state and never
+/// carries the program. The consequence is that a `For` row — which the
+/// engine instantiates on its own, with no catalog in hand — cannot expand
+/// a component reference today; the checker rejects that shape instead of
+/// letting it fail at runtime.
+struct ComponentCatalog<'doc> {
+    components: HashMap<&'doc str, &'doc ComponentIr>,
+}
+
+impl<'doc> ComponentCatalog<'doc> {
+    fn new(components: &'doc [ComponentIr]) -> ComponentCatalog<'doc> {
+        return ComponentCatalog {
+            components: components
+                .iter()
+                .map(|component| return (component.name.as_str(), component))
+                .collect(),
+        };
+    }
+
+    fn get(&self, name: &str) -> Option<&'doc ComponentIr> {
+        return self.components.get(name).copied();
+    }
+}
+
+/// The state one instantiation run threads through the recursion: the
+/// catalog to expand against and the counter that keeps every instance's id
+/// namespace distinct.
+pub(crate) struct Instantiator<'doc> {
+    catalog: ComponentCatalog<'doc>,
+    /// How many component instances have been expanded so far. Each one
+    /// takes the next number as its id prefix.
+    instances: u32,
+}
+
+impl<'doc> Instantiator<'doc> {
+    fn new(catalog: ComponentCatalog<'doc>) -> Instantiator<'doc> {
+        return Instantiator {
+            catalog,
+            instances: 0,
+        };
+    }
+
+    /// The next instance's id prefix.
+    ///
+    /// A monotonic counter rather than a path built from the call site,
+    /// because the same call site can be reached from inside a `For` row
+    /// and the prefix only has to be *unique*, not pretty. Debug-asserting
+    /// the wrap keeps a u32 rollover from silently merging two instances'
+    /// namespaces.
+    fn next_prefix(&mut self) -> String {
+        self.instances = self.instances.checked_add(1).unwrap_or_else(|| {
+            panic!("component instance counter overflowed; the document is too large")
+        });
+        return format!("i{}::", self.instances);
+    }
 }
 
 /// Hot reload (plan §3.4, v1 semantics): compiles `source` fresh (host
@@ -92,7 +166,14 @@ pub(crate) fn instantiate_scoped_node(
     engine: &mut Engine,
     node: &NodeIr,
     scope: Option<crate::element::RowScope>,
+    instantiator: &mut Instantiator<'_>,
 ) -> ElementId {
+    // A component reference expands into the referenced component's own
+    // root, so the instance element is a real element in the tree with the
+    // call site's arguments, handlers and API on it.
+    if let Some(name) = &node.component {
+        return instantiate_component_instance(tree, engine, node, name, scope, instantiator);
+    }
     let mut element = Element::new(node.ty.clone(), node.id.clone());
     element.for_scope = scope.clone();
     // Static (`=`) assignments evaluate before insertion; reactive and
@@ -164,11 +245,152 @@ pub(crate) fn instantiate_scoped_node(
         tree.arena[id].set_binding(FOR_VALUE_PROPERTY, Binding { index });
     } else {
         for child in &node.children {
-            let child_id = instantiate_scoped_node(tree, engine, child, scope.clone());
+            let child_id =
+                instantiate_scoped_node(tree, engine, child, scope.clone(), instantiator);
             tree.append_child(id, child_id);
         }
     }
     return id;
+}
+
+/// Expands one component reference into a real subtree.
+///
+/// The instance element **is** the component's single root: that is what
+/// makes the call site's `id`, the component's declared properties, its
+/// machines and the call site's signal handlers all land on one address
+/// without a wrapper node that layout would have to account for.
+///
+/// Order matters here. The component's own root is instantiated first (so
+/// its internal `<-` bindings exist), then the declared properties get
+/// their defaults, then the caller's arguments overwrite them — an argument
+/// is a later, more specific statement about the same slot. Each argument
+/// that *replaces* a property the component bound itself clears that
+/// binding, which is the same precedence rule an effect-block assignment
+/// gets (plan D10): the call site wins outright, it does not fight the
+/// component's binding every frame.
+fn instantiate_component_instance(
+    tree: &mut ElementTree,
+    engine: &mut Engine,
+    reference: &NodeIr,
+    name: &str,
+    scope: Option<crate::element::RowScope>,
+    instantiator: &mut Instantiator<'_>,
+) -> ElementId {
+    // The checker rejects a referenced component without exactly one root,
+    // and rejects references to components that do not exist (an unknown
+    // name is an element type, not a reference, so this cannot be reached
+    // from a checked document).
+    let component = instantiator
+        .catalog
+        .get(name)
+        .unwrap_or_else(|| panic!("component `{name}` is referenced but not in the catalog"));
+    let [root_node] = component.roots.as_slice() else {
+        panic!("component `{name}` is instantiated without exactly one root");
+    };
+    // The root node is cloned per instance anyway (each needs its own
+    // rewritten copy), and the machines are a handful of small tables.
+    // Taking them here keeps the catalog borrow from being live across the
+    // recursive instantiation below.
+    let root_node = root_node.clone();
+    let properties = component.properties.clone();
+    let machines = component.machines.clone();
+    let prefix = instantiator.next_prefix();
+    // The instance's own address. Chosen here and registered below, once
+    // the element the rewrite points at actually exists.
+    let self_id = format!("{prefix}self");
+    let mut root_node = root_node;
+    crate::mangle::mangle_node(&mut root_node, &prefix, &self_id);
+
+    let element = instantiate_scoped_node(tree, engine, &root_node, scope, instantiator);
+    if let Some(call_site_id) = &reference.id {
+        tree.register_id(call_site_id, element);
+    }
+    tree.arena[element].component = Some(name.to_string());
+    tree.arena[element].instance_id = Some(self_id.clone());
+    tree.register_id(&self_id, element);
+
+    apply_component_properties(tree, engine, element, &properties);
+    for assignment in &reference.assignments {
+        apply_instance_argument(tree, engine, element, assignment);
+    }
+    for handler in &reference.handlers {
+        tree.arena[element].handlers.push(HandlerEntry {
+            signal: handler.signal.clone(),
+            effect: handler.effect.clone(),
+        });
+    }
+    for mut machine in machines {
+        crate::mangle::mangle_machine(&mut machine, &prefix, &self_id);
+        attach_machine(tree, element, machine);
+    }
+    return element;
+}
+
+/// Instantiates one node of a `For` / `ListView` row prototype.
+///
+/// Same walk as [`instantiate_scoped_node`], minus the component catalog:
+/// the engine instantiates rows on its own and does not carry the
+/// document, so it cannot expand a component reference. The checker
+/// rejects that combination, which is what keeps this from being a silent
+/// no-op — a row that quietly rendered as an empty element would be far
+/// harder to diagnose than a compile error.
+pub(crate) fn instantiate_prototype_node(
+    tree: &mut ElementTree,
+    engine: &mut Engine,
+    node: &NodeIr,
+    scope: Option<crate::element::RowScope>,
+) -> ElementId {
+    if let Some(name) = &node.component {
+        panic!(
+            "component `{name}` cannot be instantiated inside a For row: \
+             the engine has no document to expand it from"
+        );
+    }
+    return instantiate_scoped_node(
+        tree,
+        engine,
+        node,
+        scope,
+        &mut Instantiator::new(ComponentCatalog::new(&[])),
+    );
+}
+
+/// Applies one call-site argument to a component instance.
+///
+/// The target already names the instance element (the checker resolved it
+/// against the caller's `id`, or `<self>` when it declared none), so this
+/// only has to decide whether the slot keeps a binding the component's own
+/// root installed.
+fn apply_instance_argument(
+    tree: &mut ElementTree,
+    engine: &mut Engine,
+    element: ElementId,
+    assignment: &AssignmentIr,
+) {
+    let property = assignment.path.join(".");
+    // A static argument is a final value: the component's own `<-` on this
+    // property would overwrite it on the next propagation pass, so the
+    // binding has to be retired on *both* sides — the engine's table (what
+    // `propagate` walks) and the element's slot (what readers consult).
+    if assignment.kind == InitKind::Static {
+        engine.retire_binding(element, &property);
+        tree.arena[element].clear_binding(&property);
+    }
+    match assignment.kind {
+        InitKind::Static => apply_static(&mut tree.arena[element], assignment),
+        InitKind::Bind => apply_reactive_assignment(tree, engine, element, assignment),
+        InitKind::TwoWay => {
+            // `<=>` against a component property: the value expression is
+            // the partner address, and it was already rewritten in the
+            // *caller's* scope when the caller was instantiated.
+            engine.retire_binding(element, &property);
+            tree.arena[element].clear_binding(&property);
+            tree.arena[element].set(&property, Value::Int(0));
+            tree.arena[element]
+                .pending_two_way
+                .push((property, assignment.value.clone()));
+        }
+    }
 }
 
 /// Writes a static (`=`) assignment; attached properties (`font.size`) store
@@ -228,9 +450,14 @@ fn eval_literal(expr: &TypedExpr) -> Option<Value> {
 /// Attaches component machines to the component instance element.
 fn attach_machines(tree: &mut ElementTree, element: ElementId, machines: &[MachineIr]) {
     for machine in machines {
-        if let Some(instance) = MachineInstance::new(machine) {
-            tree.arena[element].machines.push(instance);
-        }
+        attach_machine(tree, element, machine.clone());
+    }
+}
+
+/// Attaches one machine to an element, if it declares a state to start in.
+fn attach_machine(tree: &mut ElementTree, element: ElementId, machine: MachineIr) {
+    if let Some(instance) = MachineInstance::new(&machine) {
+        tree.arena[element].machines.push(instance);
     }
 }
 
@@ -240,9 +467,9 @@ fn apply_component_properties(
     tree: &mut ElementTree,
     engine: &mut Engine,
     root: ElementId,
-    component: &nui_compiler::ComponentIr,
+    properties: &[nui_compiler::PropertyIr],
 ) {
-    for property in &component.properties {
+    for property in properties {
         match &property.default {
             Some(PropertyDefaultIr::Static(expr)) => {
                 if let Some(value) = eval_literal(expr) {

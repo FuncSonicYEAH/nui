@@ -72,6 +72,23 @@ pub struct Element {
     /// Whether this element is the component instance itself (`root` and
     /// bare component-property reads land here).
     pub is_component_instance: bool,
+    /// The component this element instantiates, when it was expanded from
+    /// a component reference (`Chip(label = "x")`).
+    ///
+    /// `None` for an element written out directly. The name is what the
+    /// widget layer consults for interaction: a `RippleButton` instance is
+    /// a `Rectangle` as far as layout and painting are concerned, so the
+    /// *component* is the only thing that says it is a button.
+    pub component: Option<String>,
+    /// Id name this element is registered under as a component instance.
+    ///
+    /// Every implicit reference to a component's own state (`label`,
+    /// `root.dark`) is rewritten at instantiation to an explicit reference
+    /// to this name, so two instances of one component never share an
+    /// address. Tracked here because `remove_subtree` has to drop the
+    /// registration along with the element, and `Element::id` does not
+    /// carry it (the caller's `id` may be absent).
+    pub instance_id: Option<String>,
     /// `<=>` assignments awaiting partner resolution after the id table is
     /// built: `(property, partner expression)` — the partner address lives
     /// in the assignment's value expression (`text <=> root.userName`).
@@ -133,6 +150,8 @@ impl Element {
             ty: ty.into(),
             id,
             is_component_instance: false,
+            component: None,
+            instance_id: None,
             pending_two_way: Vec::new(),
             parent: None,
             children: Vec::new(),
@@ -380,6 +399,15 @@ impl ElementTree {
         for handle in &removed {
             let element = &self.arena[*handle];
             if let Some(name) = &element.id
+                && self.ids.get(name) == Some(handle)
+            {
+                self.ids.remove(name);
+            }
+            // The instance name is not `Element::id` (a caller may declare
+            // no `id` at all), so `remove_subtree` has to drop it
+            // explicitly — otherwise a rebuilt `For` row leaves a stale
+            // name pointing at a freed slot.
+            if let Some(name) = &element.instance_id
                 && self.ids.get(name) == Some(handle)
             {
                 self.ids.remove(name);

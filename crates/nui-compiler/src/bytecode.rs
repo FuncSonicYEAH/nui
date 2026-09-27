@@ -281,6 +281,16 @@ pub enum Effect {
     Emit {
         /// Declared signal name.
         signal: String,
+        /// Id name of the element the signal is emitted *on*, when that is
+        /// not the element running the effect.
+        ///
+        /// `None` means "the element this effect runs on", which is right
+        /// for a signal a document declares and raises itself. A
+        /// component's `emit` is the other case: the signal belongs to the
+        /// *call site*, so a handler on some inner element must still
+        /// reach the instance's caller. Instantiation fills this in with
+        /// the instance's own address (see `nui_runtime::mangle`).
+        on: Option<String>,
     },
     /// Method call on an element id (`timer.start()`).
     Call {
