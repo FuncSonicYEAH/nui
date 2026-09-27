@@ -30,6 +30,7 @@
 | D16 | 组件实例化的作用域 | **按实例改写 IR + id 命名空间**（`iN::` 前缀），不给求值器加词法作用域链：id 表保持一张平表，属性读取热路径不变 | 2026-09-27 |
 | D17 | 缓动曲线 | **具名曲线表**（设计系统的固定曲线集），不做通用 `bezier(x1,y1,x2,y2)` builtin——四个数字要有地方放进动态类型 `Value`；通用 builtin 留作后续，且届时无需迁移既有名字 | 2026-09-27 |
 | D18 | 组件交互声明 | 由 `ComponentDesc::interaction` 声明，而非扩充 `WIDGET_TYPES` 硬编码表：组件实例化后其类型名是 `Rectangle`，名字只留在元素上，下游无从分辨 | 2026-09-27 |
+| D19 | `emphasized` 半段曲线的来源 | 表中 `emphasized-first-half` / `emphasized-last-half` 是**推导值**（`emphasized` 两段各自 rescale 到整条时间轴），非照抄设计系统的同名 token——设计系统那两个 token 一个是 8 个数的畸形列表（照读只走到 x=1/6），另一个是未 rescale 的重锚定结果。推导过程由测试从 `emphasized` 现算，不再只是注释里的断言 | 2026-09-27 |
 
 **节点思想**（设计基座）：一切皆节点——可视节点（Rectangle/Text/Column…）、逻辑节点（Timer/State/Model，不绘制但参与树与绑定）、资源节点（Font/Image）。属性绑定构成数据流 DAG，引擎 = 节点树 + 响应式依赖图 + 每帧脏传播管线（绑定 → 布局 → 绘制）。
 

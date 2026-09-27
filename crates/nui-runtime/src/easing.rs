@@ -33,13 +33,48 @@
 //!
 //! # Where the numbers come from
 //!
-//! Transcribed from the design system's motion token table. The
-//! six-number form those tokens are written in is a cubic from `(0, 0)` to
-//! `(1, 1)`, and is spelled out here in full so the segment's meaning is
-//! checkable by eye.
+//! The six-number form the design system writes its curves in is a cubic from
+//! `(0, 0)` to `(1, 1)`, and is spelled out here in full so the segment's
+//! meaning is checkable by eye.
 //!
-//! Two consequences of reading them as CSS curves rather than as spline
-//! knots are worth stating, because both are visible in the tests:
+//! Most of the table is **transcribed** from that table. Two entries are
+//! **derived**, and the difference is worth being exact about:
+//!
+//! - `emphasized` is transcribed. The design system writes it as twelve
+//!   numbers, which is two chained segments.
+//! - `emphasized-first-half` and `emphasized-last-half` are *not* under
+//!   those names in the source. They are `emphasized`'s own two segments,
+//!   each rescaled from its own span to the full `(0, 0) .. (1, 1)` so that
+//!   either can drive a whole animation — which is what "animate only the
+//!   entry" means.
+//!
+//! The rescaling is not a guess about intent; it is what the arithmetic
+//! gives. Rescaling `(0, 0) .. (1/6, 0.4)` to the unit square puts the first
+//! control point at `(0.3, 0)`, so the accelerated half *is*
+//! `emphasized-accelerate`, and likewise for the decelerated half. Both
+//! halves of that are computed from `emphasized` in the tests — see
+//! `the_emphasized_halves_are_its_own_segments_rescaled` and
+//! `the_two_emphasized_halves_are_the_accelerate_and_decelerate_curves` —
+//! so the derivation is pinned rather than merely asserted here.
+//!
+//! What is deliberately **not** transcribed is the design system's own pair
+//! of "half" tokens, because neither is usable as a whole-timeline easing
+//! and carrying them would imply otherwise:
+//!
+//! - Its *first* half list has **eight** numbers — the first segment's six,
+//!   then a stray control-point pair with no end point. Read as a cubic it
+//!   would end at `x = 1/6`, so it cannot drive a full animation at all.
+//! - Its *last* half list is the second segment re-anchored at the origin
+//!   but **not** rescaled, which is a different curve from the rescaled
+//!   `emphasized-last-half` above.
+//!
+//! A consumer that needs the raw lists should keep them verbatim and report
+//! the malformed one, which is what the token crate behind this table does;
+//! quietly repairing it would make the two disagree invisibly.
+//!
+//! Two consequences of reading the transcribed curves as CSS curves rather
+//! than as spline knots are worth stating, because both are visible in the
+//! tests:
 //!
 //! - The **spatial** curves overshoot, by design — that is what a control
 //!   point at `y = 1.67` means. `spatial-fast` and `spatial-default` also
@@ -49,14 +84,6 @@
 //!   `every_curve_advances_essentially_monotonically` bounds it.
 //! - `emphasized` does **not** overshoot. Every control point of it lies
 //!   within its own segment's span, so it reaches 1 from below.
-//!
-//! The two `emphasized` halves are the first and second segments of the
-//! full curve, each rescaled from its own span to the full
-//! `(0, 0) .. (1, 1)` so either can be used as a whole easing — which is
-//! what "animate only the entry" means. That rescaling is why they come
-//! out as the accelerate and decelerate curves, and
-//! `the_two_emphasized_halves_are_the_accelerate_and_decelerate_curves`
-//! pins the identity down.
 
 /// One cubic-bezier segment: `(x0, y0, x1, y1, x2, y2, x3, y3)` — the
 /// segment's two endpoints followed by its two control points, in the
@@ -131,16 +158,25 @@ static CURVES: &[(&str, &[BezierSegment])] = &[
     // Effects: short, for things that appear or respond to a press.
     ("effects", &[[0.0, 0.0, 0.34, 0.80, 0.34, 1.00, 1.0, 1.0]]),
     // Emphasized: the expressive curve. Two segments, meeting at (1/6, 0.4).
+    // The control points are written as the fractions they are rather than as
+    // their decimal expansions: `2/15`, `1/6` and `5/24`. The expansions round
+    // to eight places, which is a 3e-8 error in the control points -- small
+    // enough to be invisible on screen and large enough that rescaling this
+    // segment no longer lands exactly on `emphasized-accelerate`. See
+    // `the_emphasized_halves_are_its_own_segments_rescaled`.
     (
         "emphasized",
         &[
-            [0.0, 0.0, 0.05, 0.0, 0.13333333, 0.06, 0.16666667, 0.4],
-            [0.16666667, 0.4, 0.20833333, 0.82, 0.25, 1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.05, 0.0, 2.0 / 15.0, 0.06, 1.0 / 6.0, 0.4],
+            [1.0 / 6.0, 0.4, 5.0 / 24.0, 0.82, 0.25, 1.0, 1.0, 1.0],
         ],
     ),
-    // The two halves, each rescaled to span the whole timeline. See the
-    // module doc: rescaling the first segment is what makes these the
-    // accelerate and decelerate curves.
+    // `emphasized`'s two segments, each rescaled to span the whole timeline.
+    // Derived rather than transcribed -- see the module doc, which also
+    // explains why the design system's own "half" tokens are absent here.
+    // The rescaling is what makes these the accelerate and decelerate
+    // curves, which `the_emphasized_halves_are_its_own_segments_rescaled`
+    // checks by computing it rather than by restating it.
     (
         "emphasized-first-half",
         &[[0.0, 0.0, 0.3, 0.0, 0.8, 0.15, 1.0, 1.0]],
@@ -487,11 +523,67 @@ mod tests {
         }
     }
 
+    /// Rescales a segment from its own span to the full `(0, 0) .. (1, 1)`.
+    ///
+    /// The halves are *defined* as `emphasized`'s segments put through this,
+    /// so a test that hardcoded the resulting numbers would only be checking
+    /// the table against itself. Computing them here is what makes the two
+    /// halves' provenance a checked fact rather than a claim in a comment.
+    fn rescale_to_full_timeline(segment: BezierSegment) -> BezierSegment {
+        let (x0, y0) = (segment[0], segment[1]);
+        let (width, height) = (segment[6] - x0, segment[7] - y0);
+        let along = |value: f64, from: f64, span: f64| -> f64 {
+            return (value - from) / span;
+        };
+        return [
+            0.0,
+            0.0,
+            along(segment[2], x0, width),
+            along(segment[3], y0, height),
+            along(segment[4], x0, width),
+            along(segment[5], y0, height),
+            1.0,
+            1.0,
+        ];
+    }
+
+    /// Compares curves number by number, with a tolerance for the division.
+    fn assert_curve_close(actual: &[BezierSegment], expected: &[BezierSegment], what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{what}: segment count");
+        for (index, (left, right)) in actual.iter().zip(expected.iter()).enumerate() {
+            for (position, (a, b)) in left.iter().zip(right.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-12,
+                    "{what}: segment {index} number {position} was {a}, expected {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_emphasized_halves_are_its_own_segments_rescaled() {
+        // `emphasized` is two segments; each half is one of them stretched to
+        // the full timeline. Computed here from the full curve, so this fails
+        // if either the full curve or a half is ever re-transcribed.
+        let whole = curve_of("emphasized");
+        assert_eq!(whole.len(), 2, "emphasized is two segments");
+        assert_curve_close(
+            curve_of("emphasized-first-half"),
+            &[rescale_to_full_timeline(whole[0])],
+            "the first half is the first segment rescaled",
+        );
+        assert_curve_close(
+            curve_of("emphasized-last-half"),
+            &[rescale_to_full_timeline(whole[1])],
+            "the last half is the second segment rescaled",
+        );
+    }
+
     #[test]
     fn the_two_emphasized_halves_are_the_accelerate_and_decelerate_curves() {
-        // The claim the module doc makes about where the halves come from.
-        // If a token is ever re-transcribed and breaks the identity, this
-        // is the test that says so.
+        // A consequence of the rescaling rather than a separate fact: the
+        // first segment's span is `(0, 0) .. (1/6, 0.4)`, and dividing the
+        // first control point by that span is what puts it at `(0.3, 0)`.
         for (half, whole) in [
             ("emphasized-first-half", "emphasized-accelerate"),
             ("emphasized-last-half", "emphasized-decelerate"),
@@ -499,8 +591,33 @@ mod tests {
             assert_eq!(
                 curve_of(half),
                 curve_of(whole),
-                "{half} and {whole} are documented as the same curve"
+                "{half} and {whole} are the same curve by construction"
             );
+        }
+    }
+
+    #[test]
+    fn the_emphasized_halves_stay_within_the_unit_square() {
+        // The reason the halves are rescaled at all: a segment's own span
+        // ends at `x = 1/6`, so the raw segment cannot drive a whole
+        // animation. Rescaled, both are ordinary easings that still invert
+        // cleanly, which needs their x to be monotonic.
+        for name in ["emphasized-first-half", "emphasized-last-half"] {
+            for segment in curve_of(name) {
+                assert_eq!(
+                    (segment[0], segment[1]),
+                    (0.0, 0.0),
+                    "{name} starts at the origin"
+                );
+                assert_eq!(
+                    (segment[6], segment[7]),
+                    (1.0, 1.0),
+                    "{name} ends at the unit"
+                );
+            }
+            let easing = Easing::from_name(name);
+            assert!(easing.apply(0.0).abs() < 1e-9, "{name} starts at 0");
+            assert!((easing.apply(1.0) - 1.0).abs() < 1e-9, "{name} ends at 1");
         }
     }
 
