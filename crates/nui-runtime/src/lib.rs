@@ -19,6 +19,7 @@
 pub mod animation;
 pub mod binding;
 pub mod canvas;
+pub mod easing;
 pub mod element;
 pub mod instantiate;
 pub mod machine;
@@ -32,6 +33,7 @@ pub mod widget;
 pub use animation::{AnimationClock, AnimationKind, Easing};
 pub use binding::{Binding, BindingIndex, Engine, EvalError, TwoWayEdge, TwoWayLink};
 pub use canvas::{CanvasCap, CanvasOp, CanvasPainter};
+pub use easing::{BezierCurve, BezierSegment};
 pub use element::{Element, ElementId, ElementTree, ForBinding, HandlerEntry, RowScope, WhenEntry};
 pub use instantiate::{Instance, instantiate, instantiate_with, reload_from_source};
 pub use machine::MachineInstance;

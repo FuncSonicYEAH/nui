@@ -4,54 +4,13 @@
 //!
 //! M2 scope: the engine writes the target as usual; when a property has an
 //! active animation, the clock advances the current value toward the target
-//! and the engine's read layer returns the animated value. Easing follows
-//! the CSS `ease`-family curves (plan D8 keeps animations inline; easing
-//! names come from the `easing` argument as `String`).
+//! and the engine's read layer returns the animated value. The easing curves
+//! live in [`crate::easing`]: the three CSS defaults plus a table of named
+//! cubic-bezier curves, which is where a design system's motion tokens go.
 
 use nui_core::{Duration, Value};
 
-/// Easing curve of a tween.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Easing {
-    /// Linear (`x = t`).
-    Linear,
-    /// Quadratic ease-in-out (default; `ease-out` etc. map here in M2).
-    EaseInOut,
-    /// Cubic ease-out (fast start, slow end).
-    EaseOut,
-}
-
-impl Easing {
-    /// Maps an `easing = ...` string; unknown names fall back to the
-    /// default (the compiler restricts the argument type, not the value).
-    pub fn from_name(name: &str) -> Easing {
-        return match name {
-            "linear" => Easing::Linear,
-            "ease-out" => Easing::EaseOut,
-            _ => Easing::EaseInOut,
-        };
-    }
-
-    /// Progresses `t` (0..=1) through the curve.
-    pub fn apply(self, t: f64) -> f64 {
-        let clamped = t.clamp(0.0, 1.0);
-        return match self {
-            Easing::Linear => clamped,
-            Easing::EaseInOut => {
-                if clamped < 0.5 {
-                    2.0 * clamped * clamped
-                } else {
-                    let mirrored = 2.0 - 2.0 * clamped;
-                    1.0 - mirrored * mirrored / 2.0
-                }
-            }
-            Easing::EaseOut => {
-                let inverted = 1.0 - clamped;
-                1.0 - inverted * inverted
-            }
-        };
-    }
-}
+pub use crate::easing::{BezierCurve, BezierSegment, Easing};
 
 /// One active property animation.
 #[derive(Debug, Clone)]

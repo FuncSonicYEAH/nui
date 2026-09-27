@@ -785,6 +785,90 @@ fn tween_binding_routes_target_through_the_clock() {
 }
 
 #[test]
+fn a_named_cubic_bezier_easing_reaches_the_clock() {
+    // End-to-end for the design-system curves: the name is written in the
+    // document, resolved by `Easing::from_name`, and shapes the value the
+    // clock displays. `emphasized-decelerate` is the clearest witness — it
+    // is front-loaded, so at the halfway tick it is already well past half.
+    let source = r#"
+        component A {
+            property count: Int = 0
+
+            Window(id = root) {
+                Text(x <- tween(count, duration = 100ms, easing = emphasized-decelerate))
+            }
+        }
+    "#;
+    let (mut tree, mut engine) = build(source);
+    let root = tree.lookup_id("root").unwrap();
+    let text = find_by_type(&tree, "Text");
+    engine.propagate(&mut tree);
+
+    engine.set_direct(&mut tree, root, "count", Value::Int(100));
+    engine.propagate(&mut tree);
+    assert!(engine.has_active_animations());
+    engine.tick_animations(&mut tree, Duration::from_millis(50.0));
+    let midway = match tree.arena[text].get("x") {
+        Some(Value::Float(value)) => *value,
+        Some(Value::Int(value)) => *value as f64,
+        other => panic!("expected a numeric x, got {other:?}"),
+    };
+    assert!(
+        midway > 60.0,
+        "a decelerating curve is already past the halfway point, got {midway}"
+    );
+    assert!(
+        midway < 100.0,
+        "and has not reached the target yet, got {midway}"
+    );
+    engine.tick_animations(&mut tree, Duration::from_millis(50.0));
+    assert_eq!(
+        tree.arena[text].get("x"),
+        Some(&Value::Int(100)),
+        "a completed tween lands exactly on its target"
+    );
+}
+
+#[test]
+fn an_overshooting_easing_passes_its_target_and_comes_back() {
+    // The spatial curves deliberately exceed 1.0, so an animated property
+    // can be seen past its target on the way down — the property the design
+    // system is actually buying.
+    let source = r#"
+        component A {
+            property count: Int = 0
+
+            Window(id = root) {
+                Text(x <- tween(count, duration = 100ms, easing = spatial-fast))
+            }
+        }
+    "#;
+    let (mut tree, mut engine) = build(source);
+    let root = tree.lookup_id("root").unwrap();
+    let text = find_by_type(&tree, "Text");
+    engine.propagate(&mut tree);
+    engine.set_direct(&mut tree, root, "count", Value::Int(100));
+    engine.propagate(&mut tree);
+
+    let mut peak = f64::MIN;
+    for _ in 0..8 {
+        engine.tick_animations(&mut tree, Duration::from_millis(10.0));
+        let value = match tree.arena[text].get("x") {
+            Some(Value::Float(value)) => *value,
+            Some(Value::Int(value)) => *value as f64,
+            other => panic!("expected a numeric x, got {other:?}"),
+        };
+        peak = peak.max(value);
+    }
+    assert!(peak > 100.0, "the curve overshot, peak was {peak}");
+    // ...and still lands on the target rather than short of it.
+    for _ in 0..8 {
+        engine.tick_animations(&mut tree, Duration::from_millis(10.0));
+    }
+    assert_eq!(tree.arena[text].get("x"), Some(&Value::Int(100)));
+}
+
+#[test]
 fn spring_binding_settles_at_target() {
     let source = r#"
         component A {
