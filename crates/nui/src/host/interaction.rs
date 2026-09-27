@@ -157,11 +157,7 @@ impl WindowHost {
         };
         if self.tree.arena[focused].is_text_input()
             || !matches!(key, Key::Character(' ') | Key::Enter)
-            || !nui_runtime::widget::is_activatable(
-                &self.tree,
-                focused,
-                &self.tree.arena[focused].ty,
-            )
+            || !nui_runtime::widget::is_activatable(&self.engine, &self.tree, focused)
         {
             return false;
         }

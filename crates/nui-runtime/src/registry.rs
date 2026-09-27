@@ -55,6 +55,47 @@ pub struct ComponentDesc {
     pub name: String,
     /// Property descriptors (name, type, optional default).
     pub properties: Vec<PropertyDescriptor>,
+    /// How instances of this component behave under the pointer and the
+    /// keyboard.
+    ///
+    /// The default (`kind: None`) makes the component inert, which is the
+    /// right answer for a component that is only a layout wrapper. Setting
+    /// a kind is what turns it into a control: the widget tracker then
+    /// writes `hovered` / `pressed` / `armed` / `focused` / `disabled` on
+    /// every instance, Space and Enter activate it, and a click runs
+    /// [`ElementBehavior::on_signal`] — the same contract the built-in
+    /// `Button` gets from its type name.
+    ///
+    /// This is per *instance* state on purpose. A component *property* is
+    /// persistent (declared once, own storage, survives every frame), so
+    /// modelling hover as one would cost a property slot per control and
+    /// still have no way to notice a pointer that left mid-gesture.
+    pub interaction: crate::widget::Interaction,
+}
+
+impl ComponentDesc {
+    /// A descriptor for a component that is not a control: no hover, no
+    /// press, no keyboard, no Tab stop. The right answer for a component
+    /// that only arranges other things.
+    pub fn new(name: impl Into<String>) -> ComponentDesc {
+        return ComponentDesc {
+            name: name.into(),
+            properties: Vec::new(),
+            interaction: crate::widget::Interaction::default(),
+        };
+    }
+
+    /// Builder: declares this component a control.
+    pub fn with_interaction(mut self, interaction: crate::widget::Interaction) -> ComponentDesc {
+        self.interaction = interaction;
+        return self;
+    }
+
+    /// Builder: adds a property descriptor.
+    pub fn with_property(mut self, property: PropertyDescriptor) -> ComponentDesc {
+        self.properties.push(property);
+        return self;
+    }
 }
 
 /// One property of a [`ComponentDesc`].

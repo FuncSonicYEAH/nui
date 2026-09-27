@@ -422,10 +422,7 @@ component Board {
         use crate::registry::{ComponentDesc, Registry};
         let mut registry = Registry::new();
         registry.register_component(
-            ComponentDesc {
-                name: "Canvas".to_string(),
-                properties: Vec::new(),
-            },
+            ComponentDesc::new("Canvas"),
             Some(Box::new(|| {
                 let painter = CanvasPainter::new();
                 painter.move_to(10.0, 10.0);

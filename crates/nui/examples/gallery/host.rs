@@ -19,7 +19,9 @@
 use nui_core::{Size, Value};
 use nui_runtime::canvas::{CanvasCap, CanvasPainter};
 use nui_runtime::element::ElementId;
-use nui_runtime::{BehaviorContext, ComponentDesc, ElementBehavior, ModelRow, Registry, VecModel};
+use nui_runtime::{
+    BehaviorContext, ComponentDesc, ElementBehavior, Interaction, ModelRow, Registry, VecModel,
+};
 
 /// Logical window size. Wide enough for the sidebar plus the widest page.
 pub(crate) const WINDOW: Size = Size {
@@ -347,24 +349,19 @@ pub(crate) fn build_registry() -> Registry {
         engine.set_direct(tree, root, "todoItems", Value::Model(model.0));
     }));
     registry.register_component(
-        ComponentDesc {
-            name: "Canvas".to_string(),
-            properties: Vec::new(),
-        },
+        ComponentDesc::new("Canvas"),
         Some(Box::new(|| return Box::new(ChartBehavior::new()))),
     );
+    // Both are controls, not just leaves with a behavior: declaring the
+    // interaction is what gives every instance `hovered` / `armed` states
+    // to bind a skin to, a Tab stop, and Space/Enter activation. Without
+    // it they would only respond to a pointer that happened to click.
     registry.register_component(
-        ComponentDesc {
-            name: "TodoCheckbox".to_string(),
-            properties: Vec::new(),
-        },
+        ComponentDesc::new("TodoCheckbox").with_interaction(Interaction::momentary()),
         Some(Box::new(|| return Box::new(TodoCheckbox))),
     );
     registry.register_component(
-        ComponentDesc {
-            name: "TodoRemove".to_string(),
-            properties: Vec::new(),
-        },
+        ComponentDesc::new("TodoRemove").with_interaction(Interaction::momentary()),
         Some(Box::new(|| return Box::new(TodoRemove))),
     );
     return registry;

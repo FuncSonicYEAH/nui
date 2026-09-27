@@ -42,4 +42,6 @@ pub use registry::{
     HostFunction, PropertyDescriptor, Registry,
 };
 pub use text_input::TextInputState;
-pub use widget::{PointerInput, WidgetKind, WidgetState, WidgetStates, is_widget_type};
+pub use widget::{
+    Interaction, PointerInput, WidgetKind, WidgetState, WidgetStates, is_widget_type,
+};

@@ -150,6 +150,53 @@ fn the_keyboard_focus_order_is_not_the_widget_list() {
 }
 
 #[test]
+fn interaction_of_type_describes_the_built_ins() {
+    let button = super::Interaction::of_type("Button");
+    assert_eq!(button.kind, Some(WidgetKind::Momentary));
+    assert_eq!(button.toggle_property, None, "nothing to toggle");
+    assert!(button.focusable, "a button is a tab stop");
+    assert!(button.is_control());
+
+    let check = super::Interaction::of_type("CheckBox");
+    assert_eq!(check.kind, Some(WidgetKind::Toggle));
+    assert_eq!(check.toggle_property, Some("checked"), "flips");
+    assert!(check.focusable);
+
+    let radio = super::Interaction::of_type("RadioButton");
+    assert_eq!(radio.toggle_property, Some("selected"), "selects");
+
+    let slider = super::Interaction::of_type("Slider");
+    assert_eq!(slider.kind, Some(WidgetKind::Drag));
+    assert_eq!(
+        slider.toggle_property, None,
+        "a drag control has no Boolean to flip"
+    );
+
+    // A Dialog is interactive but owns focus inside itself.
+    let dialog = super::Interaction::of_type("Dialog");
+    assert!(dialog.is_control());
+    assert!(!dialog.focusable, "not a tab stop");
+
+    let column = super::Interaction::of_type("Column");
+    assert_eq!(column.kind, None);
+    assert!(!column.is_control());
+}
+
+#[test]
+fn a_non_toggle_kind_never_reports_a_toggle_property() {
+    // `toggle_property_of_type` is keyed by type name, so asking for it
+    // without consulting the kind would hand a `Momentary` control a
+    // Boolean to flip. `of_type` is the gate.
+    for ty in ["Button", "Dialog", "Slider", "SpinBox", "Text", "Row"] {
+        assert_eq!(
+            super::Interaction::of_type(ty).toggle_property,
+            None,
+            "{ty} has nothing to toggle"
+        );
+    }
+}
+
+#[test]
 fn enabled_defaults_to_true() {
     assert!(is_enabled(&Element::new("Button", None)));
     let mut off = Element::new("Button", None);
@@ -487,16 +534,17 @@ fn momentaries_do_not_toggle() {
 #[test]
 fn disabled_widgets_are_not_activatable() {
     let (mut tree, id) = tree_of(widget("CheckBox", 0.0, 0.0, 200.0, 22.0));
-    assert!(is_activatable(&tree, id, "CheckBox"));
+    let engine = Engine::new();
+    assert!(is_activatable(&engine, &tree, id));
     tree.arena[id].set("enabled", Value::Bool(false));
-    assert!(!is_activatable(&tree, id, "CheckBox"));
+    assert!(!is_activatable(&engine, &tree, id));
 }
 
 #[test]
 fn non_widgets_are_not_activatable() {
     let (mut tree, id) = tree_of(widget("Column", 0.0, 0.0, 400.0, 400.0));
-    assert!(!is_activatable(&tree, id, "Column"));
     let mut engine = Engine::new();
+    assert!(!is_activatable(&engine, &tree, id));
     assert!(!activate(&mut engine, &mut tree, id));
 }
 

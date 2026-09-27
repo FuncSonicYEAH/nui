@@ -950,14 +950,11 @@ fn custom_component_carries_descriptor_and_behavior() {
     "#;
     let mut registry = Registry::new();
     registry.register_component(
-        ComponentDesc {
-            name: "Tally".to_string(),
-            properties: vec![PropertyDescriptor {
-                name: "count".to_string(),
-                ty: Type::Int,
-                default: Some(Value::Int(10)),
-            }],
-        },
+        ComponentDesc::new("Tally").with_property(PropertyDescriptor {
+            name: "count".to_string(),
+            ty: Type::Int,
+            default: Some(Value::Int(10)),
+        }),
         Some(Box::new(|| return Box::new(TallyBehavior))),
     );
     let outcome = nui_compiler::compile(source);
@@ -1078,21 +1075,15 @@ fn todo_demo_pipeline_end_to_end() {
     }));
     let mut registry = registry;
     registry.register_component(
-        ComponentDesc {
-            name: "Checkbox".to_string(),
-            properties: Vec::new(),
-        },
+        ComponentDesc::new("Checkbox"),
         Some(Box::new(|| return Box::new(Checkbox))),
     );
     registry.register_component(
-        ComponentDesc {
-            name: "RemoveButton".to_string(),
-            properties: vec![PropertyDescriptor {
-                name: "unused".to_string(),
-                ty: Type::Bool,
-                default: None,
-            }],
-        },
+        ComponentDesc::new("RemoveButton").with_property(PropertyDescriptor {
+            name: "unused".to_string(),
+            ty: Type::Bool,
+            default: None,
+        }),
         Some(Box::new(|| return Box::new(Remove))),
     );
     registry.register_function("log", Box::new(|_| return Ok(Value::Bool(true))));

@@ -92,8 +92,8 @@ mod tests;
 
 pub use activate::{activate, is_activatable, toggle_property};
 pub use chrome::{
-    TEXT_INSET_DP, text_inset, text_inset_extra, text_size, title_inset, title_rule_y, title_size,
-    title_text,
+    TEXT_INSET_DP, default_padding, text_inset, text_inset_extra, text_size, title_inset,
+    title_rule_y, title_size, title_text,
 };
 pub use label::{ASTERISK_GAP_DP, REQUIRED_MARK, is_required, label_target};
 pub use overlay::{
@@ -110,16 +110,19 @@ use nui_core::Value;
 use crate::binding::Engine;
 use crate::element::{Element, ElementId, ElementTree};
 
+use activate::toggle_property_of_type;
 use bounds::absolute_bounds;
 use drag::drag_value;
 
 /// Element type names the widget layer treats as interactive controls.
 ///
-/// Kept as a flat list rather than a registry trait because the set is
-/// small, fixed, and shared by the host (hit testing, keyboard) and the
-/// renderer (which paints each one). A host *custom* component built from
-/// [`ElementBehavior`](crate::registry::ElementBehavior) gets the same
-/// state by declaring the matching type name.
+/// The **built-in** controls, which answer from their type name alone.
+/// A host-registered component says the same thing through its
+/// [`ComponentDesc::interaction`](crate::registry::ComponentDesc::interaction)
+/// instead — see [`Interaction`] and [`Engine::interaction`], which is what
+/// every caller should ask. This list stays the fallback because a
+/// built-in's name *is* its identity, whereas a component instance's name
+/// is only recorded on the element.
 const WIDGET_TYPES: &[&str] = &[
     "Button",
     "CheckBox",
@@ -168,8 +171,119 @@ impl WidgetKind {
 }
 
 /// Whether an element is a widget type (host hit testing / keyboard).
+///
+/// Type-name based, so it answers `true` for a `Button` and `false` for a
+/// `Column`. It cannot see a component instance's registration — use
+/// [`Engine::interaction`] when the element is known.
 pub fn is_widget_type(ty: &str) -> bool {
     return WIDGET_TYPES.contains(&ty);
+}
+
+/// How one element behaves under the pointer and the keyboard.
+///
+/// This is the answer every interaction caller wants, and it has two
+/// sources. A built-in control is identified by its type name. A
+/// host-registered component is identified by the name recorded on the
+/// element at instantiation, which is the *only* place a component's
+/// identity survives: an instance of `component RippleButton` is a
+/// `Rectangle` to layout and to the renderer, so nothing downstream can
+/// tell it apart from a plain rectangle without asking.
+///
+/// `kind: None` means "not a control": no hover tracking, no press, no
+/// keyboard activation, and no Tab stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Interaction {
+    /// Pointer behaviour; `None` for an element that is not a control.
+    pub kind: Option<WidgetKind>,
+    /// The Boolean a `Toggle` flips (`checked` for a checkbox, `selected`
+    /// for a radio button). `None` for every other kind, which has nothing
+    /// to toggle.
+    pub toggle_property: Option<&'static str>,
+    /// Whether the control joins the Tab focus order.
+    ///
+    /// Separate from `kind` on purpose: a `Momentary` control is usually a
+    /// tab stop, while a `Dialog` is interactive but owns focus *inside*
+    /// itself, so making it a stop would be wrong.
+    pub focusable: bool,
+}
+
+impl Interaction {
+    /// The built-in behaviour of a type name.
+    pub fn of_type(ty: &str) -> Interaction {
+        let kind = WidgetKind::of(ty);
+        return Interaction {
+            // Only a `Toggle` has something to toggle, so the lookup is
+            // gated on the kind rather than asked unconditionally.
+            toggle_property: match kind {
+                Some(WidgetKind::Toggle) => toggle_property_of_type(ty),
+                _ => None,
+            },
+            kind,
+            focusable: FOCUSABLE_TYPES.contains(&ty),
+        };
+    }
+    /// Whether this element is a control at all.
+    pub fn is_control(self) -> bool {
+        return self.kind.is_some();
+    }
+
+    /// A control that acts on click and does nothing else — the built-in
+    /// `Button`'s behaviour.
+    pub fn momentary() -> Interaction {
+        return Interaction {
+            kind: Some(WidgetKind::Momentary),
+            toggle_property: None,
+            focusable: true,
+        };
+    }
+
+    /// A control whose click flips a Boolean: `checked` toggles,
+    /// `selected` selects (and groups). See
+    /// [`activate`](crate::widget::activate) for what the two mean.
+    pub fn toggle(property: &'static str) -> Interaction {
+        return Interaction {
+            kind: Some(WidgetKind::Toggle),
+            toggle_property: Some(property),
+            focusable: true,
+        };
+    }
+
+    /// A control whose click sets a position and whose captured drag keeps
+    /// updating it.
+    pub fn drag() -> Interaction {
+        return Interaction {
+            kind: Some(WidgetKind::Drag),
+            toggle_property: None,
+            focusable: true,
+        };
+    }
+
+    /// Interactive but not a Tab stop — a `Dialog` owns focus inside
+    /// itself, so making it a stop would be wrong.
+    pub fn momentary_unfocusable() -> Interaction {
+        return Interaction {
+            kind: Some(WidgetKind::Momentary),
+            toggle_property: None,
+            focusable: false,
+        };
+    }
+}
+
+impl Engine {
+    /// The pointer and keyboard behaviour of `element`.
+    ///
+    /// A component instance is answered from its registration, so a custom
+    /// control gets hover, press, activation and focus exactly like a
+    /// built-in one. Anything else falls back to the type-name table.
+    pub fn interaction(&self, tree: &ElementTree, id: ElementId) -> Interaction {
+        let element = &tree.arena[id];
+        if let Some(component) = &element.component
+            && let Some(descriptor) = self.registry().component(component)
+        {
+            return descriptor.interaction;
+        }
+        return Interaction::of_type(&element.ty);
+    }
 }
 
 /// Widget types that join the keyboard focus order (Tab, Space/Enter).
@@ -316,6 +430,10 @@ impl WidgetStates {
     }
 
     /// Whether `ty` participates in widget interaction.
+    ///
+    /// Type-name based and therefore blind to a component instance's
+    /// registration; the tracker itself asks
+    /// [`Engine::interaction`](crate::binding::Engine::interaction).
     pub fn is_widget(&self, ty: &str) -> bool {
         return is_widget_type(ty);
     }
@@ -361,8 +479,8 @@ impl WidgetStates {
         }
         let focused = engine.focused();
         let mut ids = Vec::new();
-        tree.visit_pre_order(|id, element| {
-            if is_widget_type(&element.ty) {
+        tree.visit_pre_order(|id, _element| {
+            if engine.interaction(tree, id).is_control() {
                 ids.push(id);
             }
         });
@@ -387,7 +505,7 @@ impl WidgetStates {
         if input.down
             && let Some(captured) = self.captured
             && tree.arena.contains_key(captured)
-            && WidgetKind::of(&tree.arena[captured].ty) == Some(WidgetKind::Drag)
+            && engine.interaction(tree, captured).kind == Some(WidgetKind::Drag)
             && drag_value(engine, tree, captured, input.position)
         {
             changed.push(captured);

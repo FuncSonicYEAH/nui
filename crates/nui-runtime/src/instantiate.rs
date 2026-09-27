@@ -308,6 +308,14 @@ fn instantiate_component_instance(
     tree.arena[element].component = Some(name.to_string());
     tree.arena[element].instance_id = Some(self_id.clone());
     tree.register_id(&self_id, element);
+    // A component that declares itself focusable joins the Tab order, the
+    // same as a built-in whose type name is in the focusable table. Set
+    // here rather than per frame because the focus walk reads the flag.
+    if let Some(descriptor) = engine.registry().component(name)
+        && descriptor.interaction.focusable
+    {
+        tree.arena[element].focusable = true;
+    }
 
     apply_component_properties(tree, engine, element, &properties);
     for assignment in &reference.assignments {
