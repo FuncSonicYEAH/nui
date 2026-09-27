@@ -29,7 +29,10 @@ pub use image::{
 pub use layer::{BlurPipeline, LayerInstance, LayerPipeline};
 pub use path::{PathPipeline, PathVertex};
 pub use rect::{CameraUniform, RectInstance, RectPipeline};
-pub use scene::{LineCap, PathDraw, PolylineDraw, Scene, SceneBuilder, SceneContext, TextDraw};
+pub use scene::{
+    GradientDraw, GradientKind, LineCap, PathDraw, PolylineDraw, Scene, SceneBuilder, SceneContext,
+    TextDraw,
+};
 pub use stroke::{StrokeInstance, StrokePipeline};
 pub use text::{TextInstance, TextPipeline};
 pub use widget::{Palette, VisualState, WidgetPart, variant_palette};
@@ -118,7 +121,35 @@ impl Renderer {
                 instance = instance.with_rotation(rect.rotation);
             }
             if let Some(gradient) = &rect.gradient {
-                instance = instance.with_gradient(gradient.from, gradient.to, gradient.angle);
+                instance = match gradient.kind {
+                    GradientKind::Linear => {
+                        instance.with_gradient(gradient.from, gradient.to, gradient.angle)
+                    }
+                    GradientKind::Radial => {
+                        // Defaults resolved here rather than in the scene, so
+                        // a gradient always has a definite centre and radius
+                        // by the time it reaches the instance. The default
+                        // centre is the rect's own, and the default radius
+                        // completes the gradient at the nearest edge
+                        // midpoint — half the shorter side.
+                        let center = gradient.center.unwrap_or_else(|| {
+                            return nui_core::Point::new(
+                                rect.geometry.size.width / 2.0,
+                                rect.geometry.size.height / 2.0,
+                            );
+                        });
+                        let radius = gradient.radius.unwrap_or_else(|| {
+                            return rect.geometry.size.width.min(rect.geometry.size.height) / 2.0;
+                        });
+                        instance.with_radial_gradient(
+                            gradient.from,
+                            gradient.to,
+                            center,
+                            radius,
+                            scale,
+                        )
+                    }
+                };
             }
             instances.push(instance);
         }

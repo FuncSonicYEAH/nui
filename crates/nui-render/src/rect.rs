@@ -6,7 +6,7 @@
 //! effects with M6.
 
 use bytemuck::{Pod, Zeroable};
-use nui_core::{Color, Rect};
+use nui_core::{Color, Point, Rect};
 
 /// GPU vertex: corner position in quad space.
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -52,14 +52,18 @@ pub struct RectInstance {
     pub clip_radius: f32,
     /// Rotation in degrees, clockwise, around the rect center (0 = none).
     pub rotation: f32,
-    /// WGSL struct padding to 128 bytes.
-    pub _pad2: [f32; 2],
+    /// Radial gradient centre in physical px, from the rect's top-left
+    /// corner. Only read when `gradient_params.z` is
+    /// [`GRADIENT_RADIAL`](crate::scene::GRADIENT_RADIAL); linear gradients
+    /// leave it alone. Was struct padding.
+    pub gradient_center: [f32; 2],
     /// Gradient start color (linear premultiplied); unused when no gradient.
     pub gradient_from: [f32; 4],
     /// Gradient end color (linear premultiplied); unused when no gradient.
     pub gradient_to: [f32; 4],
-    /// `(dir.x, dir.y, kind, 0)` — unit direction of the gradient axis in
-    /// screen coordinates, `kind`: 0 = none, 1 = linear.
+    /// `(dir.x, dir.y, kind, radius)` — unit direction of the gradient axis
+    /// in screen coordinates, the gradient kind (0 none / 1 linear /
+    /// 2 radial), and the radial radius in physical px.
     pub gradient_params: [f32; 4],
 }
 
@@ -122,7 +126,7 @@ impl RectInstance {
             clip_bounds: [0.0, 0.0, 0.0, 0.0],
             clip_radius: -1.0,
             rotation: 0.0,
-            _pad2: [0.0, 0.0],
+            gradient_center: [0.0, 0.0],
             gradient_from: [0.0, 0.0, 0.0, 0.0],
             gradient_to: [0.0, 0.0, 0.0, 0.0],
             gradient_params: [0.0, 0.0, 0.0, 0.0],
@@ -146,6 +150,28 @@ impl RectInstance {
         self.gradient_from = linear_rgba(from);
         self.gradient_to = linear_rgba(to);
         self.gradient_params = [angle.cos(), angle.sin(), 1.0, 0.0];
+        return self;
+    }
+
+    /// Attaches a radial gradient centred on `center` (dp, from the rect's
+    /// top-left corner), reaching `to` at `radius` dp and `from` at the
+    /// centre.
+    ///
+    /// Rect-local like the linear one, so a rotated element carries its
+    /// gradient with it. The motivating shape is a touch ripple: a circle
+    /// of colour that spreads from where the finger went and fades out.
+    pub fn with_radial_gradient(
+        mut self,
+        from: Color,
+        to: Color,
+        center: Point,
+        radius_dp: f32,
+        scale: f32,
+    ) -> RectInstance {
+        self.gradient_from = linear_rgba(from);
+        self.gradient_to = linear_rgba(to);
+        self.gradient_center = [center.x * scale, center.y * scale];
+        self.gradient_params = [0.0, 0.0, 2.0, radius_dp * scale];
         return self;
     }
 
@@ -214,10 +240,10 @@ struct RectData {
     clip_bounds: vec4<f32>,
     clip_radius: f32,
     rotation: f32,
-    _pad2: array<f32, 2>,
+    gradient_center: vec2<f32>,
     gradient_from: vec4<f32>,
     gradient_to: vec4<f32>,
-    gradient_params: vec4<f32>,  // dir.x, dir.y, kind (0 none / 1 linear), 0
+    gradient_params: vec4<f32>,  // dir.x, dir.y, kind (0 none/1 linear/2 radial), radius
 };
 
 @group(1) @binding(0) var<storage, read> rects: array<RectData>;
@@ -278,12 +304,25 @@ fn rounded_rect_sdf(point: vec2<f32>, size: vec2<f32>, radius: f32) -> f32 {
     return outside + inside - clamped_radius;
 }
 
-/// Linear gradient along a screen-space direction projected onto the rect:
-/// `t = 0` at the entry edge, `t = 1` at the exit edge. The direction is
-/// rect-local, so a rotated element carries its gradient with it.
+/// The gradient at a point in rect-local physical pixels: `t = 0` at the
+/// start colour, `t = 1` at the end colour, both clamped.
+///
+/// A linear gradient runs along a direction projected onto the rect, so
+/// the direction is rect-local and a rotated element carries its gradient
+/// with it. A radial gradient runs outward from a point, reaching the end
+/// colour at `radius` — the ripple shape, and the reason a rect's fill
+/// cannot always be a projection of a line.
 fn gradient_fill(data: RectData, local: vec2<f32>) -> vec4<f32> {
-    if (data.gradient_params.z < 0.5) {
+    let kind = data.gradient_params.z;
+    if (kind < 0.5) {
         return data.fill;
+    }
+    if (kind > 1.5) {
+        // A zero radius would divide by zero; the smallest sensible one
+        // makes the whole rect the end colour instead.
+        let radius = max(data.gradient_params.w, 0.0001);
+        let t = clamp(length(local - data.gradient_center) / radius, 0.0, 1.0);
+        return mix(data.gradient_from, data.gradient_to, t);
     }
     let dir = normalize(data.gradient_params.xy);
     let half_size = data.size * 0.5;
@@ -557,6 +596,43 @@ mod tests {
             "gradient_from.r at 128"
         );
         assert_eq!(probe.gradient_params[2], 0.0, "no gradient by default");
+        // The radial centre lives in what used to be struct padding, so it
+        // must not have shifted `gradient_from`.
+        assert_eq!(probe.gradient_center, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_radial_gradient_prepares_its_centre_and_radius() {
+        let instance = RectInstance::from_dp(
+            Rect::new(Point::ZERO, Size::new(10.0, 10.0)),
+            0.0,
+            Color::BLACK,
+            2.0,
+        )
+        .with_radial_gradient(
+            Color::from_rgb8(255, 0, 0),
+            Color::from_rgb8(0, 0, 255),
+            Point::new(3.0, 4.0),
+            12.0,
+            2.0,
+        );
+        assert_eq!(instance.gradient_params[2], 2.0, "kind = radial");
+        // Centre and radius are dp, scaled to physical pixels like every
+        // other dimension in the instance.
+        assert!((instance.gradient_center[0] - 6.0).abs() < 1e-6);
+        assert!((instance.gradient_center[1] - 8.0).abs() < 1e-6);
+        assert!((instance.gradient_params[3] - 24.0).abs() < 1e-6);
+        // A linear gradient leaves the direction slot alone; the two share
+        // `gradient_params`, so setting one must not read the other's.
+        let linear = RectInstance::from_dp(
+            Rect::new(Point::ZERO, Size::new(10.0, 10.0)),
+            0.0,
+            Color::BLACK,
+            1.0,
+        )
+        .with_gradient(Color::BLACK, Color::WHITE, 0.0);
+        assert_eq!(linear.gradient_params[2], 1.0, "kind = linear");
+        assert_eq!(linear.gradient_params[3], 0.0, "a linear radius is unused");
     }
 
     #[test]

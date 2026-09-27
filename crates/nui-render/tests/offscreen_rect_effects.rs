@@ -306,6 +306,163 @@ fn rotation_turns_the_rect_into_a_diamond() {
     );
 }
 
+/// Builds a 100x100 tree with one 80x80 child at (10, 10) carrying the
+/// given gradient properties.
+fn radial_tree(kind: Value, center: Option<(f32, f32)>, radius: Option<f32>) -> ElementTree {
+    let mut tree = ElementTree::new();
+    let mut root = Element::new("Column", None);
+    root.set("width", Value::Float(100.0));
+    root.set("height", Value::Float(100.0));
+    root.set("padding", Value::Length(nui_core::Length::Dp(10.0)));
+    let root_id = tree.insert(root);
+    tree.push_root(root_id);
+    let mut rect = Element::new("Rectangle", None);
+    rect.set("width", Value::Float(80.0));
+    rect.set("height", Value::Float(80.0));
+    rect.set("gradient.from", Value::Color(Color::from_rgb8(255, 0, 0)));
+    rect.set("gradient.to", Value::Color(Color::from_rgb8(0, 0, 0)));
+    rect.set("gradient.kind", kind);
+    if let Some((x, y)) = center {
+        rect.set("gradient.center_x", Value::Float(f64::from(x)));
+        rect.set("gradient.center_y", Value::Float(f64::from(y)));
+    }
+    if let Some(radius) = radius {
+        rect.set("gradient.radius", Value::Float(f64::from(radius)));
+    }
+    let rect_id = tree.insert(rect);
+    tree.append_child(root_id, rect_id);
+    return tree;
+}
+
+#[test]
+fn a_radial_gradient_falls_off_from_its_centre() {
+    // An 80x80 rect whose gradient runs red (centre) to black (radius 40).
+    // The default centre is the rect's own middle, which sits at (50, 50) in
+    // window coordinates. Four samples on the horizontal axis: bright red at
+    // the centre, black at one radius out, black inside past it (clamped),
+    // and a red corner because the corner is *closer* to the centre than the
+    // edge midpoint is not true — the corner is further, so it stays black.
+    let mut tree = radial_tree(Value::Enum("radial".to_string()), None, Some(40.0));
+    let (data, stride) = render_pixels(&mut tree, nui_core::Size::new(100.0, 100.0));
+
+    let centre = pixel(&data, stride, 50, 50);
+    assert!(
+        centre[0] > 200 && centre[1] < 40,
+        "the centre is the start colour, got {centre:?}"
+    );
+
+    // Halfway out (20dp from the centre on a 40dp radius) is halfway between
+    // the two colours — but *linearly*. The shader mixes premultiplied
+    // linear values, so 0.5 linear red comes back as ~0.74 in sRGB, i.e.
+    // around 188 rather than 128. Asserting the sRGB midpoint here would be
+    // asserting a colour-space bug.
+    let halfway = pixel(&data, stride, 70, 50);
+    assert!(
+        halfway[0] > 160 && halfway[0] < 210,
+        "halfway out is between the two colours, got {halfway:?}"
+    );
+
+    // At the radius the gradient is fully at the end colour.
+    let edge = pixel(&data, stride, 90, 50);
+    assert!(
+        edge[0] < 40,
+        "one radius out is the end colour, got {edge:?}"
+    );
+
+    // Past the radius the value clamps, so the corner is still black.
+    let corner = pixel(&data, stride, 88, 88);
+    assert!(
+        corner[0] < 40,
+        "beyond the radius stays clamped, got {corner:?}"
+    );
+}
+
+#[test]
+fn a_radial_gradient_honours_an_explicit_centre() {
+    // The same rect, but the centre pushed to its bottom-left corner: the
+    // bright spot moves there, which is the whole point of a ripple
+    // following a finger.
+    let mut tree = radial_tree(
+        Value::Enum("radial".to_string()),
+        Some((0.0, 0.0)),
+        Some(40.0),
+    );
+    let (data, stride) = render_pixels(&mut tree, nui_core::Size::new(100.0, 100.0));
+
+    // (10, 10) in window coordinates is the rect's own (0, 0).
+    let at_centre = pixel(&data, stride, 11, 11);
+    assert!(
+        at_centre[0] > 200,
+        "the bright spot moved to the declared centre, got {at_centre:?}"
+    );
+    // The old centre is now 40dp away — exactly the radius — so black.
+    let old_centre = pixel(&data, stride, 50, 50);
+    assert!(
+        old_centre[0] < 60,
+        "the rect's middle is a full radius away, got {old_centre:?}"
+    );
+}
+
+#[test]
+fn a_radial_gradient_without_a_centre_completes_at_the_nearer_edge() {
+    // The default radius is half the shorter side, so the gradient reaches
+    // its end colour at the midpoint of the nearest edge and clamps beyond.
+    let mut tree = radial_tree(Value::Enum("radial".to_string()), None, None);
+    let (data, stride) = render_pixels(&mut tree, nui_core::Size::new(100.0, 100.0));
+    let at_edge_midpoint = pixel(&data, stride, 90, 50);
+    assert!(
+        at_edge_midpoint[0] < 40,
+        "half the shorter side reaches the end colour, got {at_edge_midpoint:?}"
+    );
+    // A tall rect's shorter side is its width, so this is still the midpoint.
+    let mut tall = radial_tree(Value::Enum("radial".to_string()), None, None);
+    let root = tall.roots[0];
+    tall.arena[root].set("height", Value::Float(200.0));
+    let (tall_data, tall_stride) = render_pixels(&mut tall, nui_core::Size::new(100.0, 220.0));
+    let still_black = pixel(&tall_data, tall_stride, 90, 60);
+    assert!(
+        still_black[0] < 40,
+        "the width still sets the default radius, got {still_black:?}"
+    );
+}
+
+#[test]
+fn the_gradient_kind_is_also_accepted_as_a_number() {
+    // A document that parameterises its gradients may hold the kind in a
+    // number, and an integer composes better in an expression than a bare
+    // identifier.
+    let mut tree = radial_tree(Value::Int(2), None, Some(40.0));
+    let (data, stride) = render_pixels(&mut tree, nui_core::Size::new(100.0, 100.0));
+    let centre = pixel(&data, stride, 50, 50);
+    assert!(
+        centre[0] > 200,
+        "kind 2 is radial, got {centre:?} at the centre"
+    );
+}
+
+#[test]
+fn an_unset_or_linear_kind_still_runs_along_the_angle() {
+    // The default must not change: a gradient with no `kind` is still the
+    // top-to-bottom linear one it has always been.
+    let mut tree = radial_tree(Value::Enum("linear".to_string()), None, Some(40.0));
+    let (data, stride) = render_pixels(&mut tree, nui_core::Size::new(100.0, 100.0));
+    // Linear at 90 degrees: the top row is the start colour, the bottom row
+    // the end colour, and the horizontal middle is the same as the corners.
+    let top = pixel(&data, stride, 50, 12);
+    let bottom = pixel(&data, stride, 50, 88);
+    assert!(top[0] > 200, "the top is the start colour, got {top:?}");
+    assert!(
+        bottom[0] < 40,
+        "the bottom is the end colour, got {bottom:?}"
+    );
+    let left = pixel(&data, stride, 12, 50);
+    let right = pixel(&data, stride, 88, 50);
+    assert!(
+        (i32::from(left[0]) - i32::from(right[0])).abs() < 12,
+        "a vertical gradient does not vary across x, got {left:?} and {right:?}"
+    );
+}
+
 #[test]
 fn zero_rotation_matches_the_axis_aligned_rect() {
     // rotation = 0 must render identically to no rotation at all: the

@@ -100,19 +100,38 @@ pub struct Shadow {
     pub color: Color,
 }
 
-/// A linear gradient across the rect (shader-side interpolation).
+/// How a rect's gradient runs across it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GradientKind {
+    /// Along a direction, projected onto the rect.
+    Linear,
+    /// Outward from a point — the shape a touch ripple needs.
+    Radial,
+}
+
+/// A gradient across the rect (shader-side interpolation).
 ///
-/// The angle uses screen coordinates (y grows downward): `0` runs left to
-/// right, `90` runs top to bottom. The gradient is defined in the rect's
-/// own coordinate space, so it rotates with the element.
+/// Defined in the rect's own coordinate space, so it rotates with the
+/// element. The two kinds share their two endpoint colors; what differs is
+/// the path between them.
 #[derive(Debug, Clone, Copy)]
 pub struct GradientDraw {
-    /// Color at the gradient's start edge.
+    /// Which path `t` follows across the rect.
+    pub kind: GradientKind,
+    /// Color where `t = 0`.
     pub from: Color,
-    /// Color at the gradient's end edge.
+    /// Color where `t = 1`.
     pub to: Color,
-    /// Direction in degrees (screen coordinates, 0 = rightward).
+    /// Direction in degrees (screen coordinates, 0 = rightward). Linear
+    /// only.
     pub angle: f32,
+    /// Centre in dp from the rect's top-left corner. Radial only;
+    /// [`None`] means the rect's own centre.
+    pub center: Option<Point>,
+    /// Distance in dp from the centre at which `t` reaches 1. Radial only;
+    /// [`None`] means half the rect's shorter side, which completes the
+    /// gradient at the nearest edge midpoint.
+    pub radius: Option<f32>,
 }
 
 /// One drawable rounded rectangle.
@@ -131,8 +150,8 @@ pub struct RectDraw {
     /// Rotation in degrees, clockwise, around the rect's center. The
     /// layout box is unchanged; hit testing still uses the unrotated AABB.
     pub rotation: f32,
-    /// Linear gradient overriding `fill`, if any. Border and shadow keep
-    /// their own colors.
+    /// Gradient overriding `fill`, if any. Border and shadow keep their own
+    /// colors.
     pub gradient: Option<GradientDraw>,
 }
 
@@ -558,17 +577,27 @@ impl SceneBuilder {
         // rect surfaces rotate; Text/Image/TextInput decorations keep their
         // axis-aligned placement in v1.
         let rotation = f_property(element, "rotation").unwrap_or(0.0);
-        // Linear gradient: both endpoints must be present; `gradient.angle`
-        // defaults to 90 (top-to-bottom, matching the screen y axis). The
+        // A gradient needs both endpoints; `gradient.kind` picks the path
+        // between them and `gradient.angle` is linear's direction,
+        // defaulting to 90 (top-to-bottom, matching the screen y axis). The
         // element's opacity folds into both endpoints, like `fill`.
         let gradient = match (
             color_property(element, "gradient.from"),
             color_property(element, "gradient.to"),
         ) {
             (Some(from), Some(to)) => Some(GradientDraw {
+                kind: Self::gradient_kind_of(element),
                 from: from.with_alpha(from.alpha() * opacity),
                 to: to.with_alpha(to.alpha() * opacity),
                 angle: f_property(element, "gradient.angle").unwrap_or(90.0),
+                center: match (
+                    f_property(element, "gradient.center_x"),
+                    f_property(element, "gradient.center_y"),
+                ) {
+                    (Some(x), Some(y)) => Some(Point::new(x, y)),
+                    _ => None,
+                },
+                radius: f_property(element, "gradient.radius"),
             }),
             _ => None,
         };
@@ -1020,6 +1049,26 @@ impl SceneBuilder {
             return;
         };
         self.push_stroke(points, width, cap, color, clip, Point::new(x, y));
+    }
+
+    /// Reads `gradient.kind`, defaulting to linear.
+    ///
+    /// Accepted as an enum name (`radial`) or a numeric code (`2`),
+    /// because a document that parameterises its gradients may hold the
+    /// kind in a number, and an integer composes better in an expression
+    /// than a bare identifier.
+    fn gradient_kind_of(element: &nui_runtime::Element) -> GradientKind {
+        if let Some(kind) = element.get("gradient.kind") {
+            let named = kind
+                .as_enum()
+                .ok()
+                .is_some_and(|name| return name.eq_ignore_ascii_case("radial"));
+            if named || f_property(element, "gradient.kind").is_some_and(|code| return code >= 2.0)
+            {
+                return GradientKind::Radial;
+            }
+        }
+        return GradientKind::Linear;
     }
 
     /// Extracts one `Arc` element's stroke, flattening the arc into
