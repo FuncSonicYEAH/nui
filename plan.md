@@ -27,6 +27,9 @@
 | D13 | 平台隔离 | `#[cfg(target_os)]` 仅允许出现在 `nui-winit` 与打包层，CI 做 grep lint | 2026-09-19 |
 | D14 | 渲染路线 | Qt Quick 式场景图 + 4 实例化管线（rect / text / image / 后效） | 2026-09-19 |
 | D15 | lint 配置 | 显式 return 风格：`implicit_return = "warn"` 且 `needless_return = "allow"`（两 lint 互斥，以 rust-quality §2 为准） | 2026-09-19 |
+| D16 | 组件实例化的作用域 | **按实例改写 IR + id 命名空间**（`iN::` 前缀），不给求值器加词法作用域链：id 表保持一张平表，属性读取热路径不变 | 2026-09-27 |
+| D17 | 缓动曲线 | **具名曲线表**（设计系统的固定曲线集），不做通用 `bezier(x1,y1,x2,y2)` builtin——四个数字要有地方放进动态类型 `Value`；通用 builtin 留作后续，且届时无需迁移既有名字 | 2026-09-27 |
+| D18 | 组件交互声明 | 由 `ComponentDesc::interaction` 声明，而非扩充 `WIDGET_TYPES` 硬编码表：组件实例化后其类型名是 `Rectangle`，名字只留在元素上，下游无从分辨 | 2026-09-27 |
 
 **节点思想**（设计基座）：一切皆节点——可视节点（Rectangle/Text/Column…）、逻辑节点（Timer/State/Model，不绘制但参与树与绑定）、资源节点（Font/Image）。属性绑定构成数据流 DAG，引擎 = 节点树 + 响应式依赖图 + 每帧脏传播管线（绑定 → 布局 → 绘制）。
 
@@ -157,6 +160,40 @@ x       <- spring(target.x, stiffness = 120, damping = 14)
 - 依赖图成环：编译期静态检查 + 运行时求值深度上限双保险。
 - 字面量类型：`420dp`、`50%`、`auto`、`200ms`、`#336699`、`bold`（枚举变体）。
 
+### 3.3b 组件实例化（D16）
+
+文档内 `component` 声明的组件可以在节点位置当类型名用，即真正的组件库：
+
+```qml
+component RippleButton {
+    property label: String = ""
+    property tone: Color = #336699
+    signal picked
+    Rectangle(fill <- tone, radius = 12dp) {
+        Text(content <- label)
+        on click => emit picked
+    }
+}
+
+component App {
+    Window(id = root) {
+        RippleButton(id = ok, label = "OK") { on picked => n += 1 }
+    }
+}
+```
+
+规则与代价：
+
+- **实例元素就是组件的唯一根节点**，不套壳——布局看到的正是组件声明的那棵树；调用点的 `id`、声明属性、状态机与 `on <signal>` handler 全部落在同一个元素上。代价：**被实例化的组件必须恰好声明一个根节点**（未被引用的入口组件仍可声明多个，各自成为一个树根）。未被任何地方引用的组件不再实例化出多余根节点（此前"声明即产生幽灵根"）。
+- **按实例改写 IR + id 命名空间**（D16）。运行时的名字解析是全局平表（`ElementTree::ids`），给求值器加词法作用域链会把树遍历放进每次属性读取的热路径。改为：每个实例取一个 `iN::` 前缀，并把该组件 IR 的副本改写成使用它（`nui_runtime::mangle`）——组件内声明的 `id` 全部加前缀；`Component`/`Root` 裸读（"本组件自己的属性"）改写为对实例元素的显式引用。后者是必须一起解决的第二个单实例假设。方法调用的目标同样改写。
+- **`emit` 显式带目标**。组件的信号属于**调用点**，而触发它的 handler 可能在任意内层元素上。
+- **引用节点的方法体只接受 handler**。子节点 / 方法体内赋值 / `when` 各自都需要一条"落在被引用树的哪里"的规则，而每条规则都是一个静默惊喜的温床；属性写进参数列表，那里按声明类型检查。
+- **参数二义性**：名字被组件声明过就是它的 API（按声明类型检查），否则是实例根节点的普通元素属性（不检查）。同名时声明优先。
+- **调用点的静态参数会顶掉组件自身的绑定**（与 D10 效果块赋值同一优先级规则）：静态值是终值，组件自己挂的 `<-` 必须一并退役（引擎侧绑定表与元素槽两侧都要清，否则下一次传播会把它写回来）。
+- **自引用是编译错误**（组件引用图上的 DFS 成环检测）。
+- **暂不支持 `For` 体内的组件引用**：行由引擎实例化，而引擎不携带文档，无从展开——以诊断拒绝，而不是运行时静默展开为空。
+
+
 ### 3.4 编译与执行模型
 
 ```
@@ -204,14 +241,18 @@ crate 间路径依赖已在骨架 Cargo.toml 中连好；统一 lints（`unsafe_
 - **布局**：taffy 承担 flex/grid；`Column/Row/padding/spacing` 映射 flex 样式；布局结果回写 `x/y/width/height` 供绑定；绑定依赖布局结果时迭代上限做环路保护。
 - **输入**：winit 事件 → 归一化 → 命中测试（变换矩阵栈）→ capture/grab → bubble；键盘焦点链 + Tab 导航 + IME；`TextInput` 在 M7（难点 IME + 光标/选区）。
 - **宿主互操作**：`Registry` 注册自定义组件（trait + 描述符，后续 derive 宏）、注册可从表达式调用的函数、`Model` trait（行数/取行/变更通知，内置 `VecModel` 自动 diff）。跨线程更新走 event-loop proxy 合并到 UI 线程；整体单线程（图片解码等后台线程）。
+- **组件的交互声明**（D18）：`ComponentDesc::interaction` 声明该组件是控件（`Momentary` / `Toggle` / `Drag` / `Range` / `Spin`、Toggle 翻转哪个布尔、双端控件的两个属性名、是否 Tab 停留），`Engine::interaction` 依次按「元素上的组件名 → 类型名表」解析。之所以必须挂在注册表上：组件实例化后类型名就是它的根节点类型（`component RippleButton` 的实例是 `Rectangle`），名字只存在于元素上，**下游无从分辨**——这正是此前 `RippleButton` 拿不到 hover 的原因。`Toggle` 的两处约定按**属性名**而非类型名走（`selected` 是选中并成组，`checked` 是翻转），组件沿用同名即沿用约定。
+- **双端控件**（`WidgetKind::Range`）：一次手势移动离指针更近的那一端，接近度在**值空间**比较（平局取低端）。不能靠两个 `Slider` 叠在 `Stack` 里代替——指针捕获只有一个归属，上面的那个永远赢，另一个够不着。
+- **宿主动作**：`root.close()` 让文档自己关窗（引擎置标志、宿主消费）。宿主函数做不到，因为 `HostFunction` 是不可变闭包；`close` 是组件唯一可对自己调用的方法，且**跳过 id 查找**——"组件里没有叫 `root` 的元素"正是它要解决的场景。
 
 ## 6. wgpu 渲染设计
 
 - **四个管线，全部实例化批处理**：
   1. **Rect**（承担 ~80% UI）：每实例一个四边形，片元 SDF 画圆角矩形/边框/线性渐变，`fwidth` 抗锯齿；
   2. **Text**：字形图集四边形（cosmic-text shape 后栅格化进 etagere 图集，灰度 AA 起步）；
-  3. **Image**：纹理数组 + UV，tint 与九宫格；后台线程解码，按「路径+内容哈希」缓存 GPU 纹理并生成 mipmap；
+  3. **Image**：纹理数组 + UV，tint 与九宫格；后台线程解码，按「路径+内容哈希」缓存 GPU 纹理并生成 mipmap；`region.x/y/width/height` 可只绘制纹理的一块（以**纹理像素**为单位——生成的图标集因此只需一次解码与一次纹理上传；九宫格在 region 自身空间内切分后再映射到纹理空间）；
   4. **特效**（M6+）：阴影 SDF 近似、blur 两 pass 高斯 + 离屏纹理、opacity layer。
+  - 矩形填充另支持**线性渐变**（`gradient.from/to/angle`）与**径向渐变**（`gradient.kind = radial` + `gradient.center_x/center_y/radius`）——触控水波纹是圆不是线，没有径向渐变就没有它。两者都在 rect 局部坐标里，随元素一起旋转。
 - 实例带 `transform(2×3)` + 双层 clip 矩形（圆角裁剪 shader 内做，Flutter 式取最紧裁剪）；按「管线 → 材质 → 层序」排序合并，典型界面 draw call 两位数。
 - 渲染树构建时剔除不可见 / alpha=0 / 屏幕外子树。
 - 每窗口一个 `wgpu::Surface`（共享 Device/Queue），Bgra8UnormSrgb，Fifo present，正确处理 resize 与 DPI。
@@ -287,6 +328,7 @@ crate 间路径依赖已在骨架 Cargo.toml 中连好；统一 lints（`unsafe_
 | **M11**（1 周） | **多端编译与冒烟（Windows / macOS）**——见下节 M11 实施清单 | 三平台 CI 全绿 + 冒烟记录 |
 | **M12**（2 周） | AccessKit 无障碍树 + LSP（补全/跳转/诊断，复用 nui-compiler） | 编辑器里补全 `.nui` 属性 |
 | **M13**（1–2 周） | 原生集成（rfd 文件对话框 / muda 菜单 / 托盘）+ 三平台打包（Inno / .app / AppImage；依赖 M11） | 三平台可分发安装包 |
+| **M14**（2 周） | **组件库落地能力**（驱动下游把 M3 组件库搬到 nui）：组件实例化（§3.3b）、`ComponentDesc::interaction`（D18）、具名 cubic-bezier 缓动表（D17）、径向渐变、`Image` region、`root.close()`、双端控件 | 一份纯由 `component` 声明组成的控件库可用：声明式组件 + hover/press/focus + 设计系统动效曲线 |
 
 
 ### M11 实施清单：多端编译与冒烟（Windows / macOS）
@@ -308,7 +350,7 @@ crate 间路径依赖已在骨架 Cargo.toml 中连好；统一 lints（`unsafe_
   - fcitx5/ibus/XIM 支持:①`window.set_ime_allowed(true)`（winit 默认关闭 IME,不开则组合事件永不到达）;②`Event::ImePreedit` 新事件（winit `Ime::Preedit` 此前被丢弃）;③输入框内联渲染组合文本:光标处插入 preedit、下划线标记组合跨度、光标移至组合末尾;commit 提交后清空 preedit
   - 已知限制:preedit 光标偏移（字节→字符）未使用、组合期间按键仍走 handle_key 路径（X11 `is_composing` 会抑制,Wayland text-input 同理）
 
-（时长为单人业余节奏粗估，可调。M7–M13 顺序按依赖排：输入完整性 → 视觉完整性 → 大规模数据 → **多端地基** → 可达性/工具链 → 交付。）
+（时长为单人业余节奏粗估，可调。M7–M14 顺序按依赖排：输入完整性 → 视觉完整性 → 大规模数据 → **多端地基** → 可达性/工具链 → 交付 → 组件库落地。）
 
 ## 12. 风险与对策
 
@@ -407,3 +449,13 @@ crate 间路径依赖已在骨架 Cargo.toml 中连好；统一 lints（`unsafe_
   3. **swash placement 符号**：placement.top 是 Y 向上为正（基线→字形顶）,屏幕坐标 Y 向下需取反——否则全部字形画到基线下方
   4. **flex-shrink 挤压**：taffy 默认 flex_shrink=1,虚拟化列表的 30000dp Spacer 把整容器内容压缩归零;改为 `flex_shrink: 0`（Qt-Quick 语义:元素保持自然尺寸,溢出容器）
   - 教训:像素截图审查是渲染管线的『验收测试』,.offscreen 断言（红 255/通道占优）对伽马与嵌套错位完全不敏感
+- [x] **M14 完成**（2026-09-27）：**组件库落地能力**——由下游的 M3 组件库移植驱动,七项各自独立提交
+  - **组件实例化**（§3.3b）：类型名命中同文档 `component` 即为引用,checker 按声明类型检查参数/信号,运行时按实例展开。三个决定:实例元素**就是**组件的唯一根节点（不套壳,故被实例化的组件必须恰好一个根,未被引用的组件不再产生幽灵根）;作用域用 **id 命名空间改写**而非求值器作用域链（D16）;引用体只接受 handler。连带:实例改写覆盖方法调用目标、`emit` 新增显式目标、组件内状态机一并改写、`Element::remove_subtree` 清理实例名
+  - **`ComponentDesc::interaction`**（D18）：`Engine::interaction` 按「元素组件名 → 类型名表」解析,注册组件因此拿到 hover/press/armed/focus/disabled + 键盘激活 + Tab 停留;`Toggle` 的翻转/选中约定改按属性名(`checked`/`selected`),组件沿用同名即沿用约定
+  - **具名 cubic-bezier 缓动表**（D17,`nui_runtime::easing`）：12 条设计系统曲线;线段显式写出**两个端点**(M3 emphasized 是两段在 (1/6, 0.4) 相接,中段起点既非原点也非终点);进度按 **x 反解**(Newton + 二分兜底——`standard-decelerate` 两个控制点都在 x=0,`x(u)=u³` 在原点斜率为零,Newton 无法起步);测试记录两条读数为 CSS 曲线的后果:spatial 曲线**过冲**(y 控制点 >1)且 `spatial-fast`/`spatial-default` 因第二控制点低于第一点而在过冲肩部**微微回落**;`emphasized` 不过冲;两半 emphasized 归一化后恰是 accelerate/decelerate(恒等式测试锁住)
+  - **径向渐变**：`gradient.kind = radial` + `gradient.center_x/center_y/radius`;中心与半径占用原结构体 padding(`_pad2` 与 `gradient_params.w`),实例仍 176B、`gradient_from` 仍在 offset 128（两条都有断言——M9 的教训是 WGSL 对齐错误是静默的）;离屏像素测试 5 例
+  - **`Image` region**:`region.x/y/width/height`(纹理像素,四个全有或全无),九宫格在 region 空间切分后由纯函数 `remap_uv` 映射回纹理空间;离屏像素测试 4 例
+  - **`root.close()`**:引擎置标志、宿主消费;`close` 是组件唯一可对自己调用的方法且跳过 id 查找
+  - **双端控件**(`WidgetKind::Range`):一次手势移动值空间里更近的一端,平局取低端;未设的两端按 `min` 读,不除以缺失值
+  - M14 验收：`cargo fmt --all -- --check` / `clippy --workspace --all-targets -D warnings` / `test`（**652 全绿**,基线 566）/ `build --release` 全通过;D13 grep 通过;`examples/gallery --snap` 14 页出图与改动前一致(无回归)
+  - 已知限制:组件引用暂不支持出现在 `For` 体内（行由引擎实例化,引擎不携带文档）;缓动曲线名不做编译期校验（`easing` 是 `Enum`,拼错静默降级为默认曲线,与既有行为一致）;`Path` 填充仍无抗锯齿;未做系统调色板跟随（`nui-winit` 无 `QStyleHints::colorScheme` 对应能力）
