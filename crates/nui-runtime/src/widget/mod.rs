@@ -153,6 +153,13 @@ pub enum WidgetKind {
     /// press rather than on release, so the generic click path would both
     /// lose the direction and step twice.
     Spin,
+    /// Two values, one gesture: a click or drag moves whichever end is
+    /// nearer the pointer. A range slider.
+    ///
+    /// Not a `Drag` with extra state, because the choice of *which* value
+    /// to move is made per pointer event — a second `Slider` stacked on the
+    /// first cannot do it, since only one element can hold the capture.
+    Range,
 }
 
 impl WidgetKind {
@@ -199,6 +206,12 @@ pub struct Interaction {
     /// for a radio button). `None` for every other kind, which has nothing
     /// to toggle.
     pub toggle_property: Option<&'static str>,
+    /// The two properties a `Range` control moves, low end first.
+    ///
+    /// Separate from `toggle_property` because they are *both* written by
+    /// one gesture, chosen by proximity — a different rule, not a different
+    /// spelling of the same one. `None` for every other kind.
+    pub range_properties: Option<(&'static str, &'static str)>,
     /// Whether the control joins the Tab focus order.
     ///
     /// Separate from `kind` on purpose: a `Momentary` control is usually a
@@ -212,10 +225,15 @@ impl Interaction {
     pub fn of_type(ty: &str) -> Interaction {
         let kind = WidgetKind::of(ty);
         return Interaction {
-            // Only a `Toggle` has something to toggle, so the lookup is
-            // gated on the kind rather than asked unconditionally.
+            // Only a `Toggle` has something to toggle and only a `Range` has
+            // two ends, so both lookups are gated on the kind rather than
+            // asked unconditionally.
             toggle_property: match kind {
                 Some(WidgetKind::Toggle) => toggle_property_of_type(ty),
+                _ => None,
+            },
+            range_properties: match kind {
+                Some(WidgetKind::Range) => Some(("first", "second")),
                 _ => None,
             },
             kind,
@@ -233,6 +251,7 @@ impl Interaction {
         return Interaction {
             kind: Some(WidgetKind::Momentary),
             toggle_property: None,
+            range_properties: None,
             focusable: true,
         };
     }
@@ -244,6 +263,7 @@ impl Interaction {
         return Interaction {
             kind: Some(WidgetKind::Toggle),
             toggle_property: Some(property),
+            range_properties: None,
             focusable: true,
         };
     }
@@ -254,6 +274,20 @@ impl Interaction {
         return Interaction {
             kind: Some(WidgetKind::Drag),
             toggle_property: None,
+            range_properties: None,
+            focusable: true,
+        };
+    }
+
+    /// A control with two ends, moved by whichever is nearer the pointer.
+    ///
+    /// The property names are the low end first; a drag picks between them
+    /// by proximity, so the order only matters for the tie.
+    pub fn range(first: &'static str, second: &'static str) -> Interaction {
+        return Interaction {
+            kind: Some(WidgetKind::Range),
+            toggle_property: None,
+            range_properties: Some((first, second)),
             focusable: true,
         };
     }
@@ -264,6 +298,7 @@ impl Interaction {
         return Interaction {
             kind: Some(WidgetKind::Momentary),
             toggle_property: None,
+            range_properties: None,
             focusable: false,
         };
     }
@@ -499,16 +534,28 @@ impl WidgetStates {
             self.previous.insert(id, state);
             seen.insert(id);
         }
-        // A captured `Drag` widget follows the pointer for as long as the
-        // gesture lasts — including outside its own box, which is the
-        // whole point of the capture.
+        // A captured `Drag` or `Range` widget follows the pointer for as
+        // long as the gesture lasts — including outside its own box, which
+        // is the whole point of the capture. The interaction is resolved
+        // into a local first so the engine is not borrowed twice.
         if input.down
             && let Some(captured) = self.captured
             && tree.arena.contains_key(captured)
-            && engine.interaction(tree, captured).kind == Some(WidgetKind::Drag)
-            && drag_value(engine, tree, captured, input.position)
         {
-            changed.push(captured);
+            let interaction = engine.interaction(tree, captured);
+            let follows_pointer =
+                matches!(interaction.kind, Some(WidgetKind::Drag | WidgetKind::Range));
+            if follows_pointer
+                && drag_value(
+                    engine,
+                    tree,
+                    captured,
+                    input.position,
+                    interaction.range_properties,
+                )
+            {
+                changed.push(captured);
+            }
         }
         // Forget elements that are gone.
         self.previous.retain(|id, _| return seen.contains(id));

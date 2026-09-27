@@ -302,6 +302,200 @@ fn a_drag_component_follows_the_pointer_while_captured() -> TestResult {
 }
 
 #[test]
+fn a_range_control_moves_whichever_end_is_nearer() -> TestResult {
+    // One gesture, two ends. The pointer picks the end by proximity in
+    // *value* space, so pressing near the left moves the left thumb and
+    // pressing near the right moves the right one — which is what a second
+    // `Slider` stacked underneath cannot do, since only one element can
+    // hold the capture.
+    let (mut tree, mut engine) = build(
+        r#"
+        component Range {
+            property first: Float = 25.0
+            property second: Float = 75.0
+            Stack(id = range_box, width = 200dp, height = 20dp) {}
+        }
+        component App {
+            Window(id = root) { Range(id = range) }
+    }
+    "#,
+        registry_named("Range", Interaction::range("first", "second")),
+    );
+    let range = tree.lookup_id("range").expect("the range control");
+    tree.arena[range].set("x", Value::Float(0.0));
+    tree.arena[range].set("y", Value::Float(0.0));
+    tree.arena[range].set("width", Value::Float(200.0));
+    tree.arena[range].set("height", Value::Float(20.0));
+    tree.arena[range].set("min", Value::Float(0.0));
+    tree.arena[range].set("max", Value::Float(100.0));
+    let _ = engine.propagate(&mut tree);
+
+    // Near the left end: the low thumb moves.
+    let value_of = |tree: &ElementTree, name: &str| -> Option<f64> {
+        return tree.arena[range]
+            .get(name)
+            .and_then(|value| return value.as_f64().ok());
+    };
+    drag_to(&mut engine, &mut tree, range, 20.0);
+    assert!(
+        value_of(&tree, "first").is_some_and(|value| return value < 25.0),
+        "the low end moved"
+    );
+    assert_eq!(value_of(&tree, "second"), Some(75.0), "the far end stayed");
+
+    // Near the right end: the high thumb moves instead, and the low one
+    // keeps the position the previous drag gave it.
+    let first_after_left = value_of(&tree, "first");
+    drag_to(&mut engine, &mut tree, range, 180.0);
+    assert_eq!(
+        value_of(&tree, "first"),
+        first_after_left,
+        "the low end kept its new position"
+    );
+    assert!(
+        value_of(&tree, "second").is_some_and(|value| return value > 75.0),
+        "the high end moved"
+    );
+    return Ok(());
+}
+
+#[test]
+fn a_range_control_tie_resolves_to_the_low_end() -> TestResult {
+    // A press exactly between the two thumbs must always do the same thing,
+    // or a control would jump unpredictably at the midpoint.
+    let (mut tree, mut engine) = build(
+        r#"
+        component Range {
+            property first: Float = 40.0
+            property second: Float = 60.0
+            Stack(id = range_box, width = 200dp, height = 20dp) {}
+        }
+        component App {
+            Window(id = root) { Range(id = range) }
+    }
+    "#,
+        registry_named("Range", Interaction::range("first", "second")),
+    );
+    let range = tree.lookup_id("range").expect("the range control");
+    for (property, value) in [
+        ("x", 0.0),
+        ("y", 0.0),
+        ("width", 200.0),
+        ("height", 20.0),
+        ("min", 0.0),
+        ("max", 100.0),
+    ] {
+        tree.arena[range].set(property, Value::Float(value));
+    }
+    let _ = engine.propagate(&mut tree);
+    drag_to(&mut engine, &mut tree, range, 100.0);
+    let first = tree.arena[range]
+        .get("first")
+        .and_then(|v| return v.as_f64().ok());
+    let second = tree.arena[range]
+        .get("second")
+        .and_then(|v| return v.as_f64().ok());
+    assert_ne!(
+        first, second,
+        "exactly one end moved, got first={first:?} second={second:?}"
+    );
+    assert_eq!(
+        first,
+        Some(50.0),
+        "the midpoint is equidistant, so the low end takes it"
+    );
+    assert_eq!(second, Some(60.0));
+    return Ok(());
+}
+
+#[test]
+fn a_range_control_with_unset_ends_still_picks_one() -> TestResult {
+    // A control that has not been given its ends yet must not divide by a
+    // missing value; both read as `min` and the low end takes the press.
+    let (mut tree, mut engine) = build(
+        r#"
+        component Range {
+            Stack(id = range_box, width = 200dp, height = 20dp) {}
+        }
+        component App {
+            Window(id = root) { Range(id = range) }
+    }
+    "#,
+        registry_named("Range", Interaction::range("first", "second")),
+    );
+    let range = tree.lookup_id("range").expect("the range control");
+    for (property, value) in [
+        ("x", 0.0),
+        ("y", 0.0),
+        ("width", 200.0),
+        ("height", 20.0),
+        ("min", 0.0),
+        ("max", 100.0),
+    ] {
+        tree.arena[range].set(property, Value::Float(value));
+    }
+    let _ = engine.propagate(&mut tree);
+    drag_to(&mut engine, &mut tree, range, 150.0);
+    // Not 75: the mapping runs through the *thumb travel*, which is inset by
+    // half the thumb on each end (the default thumb is the element's height,
+    // 20dp), so x=150 of a 200dp track is 140/180 of the way across.
+    let first = tree.arena[range]
+        .get("first")
+        .and_then(|value| return value.as_f64().ok());
+    assert!(
+        first.is_some_and(|value| return (70.0..85.0).contains(&value)),
+        "the low end moved to the pointer's place on the track, got {first:?}"
+    );
+    assert_eq!(
+        tree.arena[range].get("second"),
+        None,
+        "the high end was never written"
+    );
+    return Ok(());
+}
+
+#[test]
+fn a_range_control_is_a_tab_stop_and_activatable() -> TestResult {
+    let (mut tree, mut engine) = build(
+        r#"
+        component Range {
+            Stack(id = range_box, width = 200dp, height = 20dp) {}
+        }
+        component App {
+            Window(id = root) { Range(id = range) }
+    }
+    "#,
+        registry_named("Range", Interaction::range("first", "second")),
+    );
+    let range = tree.lookup_id("range").expect("the range control");
+    assert!(tree.arena[range].is_focusable());
+    assert!(nui_runtime::widget::is_activatable(&engine, &tree, range));
+    // A range has no Boolean to flip, so activation only emits `click` —
+    // which is what a document's `on click` handler needs.
+    assert!(!nui_runtime::widget::activate(
+        &mut engine,
+        &mut tree,
+        range
+    ));
+    return Ok(());
+}
+
+/// Drives a captured drag to `x` on a horizontal control.
+fn drag_to(engine: &mut Engine, tree: &mut ElementTree, id: nui_runtime::ElementId, x: f32) {
+    let mut tracker = WidgetStates::new();
+    tracker.capture(Some(id));
+    tracker.update(
+        engine,
+        tree,
+        PointerInput {
+            position: nui_core::Point::new(x, 10.0),
+            inside: true,
+            down: true,
+        },
+    );
+}
+
+#[test]
 fn an_element_type_is_still_answered_from_its_name() -> TestResult {
     // The registry must not shadow a built-in: a `Button` in a document
     // that also registers a component called `Button` is still the built-in,

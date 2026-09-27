@@ -726,14 +726,16 @@ fn a_slider_quantises_by_step() {
         &mut engine,
         &mut tree,
         id,
-        nui_core::Point::new(10.0, 10.0)
+        nui_core::Point::new(10.0, 10.0),
+        None
     ));
     assert_eq!(read_number(&tree, id, "value"), Some(0.0));
     assert!(!drag_value(
         &mut engine,
         &mut tree,
         id,
-        nui_core::Point::new(10.0, 10.0)
+        nui_core::Point::new(10.0, 10.0),
+        None
     ));
 }
 
