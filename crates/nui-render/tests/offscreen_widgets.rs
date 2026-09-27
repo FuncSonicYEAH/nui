@@ -638,6 +638,72 @@ fn an_open_dialog_dims_what_is_behind_it() {
     );
 }
 
+/// The number of near-white pixels in the top `rows` rows.
+fn bright_pixels(data: &[u8], stride: usize, width: u32, rows: u32) -> usize {
+    let mut count = 0;
+    for y in 0..rows {
+        for x in 0..width {
+            let px = pixel(data, stride, x, y);
+            if px[0] > 200 && px[1] > 200 && px[2] > 200 {
+                count += 1;
+            }
+        }
+    }
+    return count;
+}
+
+/// A white label in the top 30 rows of a 200x200 window, with a modal
+/// dialog over it (or not, per `open`). The panel is 100x60 and centred, so
+/// it never reaches the label's rows.
+fn label_behind_a_dialog(open: bool) -> ElementTree {
+    let mut tree = ElementTree::new();
+    let mut root = Element::new("Column", None);
+    root.set("width", Value::Float(200.0));
+    root.set("height", Value::Float(200.0));
+    let root_id = tree.insert(root);
+    tree.push_root(root_id);
+
+    let mut label = widget("Text", 200.0, 30.0);
+    label.set("content", Value::String("MMMM".to_string()));
+    label.set("font.size", Value::Length(Length::Dp(24.0)));
+    label.set("color", Value::Color(Color::from_rgb8(255, 255, 255)));
+    let label_id = tree.insert(label);
+    tree.append_child(root_id, label_id);
+
+    let mut dialog = widget("Dialog", 100.0, 60.0);
+    dialog.set("open", Value::Bool(open));
+    let dialog_id = tree.insert(dialog);
+    tree.append_child(root_id, dialog_id);
+    return tree;
+}
+
+#[test]
+fn the_modal_scrim_dims_the_glyphs_behind_it() {
+    // The scrim is a rect and the content it must dim is usually text, and
+    // glyphs are the *last* pipeline of a pass. If a dialog's draws were
+    // folded into the main scene instead of getting a pass of their own,
+    // the scrim would paint before every glyph in that scene and the text
+    // behind the dialog would stay at full brightness while the rectangles
+    // around it dimmed. Counting bright pixels on either side of the
+    // toggle is what catches that; the draw-list assertions in `scene.rs`
+    // cannot.
+    let viewport = nui_core::Size::new(200.0, 200.0);
+    let (closed, stride) = render_pixels(&mut label_behind_a_dialog(false), viewport);
+    let (open, _) = render_pixels(&mut label_behind_a_dialog(true), viewport);
+
+    let lit_without = bright_pixels(&closed, stride, 200, 30);
+    let lit_with = bright_pixels(&open, stride, 200, 30);
+    assert!(
+        lit_without > 50,
+        "the label is legible with no dialog over it, got {lit_without} bright pixels"
+    );
+    assert!(
+        lit_with < lit_without,
+        "the scrim dims the glyphs it covers: {lit_without} bright pixels \
+         without the dialog, {lit_with} with it"
+    );
+}
+
 #[test]
 fn a_closed_dialog_leaves_the_window_untouched() {
     let mut tree = ElementTree::new();

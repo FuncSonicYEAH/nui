@@ -29,7 +29,7 @@ pub mod text_input;
 pub mod widget;
 
 pub use animation::{AnimationClock, AnimationKind, Easing};
-pub use binding::{Binding, BindingIndex, Engine, EvalError, TwoWayLink};
+pub use binding::{Binding, BindingIndex, Engine, EvalError, TwoWayEdge, TwoWayLink};
 pub use canvas::{CanvasCap, CanvasOp, CanvasPainter};
 pub use element::{Element, ElementId, ElementTree, ForBinding, HandlerEntry, RowScope, WhenEntry};
 pub use instantiate::{Instance, instantiate, instantiate_with, reload_from_source};

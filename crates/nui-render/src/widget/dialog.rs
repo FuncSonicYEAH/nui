@@ -107,6 +107,14 @@ mod tests {
     use crate::testkit::{build, widget, window_tree};
     use nui_core::Value;
 
+    /// The dialog's own draws. A `Dialog` is an overlay, so it is hoisted
+    /// out of the main scene into a pass of its own — see
+    /// `SceneBuilder::build`.
+    fn overlay(scene: &crate::scene::Scene) -> &crate::scene::Scene {
+        assert_eq!(scene.overlays.len(), 1, "one dialog, one overlay pass");
+        return &scene.overlays[0].scene;
+    }
+
     #[test]
     fn an_open_dialog_paints_a_backdrop_a_panel_and_a_title() {
         let mut dialog = widget("Dialog", 240.0, 160.0);
@@ -114,33 +122,34 @@ mod tests {
         dialog.set("title", Value::String("Delete file?".to_string()));
         let tree = window_tree(vec![dialog]);
         let scene = build(&tree);
+        let inner = overlay(&scene);
         // Backdrop (400x300) then panel (240x160), then the panel outline
         // and the title rule.
-        assert_eq!(scene.rects.len(), 2, "{:?}", scene.rects);
-        let backdrop = scene.rects[0].geometry;
+        assert_eq!(inner.rects.len(), 2, "{:?}", inner.rects);
+        let backdrop = inner.rects[0].geometry;
         assert_eq!(backdrop.size.width, 400.0, "the scrim covers the window");
         assert_eq!(backdrop.size.height, 300.0);
         // The scrim is a translucent black: dark and not fully opaque.
-        let scrim = scene.rects[0].fill;
+        let scrim = inner.rects[0].fill;
         assert!(
             scrim.red8() < 40 && scrim.alpha() > 0.0 && scrim.alpha() < 1.0,
             "the modal scrim dims: {scrim:?}"
         );
-        let panel = scene.rects[1].geometry;
+        let panel = inner.rects[1].geometry;
         assert_eq!(panel.size.width, 240.0);
         assert_eq!(panel.size.height, 160.0);
         // One glyph quad per character, deduplicated by the atlas for the
         // repeats in "Delete file?" — so assert "some glyphs", not the
         // character count.
         assert!(
-            !scene.texts.is_empty(),
+            !inner.texts.is_empty(),
             "the title is drawn, got {:?}",
-            scene.texts.len()
+            inner.texts.len()
         );
         assert!(
-            scene.polylines.len() >= 2,
+            inner.polylines.len() >= 2,
             "panel outline + title rule: {:?}",
-            scene.polylines.len()
+            inner.polylines.len()
         );
     }
 
@@ -151,6 +160,7 @@ mod tests {
         dialog.set("modal", Value::Bool(false));
         let tree = window_tree(vec![dialog]);
         let scene = build(&tree);
-        assert_eq!(scene.rects[0].fill.alpha(), 0.0, "no scrim when not modal");
+        let inner = overlay(&scene);
+        assert_eq!(inner.rects[0].fill.alpha(), 0.0, "no scrim when not modal");
     }
 }

@@ -245,6 +245,18 @@ impl Element {
         return out;
     }
 
+    /// The `<=>` link declared on exactly this property, if any.
+    ///
+    /// The targeted counterpart of [`Element::two_way_links`] for the write
+    /// path, which knows the property name and must not allocate a `Vec`
+    /// (nor scan unrelated slots) on every property write.
+    pub fn two_way_link(&self, name: &str) -> Option<TwoWayLink> {
+        return self
+            .properties
+            .get(name)
+            .and_then(|slot| return slot.two_way.clone());
+    }
+
     /// Iterates `(name, link)` pairs of two-way properties.
     pub fn two_way_links(&self) -> Vec<(String, TwoWayLink)> {
         let mut out = Vec::new();

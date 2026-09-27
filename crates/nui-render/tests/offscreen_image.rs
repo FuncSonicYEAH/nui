@@ -23,12 +23,18 @@ fn write_test_png(path: &std::path::Path) {
 
 /// Offscreen render helper: builds a tree with one Image element, renders
 /// it, returns the pixels plus the readback stride.
-fn render_image(slice: f32) -> (Vec<u8>, usize, u32, u32) {
+///
+/// `name` picks the temp file. The two tests in this file run in parallel
+/// threads by default, so a shared path meant one test writing the PNG
+/// while the other was reading it — `decode_file` then saw a half-written
+/// file and failed with "unexpected end of file", which reads exactly like
+/// an image-pipeline regression and is not one.
+fn render_image(name: &str, slice: f32) -> (Vec<u8>, usize, u32, u32) {
     let width = 64u32;
     let height = 64u32;
     let viewport = nui_core::Size::new(width as f32, height as f32);
 
-    let png_path = std::env::temp_dir().join("nui-image-test.png");
+    let png_path = std::env::temp_dir().join(format!("nui-image-test-{name}.png"));
     write_test_png(&png_path);
     let source = png_path.display().to_string();
 
@@ -174,7 +180,7 @@ fn render_image(slice: f32) -> (Vec<u8>, usize, u32, u32) {
 
 #[test]
 fn image_draws_decoded_pixels() {
-    let (data, stride, width, height) = render_image(0.0);
+    let (data, stride, width, height) = render_image("decoded", 0.0);
     let pixel = |x: u32, y: u32| -> [u8; 4] {
         let offset = (y as usize) * stride + (x as usize) * 4;
         return [
@@ -203,7 +209,7 @@ fn nine_slice_keeps_corners_and_stretches_middle() {
     // slice = 3dp: the 64x64 dest keeps the 3px source corners unscaled at
     // scale 1; the middle stretches. Verify a corner stays red while the
     // transparent middle-right region stays background.
-    let (data, stride, _width, height) = render_image(3.0);
+    let (data, stride, _width, height) = render_image("nine-slice", 3.0);
     let pixel = |x: u32, y: u32| -> [u8; 4] {
         let offset = (y as usize) * stride + (x as usize) * 4;
         return [

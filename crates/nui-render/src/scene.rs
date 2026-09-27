@@ -211,9 +211,10 @@ pub struct Scene {
     pub paths: Vec<PathDraw>,
     /// Offscreen layers in paint order (drawn last, M9).
     pub layers: Vec<LayerDraw>,
-    /// Overlay content (对话框 / Toast / 下拉) in paint order. Drawn after
-    /// `layers`, so an overlay outranks every ordinary element regardless
-    /// of where it sits in the tree (FUTURE 批次 4).
+    /// Overlay content (对话框 / Toast / 下拉) in paint order. Each entry is
+    /// composited by the renderer in its **own pass**, after every bucket of
+    /// the main scene, so an overlay outranks every ordinary element
+    /// regardless of where it sits in the tree (FUTURE 批次 4).
     ///
     /// Kept as a full sub-[`Scene`] rather than a flat list because an
     /// overlay is free to use any primitive (a dialog scrim is a rect, a
@@ -242,14 +243,17 @@ impl Scene {
     /// Appends `inner`'s draws to this scene's tails: rects to rects,
     /// glyphs to glyphs, and so on.
     ///
-    /// This is what keeps an overlay on top. The renderer draws one
-    /// pipeline at a time — all rects, then all paths, then all strokes,
-    /// then all images, then all glyphs — so tail-appending an overlay's
-    /// scrim to `rects` and its label to `texts` puts both after every
-    /// ordinary draw in their own bucket. An overlay that mixed the two
-    /// the other way round (label before scrim) would still be correct,
-    /// because a glyph can never be covered by a later rect: the scrim
-    /// paints in an earlier pipeline.
+    /// Used to fold a *nested* overlay into its parent overlay's body (see
+    /// [`SceneBuilder::build_within_a_subscene`]). Within a single pass the
+    /// renderer draws one pipeline at a time — all rects, then all paths,
+    /// then all strokes, then all images, then all glyphs — so tail-appending
+    /// puts the nested overlay after every ordinary draw in its own bucket,
+    /// which is exactly the z-order wanted inside an overlay.
+    ///
+    /// This is *not* how a top-level overlay is placed: tail-appending it to
+    /// the main scene's buckets would put its scrim in an earlier pipeline
+    /// than the text it has to dim. That is why `build` keeps them separate
+    /// and the renderer gives each one a pass of its own.
     pub fn absorb_overlay(&mut self, inner: Scene) {
         self.rects.extend(inner.rects);
         self.sources.extend(inner.sources);
@@ -383,7 +387,7 @@ impl SceneBuilder {
             sub.walk_element(tree, id, offset, None, text, context, true);
             self.overlays.push(OverlayDraw {
                 origin: Point::new(x, y),
-                scene: Box::new(sub.build()),
+                scene: Box::new(sub.build_within_a_subscene()),
             });
             return;
         }
@@ -407,7 +411,7 @@ impl SceneBuilder {
                 size: Size::new(width, height),
                 opacity: layer_opacity.clamp(0.0, 1.0),
                 blur: layer_blur,
-                scene: Box::new(sub.build()),
+                scene: Box::new(sub.build_within_a_subscene()),
             });
             return;
         }
@@ -1266,18 +1270,39 @@ impl SceneBuilder {
         }
     }
 
-    /// Finalizes the scene.
+    /// Finalizes the frame's root scene.
     ///
-    /// Overlays are *flattened in* here, at the tail of each draw list.
-    /// That is what gives them their z-order: the renderer paints rects,
-    /// then paths, then strokes, then images, then glyphs, so appending an
-    /// overlay's scrim to `rects` and its label to `texts` puts both above
-    /// every ordinary element.
+    /// Overlays are kept as separate sub-scenes rather than flattened into
+    /// the tails of `rects`/`texts`. Flattening looks equivalent and is not:
+    /// the renderer paints one pipeline at a time, so an overlay's scrim (a
+    /// rect — an *early* pipeline) would land underneath the main scene's
+    /// glyphs (the *last* pipeline). A modal dialog would then dim every
+    /// rect behind it and leave the text at full brightness — which is the
+    /// one thing a scrim must not do. Each overlay therefore gets its own
+    /// pass; see [`Renderer::render_to_view`](crate::Renderer::render_to_view).
     ///
-    /// The overlay walk already flattened nested overlays (it calls
-    /// `build` on its own sub-builder), so one level of flattening here is
-    /// enough — `inner.overlays` is always empty.
-    pub fn build(mut self) -> Scene {
+    /// Sub-scenes (a layer capture, or an overlay's own body) go through
+    /// [`SceneBuilder::build_within_a_subscene`], which does flatten — see
+    /// there for why that is the right answer one level down.
+    pub fn build(self) -> Scene {
+        return self.finish(false);
+    }
+
+    /// Finalizes a *sub*-scene: an M9 layer capture, or the body of an
+    /// overlay.
+    ///
+    /// An overlay found in here is flattened into the draw-list tails
+    /// instead of being kept for a pass of its own. A sub-scene is
+    /// composited as a single unit — a layer capture is bounded by its
+    /// texture, an overlay by the pass it already owns — so "on top" can
+    /// only mean "on top within it", and the ordinary bucket order delivers
+    /// exactly that.
+    fn build_within_a_subscene(self) -> Scene {
+        return self.finish(true);
+    }
+
+    /// Shared tail of both `build` variants.
+    fn finish(mut self, flatten_overlays: bool) -> Scene {
         let overlays = std::mem::take(&mut self.overlays);
         let mut scene = Scene {
             rects: self.rects,
@@ -1289,10 +1314,14 @@ impl SceneBuilder {
             layers: self.layers,
             overlays: Vec::new(),
         };
-        for overlay in overlays {
-            // The hoist already built the sub-scene, so this is a plain
-            // append: no second `build` pass, no coordinate shift.
-            scene.absorb_overlay(*overlay.scene);
+        if flatten_overlays {
+            for overlay in overlays {
+                // The hoist already built the sub-scene, so this is a plain
+                // append: no second `build` pass, no coordinate shift.
+                scene.absorb_overlay(*overlay.scene);
+            }
+        } else {
+            scene.overlays = overlays;
         }
         return scene;
     }
@@ -2253,7 +2282,8 @@ mod tests {
     fn an_overlay_element_paints_after_the_content_it_covers() {
         // A plain rect declared *after* an overlay must still end up
         // beneath it: the overlay is hoisted, not merely later in the
-        // document.
+        // document. It leaves the main scene entirely and becomes its own
+        // pass, so "beneath" is a guarantee about passes, not list order.
         let mut overlay = widget("Rectangle", 100.0, 50.0);
         overlay.set("overlay", Value::Bool(true));
         overlay.set("fill", Value::Color(nui_core::Color::from_rgb8(255, 0, 0)));
@@ -2261,12 +2291,47 @@ mod tests {
         plain.set("fill", Value::Color(nui_core::Color::from_rgb8(0, 255, 0)));
         let tree = window_tree(vec![overlay, plain]);
         let scene = build(&tree);
-        // Two rects, and the overlay's is last: the renderer paints rects
-        // in list order, so last = topmost.
-        assert_eq!(scene.rects.len(), 2);
+        assert_eq!(scene.rects.len(), 1, "only the ordinary rect is in-frame");
         assert_eq!(scene.rects[0].fill, nui_core::Color::from_rgb8(0, 255, 0));
-        assert_eq!(scene.rects[1].fill, nui_core::Color::from_rgb8(255, 0, 0));
-        assert!(scene.overlays.is_empty(), "flattened at build time");
+        assert_eq!(scene.overlays.len(), 1, "the overlay owns a pass");
+        assert_eq!(scene.overlays[0].scene.rects.len(), 1);
+        assert_eq!(
+            scene.overlays[0].scene.rects[0].fill,
+            nui_core::Color::from_rgb8(255, 0, 0)
+        );
+    }
+
+    #[test]
+    fn an_overlay_keeps_its_scrim_out_of_the_main_scene() {
+        // The scrim is a rect and the content it must dim may be text, and
+        // text is the *last* pipeline of a pass. If the scrim were folded
+        // into the main scene's `rects` it would paint before that text and
+        // the text would show through undimmed. It therefore has to live in
+        // an overlay pass, which the renderer encodes after the main one.
+        let mut dialog = widget("Dialog", 240.0, 160.0);
+        dialog.set("open", Value::Bool(true));
+        let mut label = widget("Text", 200.0, 30.0);
+        label.set("content", Value::String("behind the dialog".to_string()));
+        let tree = window_tree(vec![dialog, label]);
+        let scene = build(&tree);
+        assert_eq!(scene.overlays.len(), 1, "the dialog is its own pass");
+        assert!(
+            !scene.texts.is_empty(),
+            "the label stays in the main scene's glyph list"
+        );
+        // The main scene is exactly the label: no scrim, no panel. Every
+        // glyph of the main scene is therefore painted before the overlay
+        // pass starts, which is what makes the scrim dim the text.
+        assert!(
+            scene.rects.is_empty(),
+            "nothing of the dialog leaked into the main scene: {:?}",
+            scene.rects
+        );
+        assert_eq!(
+            scene.overlays[0].scene.rects.len(),
+            2,
+            "backdrop + panel, both in the overlay pass"
+        );
     }
 
     #[test]

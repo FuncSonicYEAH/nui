@@ -265,31 +265,143 @@ fn two_way_binding_syncs_both_directions() {
             }
         }
     "#;
-    let (mut tree, _engine) = build(source);
+    let (mut tree, mut engine) = build(source);
     let field = tree.lookup_id("field").unwrap();
     let root = tree.lookup_id("root").unwrap();
     assert!(
-        !tree.arena[field].pending_two_way.is_empty(),
-        "the <=> assignment must be pending before linking"
+        tree.arena[field].two_way_link("text").is_some(),
+        "instantiation resolves the `<=>` into a link on the declaring slot"
     );
 
-    // Link manually (the id table exists post-instantiate): field.text <->
-    // root.userName.
-    tree.arena[field].set("text", Value::String("Ada".to_string()));
-    tree.arena[field].set_two_way(
-        "text",
-        nui_runtime::TwoWayLink {
-            partner: root,
-            property: "userName".to_string(),
-        },
-    );
-    // Simulate the field pushing its value through the value channel.
-    let field_value = tree.arena[field].get("text").cloned().unwrap();
-    tree.arena[root].set("userName", field_value);
+    // Declaring side -> partner.
+    engine.set_direct(&mut tree, field, "text", Value::String("Ada".to_string()));
     assert_eq!(
         tree.arena[root].get("userName"),
-        Some(&Value::String("Ada".to_string()))
+        Some(&Value::String("Ada".to_string())),
+        "the field's write reaches the model"
     );
+
+    // Partner -> declaring side. This is the direction a
+    // `Dialog(open <=> page.sheetOpen)` depends on *entirely*: the document
+    // only ever writes `sheetOpen`, never `open`. Without the reverse index
+    // the link is a one-way street and the dialog never opens.
+    engine.set_direct(
+        &mut tree,
+        root,
+        "userName",
+        Value::String("Grace".to_string()),
+    );
+    assert_eq!(
+        tree.arena[field].get("text"),
+        Some(&Value::String("Grace".to_string())),
+        "the model's write reaches the field"
+    );
+}
+
+#[test]
+fn a_two_way_pair_is_driven_from_a_visual_state_block() {
+    // A `when` block writing a partner has to move the pair like any other
+    // write — the block is a third writer alongside effects and widgets.
+    let source = r#"
+        component Visual {
+            property compact: Bool = false
+            property label: String = "roomy"
+            Window(id = root) {
+                TextField(id = field, text <=> root.label)
+                when compact {
+                    root.label = "compact"
+                }
+            }
+        }
+    "#;
+    let (mut tree, mut engine) = build(source);
+    let field = tree.lookup_id("field").unwrap();
+    let root = tree.lookup_id("root").unwrap();
+
+    engine.set_direct(&mut tree, root, "compact", Value::Bool(true));
+    assert!(
+        engine.propagate(&mut tree).is_empty(),
+        "no evaluation errors"
+    );
+    engine.apply_when_blocks(&mut tree).unwrap();
+    assert_eq!(
+        tree.arena[root].get("label"),
+        Some(&Value::String("compact".to_string())),
+        "the block wrote the partner"
+    );
+    assert_eq!(
+        tree.arena[field].get("text"),
+        Some(&Value::String("compact".to_string())),
+        "and the declaring side followed"
+    );
+}
+
+#[test]
+fn an_effect_write_reaches_a_two_way_partner() {
+    // The gallery's dialog in miniature: the page drives the pair from an
+    // effect block (`on click => page.sheetOpen = true`), so the effect
+    // write path has to reach the value channel too. It is the *only*
+    // writer of the partner side in that document.
+    let source = r#"
+        component Sheet {
+            property title: String = "closed"
+            Window(id = root) {
+                TextField(id = field, text <=> root.title)
+                Button(id = opener, label = "open") {
+                    on click => root.title = "opened"
+                }
+            }
+        }
+    "#;
+    let (mut tree, mut engine) = build(source);
+    let field = tree.lookup_id("field").unwrap();
+    let opener = tree.lookup_id("opener").unwrap();
+    let root = tree.lookup_id("root").unwrap();
+
+    engine.emit_bubble(&mut tree, opener, "click").unwrap();
+    assert_eq!(
+        tree.arena[root].get("title"),
+        Some(&Value::String("opened".to_string())),
+        "the effect wrote the partner"
+    );
+    assert_eq!(
+        tree.arena[field].get("text"),
+        Some(&Value::String("opened".to_string())),
+        "and the declaring side followed"
+    );
+}
+
+#[test]
+fn a_two_way_pair_declared_from_both_sides_terminates() {
+    // Each slot declares the other as its partner, and the two property
+    // types differ, so the writes can never compare equal and settle. The
+    // propagation has to stop on its own bookkeeping rather than on
+    // "nothing changed", or this hangs.
+    let source = r#"
+        component Cycle {
+            property amount: Int = 0
+            Window(id = root) {
+                TextField(id = a, text <=> b.text)
+                TextField(id = b, text <=> a.text)
+            }
+        }
+    "#;
+    let (mut tree, mut engine) = build(source);
+    let a = tree.lookup_id("a").unwrap();
+    let b = tree.lookup_id("b").unwrap();
+
+    engine.set_direct(&mut tree, a, "text", Value::String("x".to_string()));
+    assert_eq!(
+        tree.arena[b].get("text"),
+        Some(&Value::String("x".to_string())),
+        "the pair still propagates"
+    );
+    assert_eq!(
+        tree.arena[a].get("text"),
+        Some(&Value::String("x".to_string())),
+        "and does not undo itself on the way back"
+    );
+    let _ = engine.take_changes();
 }
 
 #[derive(Debug, Clone)]

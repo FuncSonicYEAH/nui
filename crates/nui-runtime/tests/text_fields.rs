@@ -355,21 +355,27 @@ fn a_widget_write_reaches_its_two_way_partner() {
         "and the stepper holds what it wrote"
     );
 
-    // Characterization of a *known* limit: `<=>` follows one hop. `bar` is
-    // linked to the same model property, but no link pushes a value it did
-    // not itself write, so it stays where it was born. Fanning a write out
-    // to every element linked to the partner needs a reverse index in the
-    // value channel (see FUTURE.md).
+    // The write fans out to every control paired with the model, not only
+    // the one that made it: `bar` is linked to the same property, so it
+    // follows the stepper. A `<=>` is spelled once — on the declaring side —
+    // but the pair moves both ways, which is what
+    // `Engine::two_way_readers` (the reverse index) exists for.
     assert_eq!(
         tree.arena[bar].get("value"),
-        Some(&Value::Float(0.0)),
-        "a sibling pair is not resynced from someone else's write"
+        Some(&Value::Float(1.5)),
+        "a sibling pair follows someone else's write"
     );
 
-    // The model still routes a write from the *other* control one hop: the
-    // slider steps from its own stale 0 to 1, and the model follows.
+    // And the model still routes a write from the *other* control: the
+    // slider steps on from where it now stands (snapping to its default
+    // unit step), and the model follows.
     assert!(nui_runtime::widget::step(&mut engine, &mut tree, bar, 1.0));
-    assert_eq!(tree.arena[root].get("amount"), Some(&Value::Float(1.0)));
-    assert_eq!(tree.arena[bar].get("value"), Some(&Value::Float(1.0)));
+    assert_eq!(tree.arena[root].get("amount"), Some(&Value::Float(2.0)));
+    assert_eq!(tree.arena[bar].get("value"), Some(&Value::Float(2.0)));
+    assert_eq!(
+        tree.arena[spin].get("value"),
+        Some(&Value::Float(2.0)),
+        "and the stepper follows the slider in turn"
+    );
     let _ = engine.take_changes();
 }

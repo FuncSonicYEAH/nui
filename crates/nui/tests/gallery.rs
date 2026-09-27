@@ -227,3 +227,123 @@ fn no_page_file_is_orphaned() {
         );
     }
 }
+
+/// The first element of type `ty`, in document order.
+fn first_of_type(tree: &ElementTree, ty: &str) -> Option<ElementId> {
+    let mut found = None;
+    tree.visit_pre_order(|id, element| {
+        if found.is_none() && element.ty == ty {
+            found = Some(id);
+        }
+    });
+    return found;
+}
+
+/// The first button carrying `label`. Fragments do not give every control an
+/// id, so a label is the only handle a test has on them.
+fn button_labelled(tree: &ElementTree, label: &str) -> ElementId {
+    let mut found = None;
+    tree.visit_pre_order(|id, element| {
+        if found.is_some() || element.ty != "Button" {
+            return;
+        }
+        if element
+            .get("label")
+            .and_then(|value| return value.as_str().ok())
+            == Some(label)
+        {
+            found = Some(id);
+        }
+    });
+    return found.unwrap_or_else(|| panic!("no Button labelled `{label}` in the gallery"));
+}
+
+fn scene_of(tree: &ElementTree, engine: &Engine) -> nui_render::Scene {
+    let mut text = nui_text::TextSystem::with_embedded_font();
+    return nui_render::SceneBuilder::build_with_context(
+        tree,
+        &mut text,
+        nui_render::SceneContext {
+            focused: engine.focused(),
+            image_keys: &std::collections::HashMap::new(),
+        },
+    );
+}
+
+/// The widgets page's dialog, opened and closed through the buttons that
+/// drive it.
+///
+/// This is the end-to-end shape of a modal, and it exercises two things the
+/// per-crate tests do not:
+///
+/// - `Dialog(open <=> page.sheetOpen)` is a `<=>` whose *declaring* side is
+///   never written by the document — the page writes `sheetOpen` and the
+///   dialog has to follow, which is the reverse direction of the pair;
+/// - the effect write that does it (`on click => page.sheetOpen = true`)
+///   goes through the effect path, not a host or widget write.
+///
+/// The dialog must also end up in an overlay pass of its own: its scrim is
+/// a rect and the page behind it is full of glyphs, and glyphs are the last
+/// pipeline of a pass, so a scrim folded into the main scene would sit
+/// *under* the text it exists to dim.
+#[test]
+fn the_widgets_page_dialog_opens_and_occludes() {
+    let (mut tree, mut engine) = gallery();
+    let widgets = host::PAGES
+        .iter()
+        .position(|page| return page.key == "widgets")
+        .expect("the gallery has a widgets page");
+    select(&mut tree, &mut engine, widgets);
+
+    let dialog = first_of_type(&tree, "Dialog").expect("the widgets page declares a Dialog");
+    assert!(
+        !nui_runtime::widget::is_open(&tree.arena[dialog]),
+        "the dialog starts closed"
+    );
+    assert!(
+        scene_of(&tree, &engine).overlays.is_empty(),
+        "a closed dialog contributes no overlay pass"
+    );
+
+    let open_button = button_labelled(&tree, "Open dialog");
+    let _ = engine.emit_bubble(&mut tree, open_button, "click");
+    settle(&mut tree, &mut engine);
+    assert!(
+        nui_runtime::widget::is_open(&tree.arena[dialog]),
+        "the dialog's `open` follows the page's `sheetOpen` through the `<=>` pair"
+    );
+
+    let scene = scene_of(&tree, &engine);
+    assert_eq!(scene.overlays.len(), 1, "the open dialog owns one pass");
+    let inner = &scene.overlays[0].scene;
+    let scrim = inner.rects.first().expect("the backdrop is the first part");
+    assert_eq!(
+        (scrim.geometry.size.width, scrim.geometry.size.height),
+        (host::WINDOW.width, host::WINDOW.height),
+        "the scrim covers the whole window"
+    );
+    assert!(
+        scrim.fill.alpha() > 0.0 && scrim.fill.alpha() < 1.0,
+        "and dims it rather than blanking it: {:?}",
+        scrim.fill
+    );
+    // The page's own text stays in the main scene, which is the point:
+    // the renderer paints the whole main scene first and this pass after,
+    // so those glyphs are dimmed instead of floating above the scrim.
+    assert!(
+        !scene.texts.is_empty(),
+        "the page's glyphs are still in the main scene"
+    );
+
+    let cancel_button = button_labelled(&tree, "Cancel");
+    let _ = engine.emit_bubble(&mut tree, cancel_button, "click");
+    settle(&mut tree, &mut engine);
+    assert!(
+        !nui_runtime::widget::is_open(&tree.arena[dialog]),
+        "Cancel closes it again"
+    );
+    assert!(
+        scene_of(&tree, &engine).overlays.is_empty(),
+        "and the pass goes away with it"
+    );
+}

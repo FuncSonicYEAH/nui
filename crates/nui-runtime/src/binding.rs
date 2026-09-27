@@ -14,7 +14,7 @@
 //!   go through the value channel and sync the partner side.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use nui_compiler::{Builtin, PropertyTarget, TypedExpr};
 use nui_core::{Length, Value};
@@ -40,6 +40,20 @@ pub struct TwoWayLink {
     pub partner: ElementId,
     /// Partner property name.
     pub property: String,
+}
+
+/// One `<=>` declaration as the instantiation pass reports it, for
+/// [`Engine::index_two_way_links`].
+#[derive(Debug, Clone)]
+pub struct TwoWayEdge {
+    /// Element owning the declaring slot.
+    pub element: ElementId,
+    /// The property that spells the `<=>`.
+    pub property: String,
+    /// The element on the other side.
+    pub partner: ElementId,
+    /// The property on the other side.
+    pub partner_property: String,
 }
 
 /// Evaluation error: cycle detected or unresolvable read.
@@ -123,6 +137,18 @@ pub struct Engine {
     bindings: Vec<BindingRecord>,
     /// Reverse edges: `(element, property)` -> binding indices that read it.
     readers: HashMap<(ElementId, String), Vec<usize>>,
+    /// Reverse edges of the `<=>` value channel: `(partner element, partner
+    /// property)` -> the `(element, property)` slots that declared a link
+    /// *to* it.
+    ///
+    /// A `<=>` link is written once, on the side that spells `<=>`, but a
+    /// pair has to move in both directions: `Dialog(open <=> page.sheetOpen)`
+    /// only ever sees `page.sheetOpen` written, so without this index the
+    /// declaring side would never hear about it. Built by
+    /// [`Engine::index_two_way_links`] right after
+    /// [`link_two_way_pairs`](crate::instantiate), and pruned by
+    /// [`Engine::retire_bindings`] on `For` row rebuilds.
+    two_way_readers: HashMap<(ElementId, String), Vec<(ElementId, String)>>,
     /// Active `when` overrides per `(element, condition key)`: the
     /// properties the block currently overrides with their pre-override
     /// values, so a leaving condition restores what the block replaced.
@@ -183,11 +209,39 @@ impl Engine {
         return index;
     }
 
+    /// Indexes the tree's `<=>` declarations by *partner*, so a write to a
+    /// partner can fan out to every slot linked to it.
+    ///
+    /// Called once per instantiation, right after
+    /// [`link_two_way_pairs`](crate::instantiate) has resolved the partner
+    /// addresses. The elements' own slots stay the source of truth for the
+    /// forward direction; this index is only the missing reverse half.
+    pub fn index_two_way_links(&mut self, edges: Vec<TwoWayEdge>) {
+        for edge in edges {
+            let entry = self
+                .two_way_readers
+                .entry((edge.partner, edge.partner_property))
+                .or_default();
+            let slot = (edge.element, edge.property);
+            if !entry.contains(&slot) {
+                entry.push(slot);
+            }
+        }
+    }
+
     /// Marks every binding owned by the given elements dead (their elements
     /// were removed by a `For` row rebuild) and drops the reverse edges
     /// that point at them.
     pub(crate) fn retire_bindings(&mut self, removed: &[ElementId]) {
         let removed: std::collections::HashSet<ElementId> = removed.iter().copied().collect();
+        // `<=>` reverse edges: drop the pairs declared by a removed element,
+        // and the pairs that pointed *at* one.
+        self.two_way_readers
+            .retain(|(partner, _), _| return !removed.contains(partner));
+        self.two_way_readers.retain(|_, pairs| {
+            pairs.retain(|(element, _)| return !removed.contains(element));
+            return !pairs.is_empty();
+        });
         for index in 0..self.bindings.len() {
             let record = &mut self.bindings[index];
             if record.dead || !removed.contains(&record.element) {
@@ -251,27 +305,89 @@ impl Engine {
 
     /// Syncs a `<=>` partner through the value channel after
     /// `element.property` changed.
+    ///
+    /// A `<=>` pair has to move in **both** directions, and only one of them
+    /// is spelled in the document:
+    ///
+    /// - *forward* — the slot that changed declares a link
+    ///   (`Dialog(open <=> page.sheetOpen)` writing `open`), so the partner
+    ///   follows;
+    /// - *reverse* — someone else declared a link *to* this slot
+    ///   ([`Engine::two_way_readers`]), which is the only direction that
+    ///   exists for `Dialog`, whose `open` is never written from the
+    ///   document: the page writes `sheetOpen` and the dialog must follow.
+    ///
+    /// Propagation is a worklist walk rather than a single hop, because a
+    /// write can chain: given `A.x <=> B.y` and `C.z <=> B.y`, writing `A.x`
+    /// has to reach `C.z` through `B.y`. The `visited` set is what makes it
+    /// terminate — including for a pair that declares `<=>` in both
+    /// directions, and for an `Int`/`Float` pair whose two slots can never
+    /// compare equal and would otherwise ping-pong.
     pub(crate) fn sync_two_way_partner(
         &mut self,
         tree: &mut ElementTree,
         element: ElementId,
         property: &str,
     ) {
-        let Some(link) = tree.arena[element]
-            .two_way_links()
-            .into_iter()
-            .find(|(name, _)| return *name == property)
-            .map(|(_, link)| return link)
-        else {
+        // The overwhelmingly common case is a property with no link in
+        // either direction (every `<-` write of a plain property). Do not
+        // allocate a worklist for it.
+        let has_forward = tree.arena[element].two_way_link(property).is_some();
+        let has_reverse = self
+            .two_way_readers
+            .contains_key(&(element, property.to_string()));
+        if !has_forward && !has_reverse {
             return;
-        };
-        let Some(value) = tree.arena[element].get(property).cloned() else {
-            return;
-        };
-        if tree.arena[link.partner].set(&link.property, value.clone()) {
-            self.invalidate(link.partner, &link.property);
-            self.record_change(link.partner, &link.property, value, ChangeSource::TwoWay);
         }
+
+        let mut visited: HashSet<(ElementId, String)> = HashSet::new();
+        let mut pending: Vec<(ElementId, String)> = vec![(element, property.to_string())];
+        while let Some((source, source_property)) = pending.pop() {
+            if !visited.insert((source, source_property.clone())) {
+                continue;
+            }
+            let Some(value) = tree.arena[source].get(&source_property).cloned() else {
+                continue;
+            };
+            // Every slot this one is paired with, from both indexes.
+            let mut targets: Vec<(ElementId, String)> = Vec::new();
+            if let Some(link) = tree.arena[source].two_way_link(&source_property) {
+                targets.push((link.partner, link.property));
+            }
+            let paired: Vec<(ElementId, String)> = self
+                .two_way_readers
+                .get(&(source, source_property.clone()))
+                .cloned()
+                .unwrap_or_default();
+            targets.extend(paired);
+
+            for (target, target_property) in targets {
+                if self.write_two_way_value(tree, target, &target_property, value.clone()) {
+                    pending.push((target, target_property));
+                }
+            }
+        }
+    }
+
+    /// Writes one side of a `<=>` pair, reporting whether it changed.
+    ///
+    /// Deliberately not recursive: [`Engine::sync_two_way_partner`]'s
+    /// worklist decides where propagation goes next (and tracks which slots
+    /// it has already reached). Recursing here as well would let the two
+    /// directions re-enter each other.
+    fn write_two_way_value(
+        &mut self,
+        tree: &mut ElementTree,
+        element: ElementId,
+        property: &str,
+        value: Value,
+    ) -> bool {
+        if !tree.arena[element].set(property, value.clone()) {
+            return false;
+        }
+        self.invalidate(element, property);
+        self.record_change(element, property, value, ChangeSource::TwoWay);
+        return true;
     }
 
     /// Starts or retargets the animation a `tween`/`spring` binding drives:
@@ -586,6 +702,9 @@ impl Engine {
                                     value,
                                     ChangeSource::WhenBlock,
                                 );
+                                // A `when` block writing a `<=>` partner must
+                                // move the pair, exactly like an effect write.
+                                self.sync_two_way_partner(tree, resolved, &property);
                                 written.push((resolved, property.clone()));
                             }
                         }
@@ -604,6 +723,10 @@ impl Engine {
                         if tree.arena[resolved].set(&property, value.clone()) {
                             self.invalidate(resolved, &property);
                             self.record_change(resolved, &property, value, ChangeSource::WhenBlock);
+                            // The restore is a write too: a pair the block
+                            // covered goes back to its previous value on
+                            // both sides.
+                            self.sync_two_way_partner(tree, resolved, &property);
                             written.push((resolved, property.clone()));
                         }
                     }
@@ -757,6 +880,12 @@ impl Engine {
                 if tree.arena[resolved].set(&property, new_value.clone()) {
                     self.invalidate(resolved, &property);
                     self.record_change(resolved, &property, new_value, ChangeSource::Effect);
+                    // An effect block is the ordinary way a document drives
+                    // *another* element's `<=>` partner (`on click =>
+                    // page.sheetOpen = true` opening a
+                    // `Dialog(open <=> page.sheetOpen)`), so it has to reach
+                    // the pair like any other write.
+                    self.sync_two_way_partner(tree, resolved, &property);
                     written.push((resolved, property));
                 }
                 Ok(())

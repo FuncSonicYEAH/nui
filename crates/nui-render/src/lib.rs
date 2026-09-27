@@ -203,10 +203,16 @@ impl Renderer {
         }
     }
 
-    /// Encodes the draw commands for the current frame: rects, then path
-    /// fills, then strokes (strokes sit on top of the fills they outline),
-    /// then images, then glyphs (document paint order within each list).
-    /// Layers must be prepared first — use [`Renderer::render_to_view`].
+    /// Encodes the draw commands for one scene's own buckets: rects, then
+    /// path fills, then strokes (strokes sit on top of the fills they
+    /// outline), then images, then glyphs, then layer quads (document paint
+    /// order within each list).
+    ///
+    /// `scene.overlays` is **not** drawn here. An overlay needs a pass of
+    /// its own so that it composites after the last pipeline (glyphs) —
+    /// [`Renderer::render_to_view`] encodes those passes, and
+    /// [`Renderer::render_overlays`] is the loop. Layers must be prepared
+    /// first — use [`Renderer::render_to_view`].
     pub fn render<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>, scene: &Scene) {
         self.rect.render(pass, scene.rects.len() as u32);
         self.path.render(pass);
@@ -225,7 +231,8 @@ impl Renderer {
 
     /// Renders `scene` into `view`: prepares all pipelines, renders nested
     /// offscreen layers (recursively), blurs them, then encodes the main
-    /// pass and submits. `physical` is the target size in physical pixels.
+    /// pass and submits. Each overlay of the scene follows in a pass of its
+    /// own. `physical` is the target size in physical pixels.
     // Mirrors the frame pipeline sequence (prepare -> layers -> pass);
     // bundling would hide the ordering that makes instance uploads safe.
     #[allow(clippy::too_many_arguments)]
@@ -247,7 +254,15 @@ impl Renderer {
         // nested prepares overwrite the shared instance buffers.
         self.render_scene_layers(device, queue, scale, scene, &mut text);
         let logical = Size::new(physical.width / scale, physical.height / scale);
-        self.prepare(device, queue, logical, scale, scene, text, decoded_images);
+        self.prepare(
+            device,
+            queue,
+            logical,
+            scale,
+            scene,
+            text.as_deref_mut(),
+            decoded_images,
+        );
         self.layer
             .set_viewport(queue, physical.width, physical.height);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -261,6 +276,97 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.render(&mut pass, scene);
+        }
+        queue.submit([encoder.finish()]);
+
+        // Overlays, one pass each, on top of everything above.
+        //
+        // This is what makes a modal dialog actually modal. Folding the
+        // overlay's draws into the main scene's buckets instead would place
+        // its scrim (a rect, an early pipeline) *underneath* the main
+        // scene's glyphs (the last pipeline), so the text behind a dialog
+        // would stay at full brightness while everything else dimmed. The
+        // colour attachment is loaded, never cleared, and the instance
+        // buffers are re-uploaded per pass — a pass owns a `&Pipeline`, so
+        // two scenes cannot share one upload.
+        for overlay in &scene.overlays {
+            // Same lavapipe hazard the layer path documents: `prepare`
+            // stages fresh `write_buffer` copies into the very buffers the
+            // pass just submitted still has to read, and on lavapipe those
+            // were observed landing early — the main scene then renders
+            // from the overlay's instances (or from nothing). One blocking
+            // poll per overlay; overlays are rare, correctness first. A
+            // frame with no overlay pays nothing.
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .expect("overlay sync completes");
+            self.render_overlay(
+                device,
+                queue,
+                view,
+                logical,
+                physical,
+                scale,
+                &overlay.scene,
+                &mut text,
+                decoded_images,
+            );
+        }
+    }
+
+    /// Encodes one overlay sub-scene as its own prepare + pass, loading the
+    /// colour attachment the main pass left behind.
+    // Mirrors the frame pipeline sequence for a single sub-scene.
+    #[allow(clippy::too_many_arguments)]
+    fn render_overlay(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        logical: Size,
+        physical: Size,
+        scale: f32,
+        scene: &Scene,
+        text: &mut Option<&mut nui_text::TextSystem>,
+        decoded_images: &HashMap<String, DecodedImage>,
+    ) {
+        // An overlay may itself contain an offscreen layer.
+        self.render_scene_layers(device, queue, scale, scene, text);
+        self.prepare(
+            device,
+            queue,
+            logical,
+            scale,
+            scene,
+            text.as_deref_mut(),
+            decoded_images,
+        );
+        self.layer
+            .set_viewport(queue, physical.width, physical.height);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("nui-overlay"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("nui-overlay-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,

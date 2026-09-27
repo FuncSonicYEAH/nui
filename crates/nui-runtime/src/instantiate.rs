@@ -14,7 +14,7 @@ use nui_compiler::{
 };
 use nui_core::Value;
 
-use crate::binding::{Binding, Engine};
+use crate::binding::{Binding, Engine, TwoWayEdge};
 use crate::element::{
     Element, ElementId, ElementTree, FOR_VALUE_PROPERTY, ForBinding, HandlerEntry, WhenEntry,
 };
@@ -49,7 +49,8 @@ pub fn instantiate_with(document: &DocumentIr, registry: Registry) -> Instance {
         }
     }
     build_id_index(&mut tree);
-    link_two_way_pairs(&mut tree);
+    let two_way = link_two_way_pairs(&mut tree);
+    engine.index_two_way_links(two_way);
     return Instance { tree, engine };
 }
 
@@ -265,7 +266,11 @@ fn apply_component_properties(
 /// assignment's value expression (`text <=> root.userName`, `a.text <=>
 /// other.text`): resolve it like any property read, then link the two
 /// property slots.
-fn link_two_way_pairs(tree: &mut ElementTree) {
+///
+/// Returns the resolved pairs so the engine can build the *reverse* index
+/// ([`Engine::index_two_way_links`]) — the declaring slot alone only carries
+/// the forward direction, and half a pair is not a pair.
+fn link_two_way_pairs(tree: &mut ElementTree) -> Vec<TwoWayEdge> {
     let mut links = Vec::new();
     tree.visit_pre_order(|id, element| {
         for (property, expr) in &element.pending_two_way {
@@ -283,6 +288,7 @@ fn link_two_way_pairs(tree: &mut ElementTree) {
             ));
         }
     });
+    let mut edges = Vec::with_capacity(links.len());
     for (element, property, partner, partner_property) in links {
         // A pair starts *in sync*. The slot holds the `Int(0)` placeholder a
         // reactive assignment left behind (it exists so reads succeed before
@@ -297,10 +303,17 @@ fn link_two_way_pairs(tree: &mut ElementTree) {
             &property,
             crate::binding::TwoWayLink {
                 partner,
-                property: partner_property,
+                property: partner_property.clone(),
             },
         );
+        edges.push(TwoWayEdge {
+            element,
+            property,
+            partner,
+            partner_property,
+        });
     }
+    return edges;
 }
 
 /// The zero value of a compile-time type (reads before first write).
