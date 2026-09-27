@@ -1025,6 +1025,7 @@ impl SceneBuilder {
             tint,
             key: key.clone(),
             slice,
+            region: Self::image_region_of(element),
             clip,
         });
         let _ = id;
@@ -1049,6 +1050,19 @@ impl SceneBuilder {
             return;
         };
         self.push_stroke(points, width, cap, color, clip, Point::new(x, y));
+    }
+
+    /// Reads `region.x` / `region.y` / `region.width` / `region.height`, the
+    /// part of the texture to draw, in texture pixels.
+    ///
+    /// All four are required: a partially specified region would have to
+    /// guess the rest, and a generated icon table has every number anyway.
+    fn image_region_of(element: &nui_runtime::Element) -> Option<crate::image::ImageRegion> {
+        let left = f_property(element, "region.x")?;
+        let top = f_property(element, "region.y")?;
+        let width = f_property(element, "region.width")?;
+        let height = f_property(element, "region.height")?;
+        return Some(crate::image::ImageRegion::new(left, top, width, height));
     }
 
     /// Reads `gradient.kind`, defaulting to linear.

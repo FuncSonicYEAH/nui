@@ -71,6 +71,43 @@ pub fn content_hash(bytes: &[u8]) -> u64 {
     return hash;
 }
 
+/// A sub-rectangle of a texture, in **texture pixels**.
+///
+/// The reason this exists: a generated icon set. One atlas holding every
+/// glyph is one decode and one texture upload instead of forty, and each
+/// glyph is addressed by its own cell. Pixels rather than fractions,
+/// because the atlas is generated at a known size and a generated
+/// name-to-cell table naturally carries pixel numbers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImageRegion {
+    /// Left edge, in texture pixels.
+    pub left: f32,
+    /// Top edge, in texture pixels.
+    pub top: f32,
+    /// Width, in texture pixels.
+    pub width: f32,
+    /// Height, in texture pixels.
+    pub height: f32,
+}
+
+impl ImageRegion {
+    /// Builds a region from its top-left corner and size.
+    pub fn new(left: f32, top: f32, width: f32, height: f32) -> ImageRegion {
+        return ImageRegion {
+            left,
+            top,
+            width,
+            height,
+        };
+    }
+
+    /// The region's pixel size, which is what a nine-slice inset is
+    /// measured against in its place of the whole texture.
+    pub fn size(&self) -> (f32, f32) {
+        return (self.width, self.height);
+    }
+}
+
 /// One drawable image region (already expanded to quads by the renderer's
 /// nine-slice split; the scene carries the logical draw).
 #[derive(Debug, Clone)]
@@ -83,6 +120,9 @@ pub struct ImageDraw {
     pub key: String,
     /// Nine-slice inset on all sides (dp); 0 = stretch the whole texture.
     pub slice: f32,
+    /// The part of the texture to draw; `None` is the whole thing, which is
+    /// what every image did before regions existed.
+    pub region: Option<ImageRegion>,
     /// Inherited clip region, if any.
     pub clip: Option<crate::scene::ClipDraw>,
 }
@@ -442,13 +482,21 @@ impl ImagePipeline {
             let Some(texture) = self.textures.get(&draw.key) else {
                 continue;
             };
-            let quads = nine_slice_quads(
-                draw.geometry,
-                draw.slice,
-                texture.width,
-                texture.height,
-                scale,
-            );
+            // A region replaces the texture's own extent as the space the
+            // nine-slice split works in, so `slice` stays in dp and is
+            // measured against the region rather than the whole atlas.
+            let (split_width, split_height) = match &draw.region {
+                Some(region) => {
+                    let (width, height) = region.size();
+                    // `nine_slice_quads` clamps its inset against the pixel
+                    // extent, so a fractional region is rounded here rather
+                    // than producing a sub-pixel split it cannot express.
+                    (width.round() as u32, height.round() as u32)
+                }
+                None => (texture.width, texture.height),
+            };
+            let quads =
+                nine_slice_quads(draw.geometry, draw.slice, split_width, split_height, scale);
             let index = match index_of.get(&draw.key) {
                 Some(index) => *index,
                 None => {
@@ -459,9 +507,15 @@ impl ImagePipeline {
                 }
             };
             for (dest, uv) in quads {
+                let (uv_origin, uv_size) = remap_uv(
+                    draw.region,
+                    (texture.width as f32, texture.height as f32),
+                    uv[0],
+                    uv[1],
+                );
                 grouped[index].1.push(
                     ImageInstance::from_dp(dest.origin, dest.size, draw.tint, scale, draw.clip)
-                        .with_uv(uv[0], uv[1]),
+                        .with_uv(uv_origin, uv_size),
                 );
             }
         }
@@ -569,6 +623,39 @@ impl ImageInstance {
 }
 
 /// Splits `rect` into up to nine destination/UV quad pairs for a
+/// Maps UVs expressed in a region's own `0..1` space into texture space.
+///
+/// `None` is the identity — the draw already covers the whole texture, which
+/// is every image written before regions existed. With a region, the `0..1`
+/// span of the region is scaled by its share of the texture and offset to
+/// where the region starts.
+///
+/// Pure, so the arithmetic is checkable without a GPU: the offscreen tests
+/// confirm the *result* on screen, and this is where the off-by-one lives.
+pub fn remap_uv(
+    region: Option<ImageRegion>,
+    texture_size: (f32, f32),
+    uv_origin: [f32; 2],
+    uv_size: [f32; 2],
+) -> ([f32; 2], [f32; 2]) {
+    let Some(region) = region else {
+        return (uv_origin, uv_size);
+    };
+    let (texture_width, texture_height) = texture_size;
+    // A zero-sized texture cannot be divided by; the draw is degenerate
+    // anyway, so leave the UVs where they were rather than emit NaNs.
+    if texture_width <= 0.0 || texture_height <= 0.0 {
+        return (uv_origin, uv_size);
+    }
+    let scale_x = region.width / texture_width;
+    let scale_y = region.height / texture_height;
+    let origin = [
+        region.left / texture_width + uv_origin[0] * scale_x,
+        region.top / texture_height + uv_origin[1] * scale_y,
+    ];
+    return (origin, [uv_size[0] * scale_x, uv_size[1] * scale_y]);
+}
+
 /// `slice`-dp nine-patch (`slice <= 0` yields one stretched quad).
 /// Returns `((dest_rect, [uv_origin, uv_size]), ...)`.
 pub fn nine_slice_quads(
@@ -670,6 +757,66 @@ mod tests {
         let (middle, uv_middle) = quads[4];
         assert!((middle.size.width - 70.0).abs() < 1e-4, "90 - 2*10");
         assert!((uv_middle[1][0] - 10.0 / 30.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn no_region_leaves_the_uvs_alone() {
+        // Every image written before regions existed takes this path, and
+        // the whole texture is `0..1` on both axes.
+        let (origin, size) = remap_uv(None, (64.0, 32.0), [0.0, 0.0], [1.0, 1.0]);
+        assert_eq!(origin, [0.0, 0.0]);
+        assert_eq!(size, [1.0, 1.0]);
+    }
+
+    #[test]
+    fn a_region_scales_and_offsets_the_uvs() {
+        // A 16x16 cell at (32, 48) of a 128x64 atlas: the region's share of
+        // the texture is 1/8 across and 1/4 down, starting a quarter and
+        // three quarters of the way in.
+        let region = ImageRegion::new(32.0, 48.0, 16.0, 16.0);
+        let (origin, size) = remap_uv(Some(region), (128.0, 64.0), [0.0, 0.0], [1.0, 1.0]);
+        assert!((origin[0] - 0.25).abs() < 1e-6, "u starts at 0.25");
+        assert!((origin[1] - 0.75).abs() < 1e-6, "v starts at 0.75");
+        assert!((size[0] - 0.125).abs() < 1e-6, "u spans an eighth");
+        assert!((size[1] - 0.25).abs() < 1e-6, "v spans a quarter");
+        // The far corner lands exactly on the region's bottom-right, which
+        // is the off-by-one this function exists to get right.
+        let end = [origin[0] + size[0], origin[1] + size[1]];
+        assert!((end[0] - 0.375).abs() < 1e-6, "u ends at 0.375");
+        assert!((end[1] - 1.0).abs() < 1e-6, "v ends at 1.0");
+    }
+
+    #[test]
+    fn a_nine_sliced_region_maps_each_band_into_the_cell() {
+        // A nine-slice inside a region: the split happens in the region's
+        // own space, then every band's UVs are remapped. A 4px slice of a
+        // 16px cell is a quarter of the cell, not a quarter of the atlas.
+        let region = ImageRegion::new(32.0, 0.0, 16.0, 16.0);
+        let quads = nine_slice_quads(
+            Rect::new(Point::ZERO, Size::new(160.0, 16.0)),
+            4.0,
+            16,
+            16,
+            1.0,
+        );
+        assert_eq!(quads.len(), 9, "the split happens in region space");
+        for (_, uv) in &quads {
+            let (origin, size) = remap_uv(Some(region), (128.0, 16.0), uv[0], uv[1]);
+            assert!(
+                origin[0] >= 0.25 - 1e-6 && origin[0] + size[0] <= 0.375 + 1e-6,
+                "every band stays inside the cell's u range, got {origin:?} {size:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_degenerate_texture_leaves_the_uvs_alone() {
+        // Division by a zero-sized texture would be NaN, and a NaN UV makes
+        // the whole draw vanish rather than fail visibly.
+        let region = ImageRegion::new(0.0, 0.0, 8.0, 8.0);
+        let (origin, size) = remap_uv(Some(region), (0.0, 0.0), [0.0, 0.0], [1.0, 1.0]);
+        assert_eq!(origin, [0.0, 0.0]);
+        assert_eq!(size, [1.0, 1.0]);
     }
 
     #[test]
