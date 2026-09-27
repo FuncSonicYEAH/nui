@@ -131,12 +131,34 @@ fn mangle_effects(effects: &mut [Effect], prefix: &str, self_id: &str) {
                     *on = Some(self_id.to_string());
                 }
             }
-            Effect::Call { args, .. } => {
+            Effect::Call { callee, args } => {
+                mangle_callee(callee, prefix, self_id);
                 for arg in args {
                     mangle_expr(arg, prefix, self_id);
                 }
             }
         }
+    }
+}
+
+/// Points a call's target at this instance.
+///
+/// An `id.method()` callee is resolved through the same flat id table as
+/// everything else, so its id needs the prefix for the same reason.
+/// `parent` is left alone: it is structural, and the method dispatcher
+/// resolves it that way already.
+fn mangle_callee(callee: &mut [String], prefix: &str, self_id: &str) {
+    // A one-segment callee is a host function, not an element address, and
+    // has nothing to namespace. Matched on the length rather than with a
+    // `[first, ..]` slice, which would happily match a single segment too.
+    if callee.len() < 2 {
+        return;
+    }
+    let target = &mut callee[0];
+    match target.as_str() {
+        "root" => *target = self_id.to_string(),
+        "parent" => {}
+        name => *target = format!("{prefix}{name}"),
     }
 }
 
@@ -398,6 +420,68 @@ mod tests {
             panic!("expected a property read");
         };
         assert_eq!(*target, PropertyTarget::Parent("width".to_string()));
+    }
+
+    #[test]
+    fn a_call_target_is_rewritten_like_any_other_address() {
+        // `id.method()` resolves through the same flat id table, so a
+        // component-local id needs the prefix; `root` becomes the instance's
+        // own address, and `parent` is structural and left alone.
+        let mut node = NodeIr {
+            handlers: vec![nui_compiler::HandlerIr {
+                signal: "click".to_string(),
+                effect: vec![
+                    Effect::Call {
+                        callee: vec!["timer".to_string(), "start".to_string()],
+                        args: Vec::new(),
+                    },
+                    Effect::Call {
+                        callee: vec!["root".to_string(), "close".to_string()],
+                        args: Vec::new(),
+                    },
+                    Effect::Call {
+                        callee: vec!["parent".to_string(), "focus".to_string()],
+                        args: Vec::new(),
+                    },
+                ],
+            }],
+            ..NodeIr::default()
+        };
+        mangle_node(&mut node, "i0::", "i0::self");
+        let Effect::Call { callee, .. } = &node.handlers[0].effect[0] else {
+            panic!("expected a call");
+        };
+        assert_eq!(callee[0], "i0::timer", "a local id is namespaced");
+        assert_eq!(callee[1], "start", "the method name is untouched");
+        let Effect::Call { callee, .. } = &node.handlers[0].effect[1] else {
+            panic!("expected a call");
+        };
+        assert_eq!(callee[0], "i0::self", "`root` becomes the instance");
+        let Effect::Call { callee, .. } = &node.handlers[0].effect[2] else {
+            panic!("expected a call");
+        };
+        assert_eq!(callee[0], "parent", "`parent` stays structural");
+    }
+
+    #[test]
+    fn a_single_name_call_is_a_host_function_and_is_not_namespaced() {
+        // One segment is not an element address, so prefixing it would
+        // invent an id nothing registered.
+        let mut node = NodeIr {
+            handlers: vec![nui_compiler::HandlerIr {
+                signal: "click".to_string(),
+                effect: vec![Effect::Call {
+                    callee: vec!["refresh".to_string()],
+                    args: Vec::new(),
+                }],
+            }],
+            ..NodeIr::default()
+        };
+        mangle_node(&mut node, "i0::", "i0::self");
+        let Effect::Call { callee, .. } = &node.handlers[0].effect[0] else {
+            panic!("expected a call");
+        };
+        assert_eq!(callee[0], "refresh");
     }
 
     #[test]

@@ -221,8 +221,26 @@ impl WindowHost {
     }
 
     /// Whether the window should close.
+    ///
+    /// True once the platform has asked (`CloseRequested`) or once the
+    /// document has (`root.close()` — see [`Engine::close_requested`]).
     pub fn should_close(&self) -> bool {
-        return self.close_requested;
+        return self.close_requested || self.engine.close_requested();
+    }
+
+    /// Acts on a document's close request, if there is one.
+    ///
+    /// winit has no client-side "please close" — a window closes when the
+    /// platform sends `CloseRequested`, or when the event loop exits — so
+    /// the request is recorded as this host's own close flag and the run
+    /// loop's `should_close` check does the rest. Returns whether a close
+    /// was recorded, so the caller stops asking.
+    pub fn poll_close_request(&mut self) -> bool {
+        if !self.engine.take_close_request() {
+            return false;
+        }
+        self.close_requested = true;
+        return true;
     }
 
     /// Whether a redraw is pending (dirty data or running animation).
@@ -266,6 +284,10 @@ impl WindowHost {
                 any_action = true;
             }
         }
+        // A click that ran `root.close()` is only asking; turn it into a
+        // real close now, so the run loop's `should_close` check below sees
+        // it without the document having to reach the window itself.
+        self.poll_close_request();
         return any_action;
     }
 

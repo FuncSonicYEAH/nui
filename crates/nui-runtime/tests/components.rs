@@ -587,6 +587,119 @@ fn a_duplicate_component_declaration_is_an_error() {
 }
 
 #[test]
+fn a_document_can_ask_the_host_to_close_the_window() -> TestResult {
+    // The titlebar close button. `root.close()` is the one method a
+    // component may call on itself, because it acts on the host rather than
+    // on the element.
+    let (mut tree, mut engine) = build(
+        r#"
+        component App {
+            property closes: Int = 0
+            Window(id = root) {
+                Rectangle(id = button, width = 30dp, height = 30dp) {
+                    on click => { root.close() closes += 1 }
+                }
+            }
+        }
+    "#,
+    );
+    engine.propagate(&mut tree);
+    assert!(!engine.close_requested(), "nothing asked before the click");
+    let button = tree.lookup_id("button").expect("the button");
+    engine.emit_bubble(&mut tree, button, "click")?;
+    engine.propagate(&mut tree);
+    assert!(
+        engine.close_requested(),
+        "the click asked the host to close"
+    );
+    // The rest of the effect still ran: a close request is not an abort.
+    let root = tree.lookup_id("root").expect("root");
+    assert_eq!(tree.arena[root].get("closes"), Some(&Value::Int(1)));
+    return Ok(());
+}
+
+#[test]
+fn a_close_request_is_taken_once() -> TestResult {
+    let (mut tree, mut engine) = build(
+        r#"
+        component App {
+            Window(id = root) {
+                Rectangle(id = button, width = 30dp, height = 30dp) {
+                    on click => root.close()
+                }
+            }
+        }
+    "#,
+    );
+    engine.propagate(&mut tree);
+    let button = tree.lookup_id("button").expect("the button");
+    engine.emit_bubble(&mut tree, button, "click")?;
+    assert!(engine.close_requested());
+    assert!(engine.take_close_request(), "the host consumes it");
+    assert!(
+        !engine.close_requested(),
+        "a host that polls every frame must act once, not every frame"
+    );
+    assert!(!engine.take_close_request());
+    return Ok(());
+}
+
+#[test]
+fn a_close_inside_a_component_reaches_the_host() -> TestResult {
+    // The rewrite matters here: `root` inside a component means the
+    // component's own root, so the call is namespaced with the instance
+    // rather than aimed at the document's window.
+    let (mut tree, mut engine) = build(
+        r#"
+        component Closer {
+            Rectangle(id = box, width = 30dp, height = 30dp) {
+                on click => root.close()
+            }
+        }
+        component App {
+            Window(id = root) { Column { Closer(id = a) Closer(id = b) } }
+        }
+    "#,
+    );
+    engine.propagate(&mut tree);
+    let a = tree.lookup_id("a").expect("first closer");
+    let b = tree.lookup_id("b").expect("second closer");
+    engine.emit_bubble(&mut tree, a, "click")?;
+    assert!(
+        engine.close_requested(),
+        "a component's close still reaches the host"
+    );
+    let _ = engine.take_close_request();
+    // The second instance is a separate element, so its click is a separate
+    // request rather than a replay of the first.
+    engine.emit_bubble(&mut tree, b, "click")?;
+    assert!(engine.take_close_request());
+    return Ok(());
+}
+
+#[test]
+fn close_is_the_only_method_a_component_may_call() {
+    // Everything else stays rejected, so a typo cannot slip through to fail
+    // at runtime instead of here.
+    let rendered = diagnostics_of(
+        r#"
+        component App {
+            property n: Int = 0
+            Window(id = root) {
+                Rectangle(id = box, width = 10dp, height = 10dp) {
+                    on click => root.explode()
+                }
+            }
+        }
+    "#,
+    );
+    assert!(
+        rendered.contains("components have no methods"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn a_component_cannot_be_instantiated_inside_a_for_body() {
     let rendered = diagnostics_of(
         r#"

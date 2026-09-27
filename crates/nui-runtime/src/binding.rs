@@ -175,6 +175,9 @@ pub struct Engine {
     /// The animation clock (D8): `tween`/`spring` binding writes start or
     /// retarget animations here instead of writing the displayed value.
     pub(crate) clock: crate::animation::AnimationClock,
+    /// Set by a document asking for the window to close (`root.close()`),
+    /// and consumed by the host.
+    close_requested: bool,
 }
 
 /// Default duration of a `tween` without an explicit `duration` argument.
@@ -967,8 +970,32 @@ impl Engine {
         });
     }
 
+    /// Records that the document asked for the window to close.
+    ///
+    /// Set from an effect block (`on click => root.close()`) and drained by
+    /// the host, which turns it into a real window close. The engine cannot
+    /// close the window itself — it has no window — and a host *function*
+    /// cannot do it either, because [`HostFunction`] is an immutable
+    /// closure and this needs to change engine state.
+    pub fn request_close(&mut self) {
+        self.close_requested = true;
+    }
+
+    /// Whether a close is pending, leaving the request in place.
+    pub fn close_requested(&self) -> bool {
+        return self.close_requested;
+    }
+
+    /// Whether a close is pending, clearing the request.
+    ///
+    /// Taken rather than read, so a host that polls every frame acts on a
+    /// request exactly once.
+    pub fn take_close_request(&mut self) -> bool {
+        return std::mem::take(&mut self.close_requested);
+    }
+
     /// Method calls: `id.method(...)` element methods (`timer.start()` /
-    /// `timer.stop()`) and single-name host function calls.
+    /// `timer.stop()`, `root.close()`) and single-name host function calls.
     fn run_method_call(
         &mut self,
         tree: &mut ElementTree,
@@ -986,6 +1013,15 @@ impl Engine {
                 Ok(())
             }
             [id_name, method, ..] => {
+                // `close` is about the *window*, not about the element it is
+                // written on, so it resolves before the target element does:
+                // a document that spells it `root.close()` on a component
+                // whose root is not a `Window` should still ask the host to
+                // close, rather than fail on an id that may not exist.
+                if method == "close" {
+                    self.request_close();
+                    return Ok(());
+                }
                 let Some(target) = tree.lookup_id(id_name) else {
                     return Err(EvalError::Unresolved {
                         what: format!("unknown id `{id_name}`"),

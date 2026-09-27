@@ -20,6 +20,16 @@ use crate::types::{Type, unify};
 /// Supported hex-digit counts of color literals.
 const COLOR_DIGIT_COUNTS: [usize; 4] = [3, 4, 6, 8];
 
+/// Methods a document may call through `root` / `parent`.
+///
+/// A component has no methods of its own, so the checker normally rejects
+/// `root.something()`. These are the exceptions: methods that act on the
+/// *host* rather than on the element, and so are reachable from anywhere —
+/// or rather, only from the document root, which is where a window lives.
+/// A fixed list rather than a rule, because "any method on a `Window`
+/// element" needs an element type table the checker does not have.
+const HOST_ELEMENT_METHODS: &[&str] = &["close"];
+
 /// Outcome of checking: the compiled document plus diagnostics.
 pub struct CheckOutcome {
     /// Compiled document (best effort; erroneous parts become `Error`
@@ -1105,13 +1115,22 @@ impl<'source> ComponentBinder<'source> {
             return None;
         }
         let id = &callee.parts[0];
+        // `root.close()` is the one method that is not about the element it
+        // is written on: it asks the *host* to close the window, and the
+        // window is not reachable from inside a component by any other
+        // route. It therefore also skips the id lookup — a component that
+        // has no element called `root` is exactly the case that matters.
+        let method = callee.parts[1].name.as_str();
+        if HOST_ELEMENT_METHODS.contains(&method) {
+            return Some(Effect::Call {
+                callee: vec![id.name.clone(), method.to_string()],
+                args: Vec::new(),
+            });
+        }
         if id.name == "root" || id.name == "parent" {
             self.diagnostics.push(nui_syntax::Diagnostic::error(
                 id.span,
-                format!(
-                    "`{}.{}`: components have no methods",
-                    id.name, callee.parts[1].name
-                ),
+                format!("`{}.{}`: components have no methods", id.name, method),
             ));
             return None;
         }
