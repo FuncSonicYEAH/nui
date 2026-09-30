@@ -111,31 +111,38 @@ fn a_card_and_a_panel_fill_their_row() {
 }
 
 #[test]
-fn a_grid_places_six_children_in_two_rows_of_three() {
+fn a_grid_gives_its_spanning_cell_two_tracks() {
     let tree = example_tree();
     let grid = find(&tree, "containers_swatches");
     let cells = tree.arena[grid].children.clone();
-    assert_eq!(cells.len(), 6);
+    assert_eq!(cells.len(), 5, "a banner and four cells");
     let grid_x = number(&tree, grid, "x");
     let grid_y = number(&tree, grid, "y");
     let row_height = number(&tree, cells[0], "height");
     assert_eq!(number(&tree, cells[0], "x"), grid_x);
     assert_eq!(number(&tree, cells[0], "y"), grid_y);
-    // Columns advance, rows stack.
-    assert!(number(&tree, cells[1], "x") > number(&tree, cells[0], "x"));
-    assert!(number(&tree, cells[2], "x") > number(&tree, cells[1], "x"));
-    assert_eq!(
-        number(&tree, cells[3], "x"),
-        grid_x,
-        "cell 3 starts row two"
+
+    // A one-track cell is as wide as its track, which is what makes the
+    // span measurable: the banner is two tracks plus the gap it bridges.
+    let track = number(&tree, cells[1], "width");
+    let banner = number(&tree, cells[0], "width");
+    assert!(
+        (banner - (2.0 * track + 8.0)).abs() < 1.0,
+        "the banner spans two tracks plus the 8dp gap between them: \
+         banner {banner}, track {track}"
     );
+
+    // Auto-placement resumes in the track the span left free, on the same
+    // row (two tracks and the two gaps the cell now starts after).
+    assert_eq!(number(&tree, cells[1], "x"), grid_x + 2.0 * track + 16.0);
+    assert_eq!(number(&tree, cells[1], "y"), grid_y);
+    // Row two starts back at the first column.
+    assert_eq!(number(&tree, cells[2], "x"), grid_x);
     assert_eq!(
-        number(&tree, cells[3], "y"),
+        number(&tree, cells[2], "y"),
         grid_y + row_height + 8.0,
         "row two clears the 8dp row gap"
     );
-    // Auto-width children stretch to their track.
-    assert!(number(&tree, cells[0], "width") > 150.0);
 }
 
 #[test]

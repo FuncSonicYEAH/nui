@@ -69,6 +69,9 @@ enum Arrangement {
         wrap: bool,
     },
     /// A `Grid`: equal-width tracks, children placed in document order.
+    ///
+    /// A child can claim several tracks (`column_span` / `row_span`); see
+    /// `style_for`, which is where a child's own placement is decided.
     Grid {
         /// Track count on the inline axis, if declared.
         columns: Option<u16>,
@@ -467,6 +470,36 @@ fn style_for(tree: &ElementTree, id: ElementId) -> Style {
             start: taffy::style_helpers::line(1),
             end: taffy::style_helpers::auto(),
         };
+    }
+
+    // A `Grid` child may claim more than one track: `column_span = 2` makes
+    // it two tracks wide, `row_span` two tall. The start line stays `auto`,
+    // so auto-placement still chooses the cell and only the *extent* is
+    // declared — a calculator's keypad needs "this key is the wide zero",
+    // not hand-numbered coordinates that break when a column is inserted.
+    //
+    // Gated on the parent being a `Grid` rather than applied to every
+    // element: `grid_*` on a child of a `Column` means nothing to a flex
+    // container, and the `Stack` branch above has already claimed both
+    // lines for its children.
+    if tree.arena[id]
+        .parent
+        .is_some_and(|parent| return tree.arena[parent].ty == "Grid")
+    {
+        let column_span = count_property(element, "column_span").unwrap_or(1);
+        if column_span > 1 {
+            style.grid_column = taffy::Line {
+                start: taffy::style_helpers::auto(),
+                end: taffy::style_helpers::span(column_span),
+            };
+        }
+        let row_span = count_property(element, "row_span").unwrap_or(1);
+        if row_span > 1 {
+            style.grid_row = taffy::Line {
+                start: taffy::style_helpers::auto(),
+                end: taffy::style_helpers::span(row_span),
+            };
+        }
     }
 
     // Per-item overrides of the container's alignment, applied last so a
@@ -1595,6 +1628,82 @@ mod container_tests {
         layout(&mut tree, VIEWPORT);
         assert_eq!(at(&tree, first), (0.0, 0.0));
         assert_eq!(at(&tree, second), (0.0, 20.0), "no columns means one track");
+    }
+
+    #[test]
+    fn a_grid_child_can_span_columns() {
+        let mut tree = ElementTree::new();
+        let grid = root(&mut tree, "Grid");
+        set(&mut tree, grid, "columns", Value::Int(4));
+        set(
+            &mut tree,
+            grid,
+            "column_spacing",
+            Value::Length(Length::Dp(20.0)),
+        );
+        // A display over three of the four columns, with no width of its
+        // own: the span is what decides how wide it is.
+        let mut wide = Element::new("Rectangle", None);
+        wide.set("height", Value::Length(Length::Dp(20.0)));
+        wide.set("column_span", Value::Int(3));
+        let wide = tree.insert(wide);
+        let key = box_of(&mut tree, 30.0, 20.0);
+        tree.append_child(grid, wide);
+        tree.append_child(grid, key);
+        layout(&mut tree, VIEWPORT);
+
+        // Tracks are (400 - 3×20) / 4 = 85 wide; three of them plus the
+        // two gaps between them is 295.
+        assert_eq!(at(&tree, wide), (0.0, 0.0));
+        assert_eq!(
+            size_of(&tree, wide),
+            (295.0, 20.0),
+            "an auto width fills the spanned tracks, not one of them"
+        );
+        // Auto-placement resumes in the track the span left free, on the
+        // same row -- 400 - 85.
+        assert_eq!(at(&tree, key), (315.0, 0.0));
+    }
+
+    #[test]
+    fn a_row_span_keeps_later_children_out_of_its_cells() {
+        let mut tree = ElementTree::new();
+        let grid = root(&mut tree, "Grid");
+        set(&mut tree, grid, "columns", Value::Int(2));
+        let tall = box_of(&mut tree, 30.0, 20.0);
+        set(&mut tree, tall, "row_span", Value::Int(2));
+        let beside = box_of(&mut tree, 30.0, 20.0);
+        let under = box_of(&mut tree, 30.0, 20.0);
+        let after = box_of(&mut tree, 30.0, 20.0);
+        for child in [tall, beside, under, after] {
+            tree.append_child(grid, child);
+        }
+        layout(&mut tree, VIEWPORT);
+
+        assert_eq!(at(&tree, tall), (0.0, 0.0), "the spanning child is first");
+        assert_eq!(at(&tree, beside), (200.0, 0.0), "the next cell is column 2");
+        // Row 2 column 1 is inside the span, so the third child goes to the
+        // second column of that row instead of starting a new one there.
+        assert_eq!(at(&tree, under).0, 200.0, "column 1 of row 2 is taken");
+        assert!(at(&tree, under).1 > 0.0, "and it is on row 2, not row 1");
+        // Only then does the next child come back to the first column.
+        assert_eq!(at(&tree, after).0, 0.0, "row 3 starts in column 1");
+        assert!(at(&tree, after).1 > at(&tree, under).1);
+    }
+
+    #[test]
+    fn a_span_outside_a_grid_is_ignored() {
+        // `column_span` is grid vocabulary; a flex line has no tracks to
+        // span, so a child of a `Row` that declares one is still one item.
+        let mut tree = ElementTree::new();
+        let row = root(&mut tree, "Row");
+        let first = box_of(&mut tree, 30.0, 20.0);
+        set(&mut tree, first, "column_span", Value::Int(3));
+        let second = box_of(&mut tree, 30.0, 20.0);
+        tree.append_child(row, first);
+        tree.append_child(row, second);
+        layout(&mut tree, VIEWPORT);
+        assert_eq!(at(&tree, second), (30.0, 0.0));
     }
 
     #[test]

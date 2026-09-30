@@ -1,6 +1,6 @@
-// Containers — `Panel` / `Card`, `Grid`, `Wrap`, `Stack` (with a badge on
-// the corner), `Separator`, `Spacer`, and the container alignment
-// properties.
+// Containers — `Panel` / `Card`, `Grid` (with spanning cells), `Wrap`,
+// `Stack` (with a badge on the corner), `Separator`, `Spacer`, and the
+// container alignment properties.
 //
 // The page declares `height = 100%`, so it fills the viewport it is given
 // and the trailing `Spacer` has free space to push against.
@@ -24,10 +24,14 @@ Column(id = containers_page, spacing = 14dp, padding = 24dp, height = 100%,
 
     Text(content = "Grid", font.size = 16dp, color = #e8ecf2)
 
+    // The first cell spans two columns (`column_span`), so the five
+    // rectangles fill the six tracks of two rows. Auto-placement does the
+    // rest: nothing here is numbered by hand, which is what keeps the grid
+    // intact when a column is added.
     Grid(id = containers_swatches, columns = 3, row_spacing = 8dp,
          column_spacing = 8dp) {
-        Rectangle(fill = #2a3140, radius = 6dp, height = 28dp)
-        Rectangle(fill = #2a3140, radius = 6dp, height = 28dp)
+        Rectangle(fill = #3d5a75, radius = 6dp, height = 28dp,
+                  column_span = 2)
         Rectangle(fill = #2a3140, radius = 6dp, height = 28dp)
         Rectangle(fill = #2a3140, radius = 6dp, height = 28dp)
         Rectangle(fill = #2a3140, radius = 6dp, height = 28dp)
