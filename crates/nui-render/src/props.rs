@@ -13,6 +13,36 @@
 use nui_core::{Color, Value};
 use nui_runtime::Element;
 
+/// The typeface an element asks for, from its `font.*` properties.
+///
+/// # Why this is the second such reader
+///
+/// `nui-layout` reads the same three properties, and it has to: it measures,
+/// and a measurement taken in a different typeface than the one painted is a
+/// width that is wrong by a few percent -- close enough to look fine in a
+/// screenshot and wrong enough that a bold run's last glyph falls outside its
+/// box. The two crates are siblings (both sit above `nui-runtime`), so neither
+/// can call the other, and this is the arrangement the codebase already uses
+/// for `font.size` via two `dp_of`s.
+///
+/// What keeps them honest is not this comment but the defaults living once, in
+/// [`nui_text::Typeface::from_parts`], and `font_weight_reaches_the_measurement`
+/// in this crate's tests, which fails if the two ever disagree about a run's
+/// width.
+pub fn typeface_of(element: &Element) -> nui_text::Typeface {
+    return nui_text::Typeface::from_parts(
+        element
+            .get("font.family")
+            .and_then(|value| return value.as_str().ok()),
+        element
+            .get("font.weight")
+            .and_then(|value| return dp_of(value)),
+        element
+            .get("font.italic")
+            .and_then(|value| return value.as_bool().ok()),
+    );
+}
+
 /// Extracts a dp `f32` from a property value (`Int`, `Float` or
 /// `Length::Dp`). Anything else — a string, a color, a bool — is `None`.
 pub fn dp_of(value: &Value) -> Option<f32> {

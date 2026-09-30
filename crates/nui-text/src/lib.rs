@@ -17,9 +17,11 @@
 
 pub mod atlas;
 pub mod system;
+pub mod typeface;
 
 pub use atlas::{GlyphAtlas, GlyphMask, GlyphQuad, GlyphSlot, atlas_page_size};
 pub use system::{ShapedGlyph, ShapedText, TextSystem, WrappedLayout, WrappedLine};
+pub use typeface::Typeface;
 
 /// The bundled fallback typeface (DejaVu Sans; license alongside the file).
 pub const EMBEDDED_FONT: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");

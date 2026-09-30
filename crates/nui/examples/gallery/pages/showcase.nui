@@ -1,8 +1,27 @@
-// Scroll + layers — a `Scroll` viewport whose content is clipped and
-// wheel-scrolled, group compositing through `layer.opacity`, and a
-// two-pass gaussian offscreen layer through `layer.blur`. No new GPU
-// pipeline: both go through the offscreen texture the renderer already has.
+// Scroll + layers, and the type scale.
+//
+// Where render features go to be seen. The scale is `font.weight` ascending
+// from 100 to 900 with `font.italic` turned on for the last two, so the two
+// axes can be told apart at a glance — which is the thing worth looking at,
+// since either on its own is unremarkable.
+//
+// The weights are the host's own fonts, so how heavy "Bold" actually is depends
+// on what is installed. A snapshot therefore cannot pin these widths.
 Column(id = showcase_page, spacing = 16dp, padding = 24dp) {
+
+    Text(content = "font.weight / font.italic / font.family", font.size = 16dp,
+         color = #e8ecf2)
+
+    Column(id = showcase_type, spacing = 2dp, width = 340dp) {
+        For(row in root.showcaseWeights) {
+            Text(content = row.label, font.size = 17dp, align_self = "start",
+                 font.weight = row.weight, font.italic = row.italic,
+                 color = #e8ecf2)
+        }
+    }
+
+    Rectangle(id = showcase_type_rule, width = 340dp, height = 1dp,
+              fill = #2b3240)
 
     Text(content = "layer.opacity / layer.blur", font.size = 16dp,
          color = #e8ecf2)

@@ -13,6 +13,8 @@ pub mod image;
 pub mod layer;
 pub mod path;
 pub mod props;
+
+pub use props::typeface_of;
 pub mod rect;
 pub mod scene;
 pub mod stroke;

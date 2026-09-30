@@ -9,13 +9,24 @@
 
 use std::collections::HashMap;
 
-use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache, SwashContent};
+use cosmic_text::{Buffer, FontSystem, Metrics, Shaping, SwashCache, SwashContent};
 
 use crate::atlas::{GlyphAtlas, GlyphMask, GlyphQuad};
+use crate::typeface::Typeface;
 
 /// Default line-height factor over font size (baseline rules unified; QML
 /// uses ~1.2 for single-line text).
 const LINE_HEIGHT_FACTOR: f32 = 1.2;
+
+/// The measure-cache key for a single-line run.
+///
+/// One named type rather than a bare tuple: the two caches differ by one field,
+/// and a tuple's field order is invisible at the use site, so a swapped pair
+/// compiles and quietly returns another entry's measurement.
+type MeasureKey = (String, u32, Typeface);
+
+/// The measure-cache key for a run that wraps at a width.
+type WrappedMeasureKey = (String, u32, Typeface, u32);
 
 /// One shaped glyph: baseline origin in pixels plus its atlas cache key.
 #[derive(Debug, Clone, Copy)]
@@ -126,14 +137,14 @@ pub struct TextSystem {
     /// Baseline offsets per rasterized glyph (placement is only known at
     /// rasterize time, so it is stored beside the atlas slot).
     placements: HashMap<cosmic_text::CacheKey, (i32, i32)>,
-    /// Measure cache keyed by `(text, font size bits)`: taffy's measure
-    /// callback runs many times per frame for the same strings.
-    measure_cache: HashMap<(String, u32), (f32, f32)>,
+    /// Measure cache keyed by `(text, font size bits, typeface)`: taffy's
+    /// measure callback runs many times per frame for the same strings.
+    measure_cache: HashMap<MeasureKey, (f32, f32)>,
     /// Measure cache for *wrapped* text, keyed by
-    /// `(text, font size bits, width bits)`: a multi-line field asks for
-    /// the same measurement every frame, and the wrap width changes only
+    /// `(text, font size bits, typeface, width bits)`: a multi-line field asks
+    /// for the same measurement every frame, and the wrap width changes only
     /// on resize.
-    wrapped_measure_cache: HashMap<(String, u32, u32), (f32, f32)>,
+    wrapped_measure_cache: HashMap<WrappedMeasureKey, (f32, f32)>,
 }
 
 impl std::fmt::Debug for TextSystem {
@@ -190,12 +201,12 @@ impl TextSystem {
 
     /// Measures `text` at `font_size` (px) without wrapping; returns
     /// `(width, height)`. Cached per `(text, size)`.
-    pub fn measure(&mut self, text: &str, font_size: f32) -> (f32, f32) {
-        let key = (text.to_string(), font_size.to_bits());
+    pub fn measure(&mut self, text: &str, font_size: f32, typeface: &Typeface) -> (f32, f32) {
+        let key = (text.to_string(), font_size.to_bits(), typeface.clone());
         if let Some(cached) = self.measure_cache.get(&key) {
             return *cached;
         }
-        let shaped = self.shape(text, font_size);
+        let shaped = self.shape(text, font_size, typeface);
         let measured = (shaped.width, shaped.height);
         self.measure_cache.insert(key, measured);
         return measured;
@@ -207,23 +218,34 @@ impl TextSystem {
     /// Separate from [`TextSystem::measure`] rather than a mode switch on
     /// it: the single-line path is on the hot path of every `Text` element
     /// in the document and must not grow a wrap parameter.
-    pub fn measure_wrapped(&mut self, text: &str, font_size: f32, max_width: f32) -> (f32, f32) {
+    pub fn measure_wrapped(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        typeface: &Typeface,
+    ) -> (f32, f32) {
         if max_width <= 0.0 {
-            return self.measure(text, font_size);
+            return self.measure(text, font_size, typeface);
         }
-        let key = (text.to_string(), font_size.to_bits(), max_width.to_bits());
+        let key = (
+            text.to_string(),
+            font_size.to_bits(),
+            typeface.clone(),
+            max_width.to_bits(),
+        );
         if let Some(cached) = self.wrapped_measure_cache.get(&key) {
             return *cached;
         }
-        let layout = self.layout_wrapped(text, font_size, max_width);
+        let layout = self.layout_wrapped(text, font_size, max_width, typeface);
         let measured = (layout.width, layout.height);
         self.wrapped_measure_cache.insert(key, measured);
         return measured;
     }
 
     /// Shapes `text` (single paragraph, no wrap) and returns placed glyphs.
-    pub fn shape(&mut self, text: &str, font_size: f32) -> ShapedText {
-        let (width, height, _lines, glyphs) = self.place(text, font_size, None);
+    pub fn shape(&mut self, text: &str, font_size: f32, typeface: &Typeface) -> ShapedText {
+        let (width, height, _lines, glyphs) = self.place(text, font_size, None, typeface);
         return ShapedText {
             width,
             height,
@@ -233,8 +255,14 @@ impl TextSystem {
 
     /// Shapes `text` wrapped at `max_width`, returning the visual lines
     /// (with their char ranges) plus every placed glyph.
-    pub fn layout_wrapped(&mut self, text: &str, font_size: f32, max_width: f32) -> WrappedLayout {
-        let (width, height, lines, glyphs) = self.place(text, font_size, Some(max_width));
+    pub fn layout_wrapped(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        typeface: &Typeface,
+    ) -> WrappedLayout {
+        let (width, height, lines, glyphs) = self.place(text, font_size, Some(max_width), typeface);
         return WrappedLayout {
             width,
             height,
@@ -253,11 +281,12 @@ impl TextSystem {
         text: &str,
         font_size: f32,
         max_width: Option<f32>,
+        typeface: &Typeface,
     ) -> (f32, f32, Vec<WrappedLine>, Vec<ShapedGlyph>) {
         let metrics = Metrics::new(font_size, font_size * LINE_HEIGHT_FACTOR);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(max_width, None);
-        buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
+        buffer.set_text(text, &typeface.attrs(), Shaping::Advanced, None);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         // Paragraph starts, so a run's paragraph-relative byte offsets can
@@ -429,23 +458,26 @@ mod tests {
     #[test]
     fn measures_embedded_font_deterministically() {
         let mut system = TextSystem::with_embedded_font();
-        let (width, height) = system.measure("hello", 20.0);
+        let (width, height) = system.measure("hello", 20.0, &Typeface::default());
         assert!(width > 20.0, "measured width {width}");
         assert!(
             (height - 24.0).abs() < 0.01,
             "line height 1.2 × 20, got {height}"
         );
         // Determinism: the same call is cached and identical.
-        assert_eq!(system.measure("hello", 20.0), (width, height));
+        assert_eq!(
+            system.measure("hello", 20.0, &Typeface::default()),
+            (width, height)
+        );
         // Wider text measures wider.
-        let (wide, _) = system.measure("hello world, longer", 20.0);
+        let (wide, _) = system.measure("hello world, longer", 20.0, &Typeface::default());
         assert!(wide > width);
     }
 
     #[test]
     fn shapes_glyphs_with_positions() {
         let mut system = TextSystem::with_embedded_font();
-        let shaped = system.shape("hi", 20.0);
+        let shaped = system.shape("hi", 20.0, &Typeface::default());
         assert!(shaped.glyphs.len() >= 2, "one glyph per character minimum");
         // Glyphs advance left to right.
         assert!(shaped.glyphs[1].x > shaped.glyphs[0].x);
@@ -454,7 +486,7 @@ mod tests {
     #[test]
     fn empty_text_shapes_to_nothing() {
         let mut system = TextSystem::with_embedded_font();
-        let (width, height) = system.measure("", 20.0);
+        let (width, height) = system.measure("", 20.0, &Typeface::default());
         assert_eq!(width, 0.0);
         assert!(height > 0.0, "an empty line still occupies line height");
     }
@@ -463,10 +495,10 @@ mod tests {
     fn wrapping_breaks_at_the_given_width() {
         let mut system = TextSystem::with_embedded_font();
         let text = "the quick brown fox jumps over the lazy dog";
-        let (one_line, _) = system.measure(text, 16.0);
+        let (one_line, _) = system.measure(text, 16.0, &Typeface::default());
         // A width well past the first word but far short of the sentence
         // must wrap into several lines.
-        let layout = system.layout_wrapped(text, 16.0, one_line / 4.0);
+        let layout = system.layout_wrapped(text, 16.0, one_line / 4.0, &Typeface::default());
         assert!(
             layout.lines.len() >= 3,
             "expected several lines, got {}",
@@ -482,7 +514,7 @@ mod tests {
         assert!(widest <= one_line / 4.0 + 15.0, "widest line {widest}");
         // Wrapping does not change the text's total extent when there is
         // room: the width is capped by the wrap width, the height grows.
-        let (_, tall) = system.measure_wrapped(text, 16.0, one_line / 4.0);
+        let (_, tall) = system.measure_wrapped(text, 16.0, one_line / 4.0, &Typeface::default());
         assert!(tall > 3.0 * 16.0);
         assert!(width_of(&layout) <= one_line / 4.0 + 15.0);
     }
@@ -491,7 +523,7 @@ mod tests {
     fn wrapped_lines_are_a_contiguous_partition_of_the_text() {
         let mut system = TextSystem::with_embedded_font();
         let text = "alpha beta gamma delta epsilon";
-        let layout = system.layout_wrapped(text, 16.0, 60.0);
+        let layout = system.layout_wrapped(text, 16.0, 60.0, &Typeface::default());
         assert!(layout.lines.len() >= 2);
         assert_eq!(layout.lines[0].start, 0, "the first line starts the text");
         assert_eq!(
@@ -510,7 +542,8 @@ mod tests {
     #[test]
     fn a_hard_newline_starts_a_line() {
         let mut system = TextSystem::with_embedded_font();
-        let layout = system.layout_wrapped("first\nsecond\nthird", 16.0, 500.0);
+        let layout =
+            system.layout_wrapped("first\nsecond\nthird", 16.0, 500.0, &Typeface::default());
         // Three paragraphs, each short enough not to wrap: three lines.
         assert_eq!(layout.lines.len(), 3);
         assert_eq!(layout.lines[0].start, 0);
@@ -528,7 +561,7 @@ mod tests {
         assert_eq!(layout.line_of(6), 1, "caret after the newline is on line 1");
         assert!(layout.caret_x(6) <= 2.0, "caret at the second line's start");
         // A trailing newline still opens an empty line (like editors).
-        let trailing = system.layout_wrapped("one\n", 16.0, 500.0);
+        let trailing = system.layout_wrapped("one\n", 16.0, 500.0, &Typeface::default());
         assert_eq!(trailing.lines.len(), 2);
         assert_eq!(trailing.lines[1].start, trailing.lines[1].end);
     }
@@ -537,7 +570,7 @@ mod tests {
     fn the_caret_walks_across_wrapped_lines() {
         let mut system = TextSystem::with_embedded_font();
         let text = "alpha beta gamma delta";
-        let layout = system.layout_wrapped(text, 16.0, 60.0);
+        let layout = system.layout_wrapped(text, 16.0, 60.0, &Typeface::default());
         assert!(layout.lines.len() >= 2);
 
         // The caret x is measured inside its own line: the first char of
@@ -569,12 +602,13 @@ mod tests {
     #[test]
     fn wrap_measure_is_cached_and_agrees_with_the_layout() {
         let mut system = TextSystem::with_embedded_font();
-        let (width, height) = system.measure_wrapped("hello world", 20.0, 50.0);
-        let layout = system.layout_wrapped("hello world", 20.0, 50.0);
+        let (width, height) =
+            system.measure_wrapped("hello world", 20.0, 50.0, &Typeface::default());
+        let layout = system.layout_wrapped("hello world", 20.0, 50.0, &Typeface::default());
         assert!((width - layout.width).abs() < 0.01);
         assert!((height - layout.height).abs() < 0.01);
         assert_eq!(
-            system.measure_wrapped("hello world", 20.0, 50.0),
+            system.measure_wrapped("hello world", 20.0, 50.0, &Typeface::default()),
             (width, height)
         );
     }

@@ -660,8 +660,12 @@ fn overlay_text(scene: &mut nui_render::Scene, text: &mut nui_text::TextSystem, 
     const LINE_SPACING: f32 = 1.25;
     let red = nui_core::Color::from_rgb8(255, 99, 99);
     let mut y = MARGIN;
+    // The diagnostic overlay is framework chrome with no element behind it, so
+    // it has no `font.*` to read and takes the default face. It is the one
+    // place a typeface is not derived from a document.
+    let typeface = nui_text::Typeface::default();
     for line in message.lines().take(MAX_LINES) {
-        let shaped = text.shape(line, FONT_SIZE);
+        let shaped = text.shape(line, FONT_SIZE, &typeface);
         for glyph in &shaped.glyphs {
             let Some(quad) = text.glyph_quad(&glyph.key) else {
                 continue;

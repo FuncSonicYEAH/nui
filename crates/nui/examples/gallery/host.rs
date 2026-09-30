@@ -235,6 +235,7 @@ component Gallery {{
     // is what lets each page keep its own state without declaring it here.
     property listRows: Model
     property showcaseRows: Model
+    property showcaseWeights: Model
     property todoItems: Model
 
     Window(id = root) {{
@@ -331,6 +332,31 @@ pub(crate) fn build_registry() -> Registry {
             .collect();
         let model = engine.add_model(Box::new(VecModel::from_rows(short)));
         engine.set_direct(tree, root, "showcaseRows", Value::Model(model.0));
+
+        // The type scale. One row per step, so the page reads as a scale rather
+        // than as four unrelated lines: the weights ascend, and the last two
+        // turn the slant on at the same weights to show the axes are separate.
+        let scale: Vec<ModelRow> = [
+            ("Thin 100", 100_u16, false),
+            ("Light 300", 300, false),
+            ("Regular 400", 400, false),
+            ("Medium 500", 500, false),
+            ("Bold 700", 700, false),
+            ("Black 900", 900, false),
+            ("Italic 400", 400, true),
+            ("Bold italic 700", 700, true),
+        ]
+        .into_iter()
+        .map(|(label, weight, italic)| {
+            return vec![
+                ("label".to_string(), Value::String(label.to_string())),
+                ("weight".to_string(), Value::Int(weight as i64)),
+                ("italic".to_string(), Value::Bool(italic)),
+            ];
+        })
+        .collect();
+        let model = engine.add_model(Box::new(VecModel::from_rows(scale)));
+        engine.set_direct(tree, root, "showcaseWeights", Value::Model(model.0));
 
         // The todo rows: two of them done, so the done/undone colour and
         // the tween are both visible on arrival.

@@ -536,9 +536,14 @@ impl SceneBuilder {
             state,
             palette,
         );
+        // One read of the element's typeface for every part, rather than one
+        // per label: a control's parts are drawn in a single typeface, and the
+        // alternative is a third `Label` field that every constructor in the
+        // widget layer would have to fill.
+        let typeface = crate::props::typeface_of(element);
         let mut painted_surface = false;
         for part in parts {
-            painted_surface |= paint_part(self, part, bounds, clip, opacity, text);
+            painted_surface |= paint_part(self, part, bounds, clip, opacity, text, &typeface);
         }
         if painted_surface {
             self.sources.push(id);
@@ -684,7 +689,8 @@ impl SceneBuilder {
             .unwrap_or(1.0)
             .clamp(0.0, 1.0);
         let tint = color.with_alpha(color.alpha() * opacity);
-        let shaped = text.shape(content, font_size);
+        let typeface = crate::props::typeface_of(element);
+        let shaped = text.shape(content, font_size, &typeface);
         let content_width = shaped.width;
         self.push_placed(text, &shaped.glyphs, Point::new(x, y), tint, clip);
         if nui_runtime::widget::is_required(element) {
@@ -699,6 +705,7 @@ impl SceneBuilder {
                 y,
                 REQUIRED_COLOR.with_alpha(opacity),
                 clip,
+                &typeface,
             );
         }
         let _ = id;
@@ -794,6 +801,11 @@ impl SceneBuilder {
             .unwrap_or("")
             .to_string();
         let bounds = Rect::new(Point::new(x, y), Size::new(width, height));
+        // The caret, the selection and the underline underline are all widths
+        // of a *prefix*, so they have to be measured in the face the glyphs are
+        // drawn in. A caret placed with a regular prefix and a bold glyph above
+        // it is off by enough to see.
+        let typeface = crate::props::typeface_of(element);
         if element.is_multiline() {
             self.paint_wrapped_input(
                 &content,
@@ -801,6 +813,7 @@ impl SceneBuilder {
                 bounds,
                 inset,
                 font_size,
+                &typeface,
                 tint,
                 opacity,
                 radius,
@@ -815,6 +828,7 @@ impl SceneBuilder {
                 bounds,
                 inset,
                 font_size,
+                &typeface,
                 tint,
                 opacity,
                 clip,
@@ -838,6 +852,7 @@ impl SceneBuilder {
         bounds: Rect,
         inset: f32,
         font_size: f32,
+        typeface: &nui_text::Typeface,
         tint: Color,
         opacity: f32,
         clip: Option<ClipDraw>,
@@ -851,7 +866,16 @@ impl SceneBuilder {
         if content.display.is_empty() {
             if !placeholder.is_empty() {
                 let dim = PLACEHOLDER_COLOR.with_alpha(opacity);
-                self.push_glyphs(text, placeholder, font_size, x + inset, origin_y, dim, clip);
+                self.push_glyphs(
+                    text,
+                    placeholder,
+                    font_size,
+                    x + inset,
+                    origin_y,
+                    dim,
+                    clip,
+                    typeface,
+                );
             }
         } else {
             self.push_glyphs(
@@ -862,6 +886,7 @@ impl SceneBuilder {
                 origin_y,
                 tint,
                 clip,
+                typeface,
             );
         }
         if !focused {
@@ -874,8 +899,14 @@ impl SceneBuilder {
                 text,
                 &chars[..content.caret_text.min(chars.len())],
                 font_size,
+                typeface,
             );
-            let to = measure_width(text, &chars[..content.cursor.min(chars.len())], font_size);
+            let to = measure_width(
+                text,
+                &chars[..content.cursor.min(chars.len())],
+                font_size,
+                typeface,
+            );
             self.rects.push(RectDraw {
                 geometry: Rect::new(
                     Point::new(x + inset + from, y + height * 0.82),
@@ -892,8 +923,18 @@ impl SceneBuilder {
         // Selection highlight under the glyphs.
         let (select_from, select_to) = content.selection_display_range();
         if select_from < select_to {
-            let start_x = measure_width(text, &chars[..select_from.min(chars.len())], font_size);
-            let end_x = measure_width(text, &chars[..select_to.min(chars.len())], font_size);
+            let start_x = measure_width(
+                text,
+                &chars[..select_from.min(chars.len())],
+                font_size,
+                typeface,
+            );
+            let end_x = measure_width(
+                text,
+                &chars[..select_to.min(chars.len())],
+                font_size,
+                typeface,
+            );
             self.rects.push(RectDraw {
                 geometry: Rect::new(
                     Point::new(x + inset + start_x, origin_y),
@@ -909,8 +950,14 @@ impl SceneBuilder {
         }
         // Cursor: a 2dp caret, centred vertically; during composition it
         // sits after the preedit text.
-        let cursor_x =
-            x + inset + measure_width(text, &chars[..content.cursor.min(chars.len())], font_size);
+        let cursor_x = x
+            + inset
+            + measure_width(
+                text,
+                &chars[..content.cursor.min(chars.len())],
+                font_size,
+                typeface,
+            );
         self.rects.push(RectDraw {
             geometry: Rect::new(
                 Point::new(cursor_x, y + height * 0.2),
@@ -941,6 +988,7 @@ impl SceneBuilder {
         bounds: Rect,
         inset: f32,
         font_size: f32,
+        typeface: &nui_text::Typeface,
         tint: Color,
         opacity: f32,
         radius: f32,
@@ -949,7 +997,7 @@ impl SceneBuilder {
         focused: bool,
     ) {
         let wrap_width = (bounds.size.width - inset * 2.0).max(1.0);
-        let layout = text.layout_wrapped(&content.display, font_size, wrap_width);
+        let layout = text.layout_wrapped(&content.display, font_size, wrap_width, typeface);
         let inner_clip = push_clip(clip, bounds, radius);
         let origin = Point::new(bounds.origin.x + inset, bounds.origin.y + inset);
         if content.display.is_empty() {
@@ -963,6 +1011,7 @@ impl SceneBuilder {
                     origin.y,
                     dim,
                     inner_clip,
+                    typeface,
                 );
             }
         } else {
@@ -1318,8 +1367,9 @@ impl SceneBuilder {
         origin_y: f32,
         tint: Color,
         clip: Option<ClipDraw>,
+        typeface: &nui_text::Typeface,
     ) {
-        let shaped = text.shape(content, font_size);
+        let shaped = text.shape(content, font_size, typeface);
         self.push_placed(
             text,
             &shaped.glyphs,
@@ -1518,9 +1568,19 @@ fn text_color_of(element: &nui_runtime::Element) -> Color {
 }
 
 /// The pixel width of a char prefix at `font_size` (cursor/selection x).
-fn measure_width(text: &mut nui_text::TextSystem, chars: &[char], font_size: f32) -> f32 {
+///
+/// The typeface is a parameter rather than read from an element because there
+/// is no element here: the caller is a free function deep in the input painter.
+/// That is the reason the *caller* threads it, and the reason the caret lands
+/// under the glyphs rather than near them.
+fn measure_width(
+    text: &mut nui_text::TextSystem,
+    chars: &[char],
+    font_size: f32,
+    typeface: &nui_text::Typeface,
+) -> f32 {
     let prefix: String = chars.iter().collect();
-    return text.measure(&prefix, font_size).0;
+    return text.measure(&prefix, font_size, typeface).0;
 }
 
 /// Parses `"x,y x,y ..."` point pairs (whitespace between pairs, comma
@@ -1645,6 +1705,7 @@ fn paint_part(
     clip: Option<ClipDraw>,
     opacity: f32,
     text: &mut nui_text::TextSystem,
+    typeface: &nui_text::Typeface,
 ) -> bool {
     use crate::widget::WidgetPart;
     let origin = bounds.origin;
@@ -1770,7 +1831,7 @@ fn paint_part(
             padding,
             center_y,
         } => {
-            let line_height = text_measure_height(text, &content, size);
+            let line_height = text_measure_height(text, &content, size, typeface);
             let baseline = origin.y + center_y - line_height / 2.0;
             builder.push_glyphs(
                 text,
@@ -1780,6 +1841,7 @@ fn paint_part(
                 baseline,
                 scale(color),
                 clip,
+                typeface,
             );
             false
         }
@@ -1787,8 +1849,13 @@ fn paint_part(
 }
 
 /// The shaped height of a line, for vertical centering.
-fn text_measure_height(text: &mut nui_text::TextSystem, content: &str, size: f32) -> f32 {
-    return text.shape(content, size).height.max(size * 1.2);
+fn text_measure_height(
+    text: &mut nui_text::TextSystem,
+    content: &str,
+    size: f32,
+    typeface: &nui_text::Typeface,
+) -> f32 {
+    return text.shape(content, size, typeface).height.max(size * 1.2);
 }
 
 /// Strokes a rectangle outline as four polyline segments (the capsule

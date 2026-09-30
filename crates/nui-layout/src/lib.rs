@@ -41,6 +41,8 @@ enum Intrinsic {
         content: String,
         /// Font size in dp.
         font_size: f32,
+        /// The typeface to break it in.
+        typeface: nui_text::Typeface,
         /// Inset the painter applies on each side *beyond* the style padding
         /// taffy already removed (see [`chrome::text_inset_extra`]).
         inset: f32,
@@ -499,6 +501,28 @@ fn dp_of(value: &Value) -> Option<f32> {
     };
 }
 
+/// The typeface an element asks for, from its `font.*` properties.
+///
+/// `font.size` has its own reader (`dp_of` at each use) because a size is a
+/// length that may be written in several units, while these three are scalars
+/// or strings. Absent or malformed means the default, so a typo in a weight is
+/// a normal-looking regular run rather than a diagnostic — consistent with how
+/// every other element property behaves, and the reason `--check` in a
+/// downstream app has to evaluate bindings rather than trust the compiler.
+pub fn typeface_of(element: &Element) -> nui_text::Typeface {
+    return nui_text::Typeface::from_parts(
+        element
+            .get("font.family")
+            .and_then(|value| return value.as_str().ok()),
+        element
+            .get("font.weight")
+            .and_then(|value| return dp_of(value)),
+        element
+            .get("font.italic")
+            .and_then(|value| return value.as_bool().ok()),
+    );
+}
+
 fn length_value(dp: f32) -> taffy::style::LengthPercentage {
     return taffy::style::LengthPercentage::length(dp);
 }
@@ -542,7 +566,8 @@ pub fn layout_with_text(
                     .get("font.size")
                     .and_then(|value| return dp_of(value))
                     .unwrap_or(DEFAULT_FONT_SIZE_DP);
-                let (width, height) = text_system.measure(content, font_size);
+                let (width, height) =
+                    text_system.measure(content, font_size, &typeface_of(element));
                 return Some(Intrinsic::Fixed(taffy::prelude::Size {
                     width: width.max(1.0),
                     height: height.max(1.0),
@@ -569,6 +594,7 @@ pub fn layout_with_text(
             return Some(Intrinsic::Wrapped {
                 content,
                 font_size,
+                typeface: typeface_of(element),
                 inset: chrome::text_inset_extra(element),
             });
         };
@@ -644,13 +670,14 @@ pub fn layout_with_text(
                 let Some(intrinsic) = context.and_then(|inner| return inner.as_ref()) else {
                     return Size::ZERO;
                 };
-                let (content, font_size, inset) = match intrinsic {
+                let (content, font_size, typeface, inset) = match intrinsic {
                     Intrinsic::Fixed(size) => return *size,
                     Intrinsic::Wrapped {
                         content,
                         font_size,
+                        typeface,
                         inset,
-                    } => (content, *font_size, *inset),
+                    } => (content, *font_size, typeface, *inset),
                 };
                 let Some(text_system) = text.as_mut() else {
                     return Size::ZERO;
@@ -670,10 +697,11 @@ pub fn layout_with_text(
                         content,
                         font_size,
                         (width - inset * 2.0).max(1.0),
+                        typeface,
                     ),
                     // No definite width to wrap at: measure unwrapped, which
                     // still counts every hard line break.
-                    None => text_system.measure(content, font_size),
+                    None => text_system.measure(content, font_size, typeface),
                 };
                 return Size {
                     width: widest.max(1.0),
@@ -812,8 +840,9 @@ pub fn visual_lines(
     content: &str,
     font_size: f32,
     wrap_width: f32,
+    typeface: &nui_text::Typeface,
 ) -> Vec<nui_runtime::text_input::VisualLine> {
-    let layout = text.layout_wrapped(content, font_size, wrap_width.max(1.0));
+    let layout = text.layout_wrapped(content, font_size, wrap_width.max(1.0), typeface);
     return layout
         .lines
         .iter()
@@ -1194,7 +1223,11 @@ mod text_field_tests {
     fn a_multiline_field_grows_with_its_wrapped_lines() {
         let mut text = nui_text::TextSystem::with_embedded_font();
         let content = "alpha beta";
-        let (full, line_height) = text.measure(content, DEFAULT_FONT_SIZE_DP);
+        let (full, line_height) = text.measure(
+            content,
+            DEFAULT_FONT_SIZE_DP,
+            &nui_text::Typeface::default(),
+        );
         // A box wide enough for the *text*, but not for the text plus the
         // field's 8dp inset on each side: it must wrap into two lines, and
         // the measured height must include the inset the painter will use.
@@ -1250,7 +1283,11 @@ mod text_field_tests {
         // content plus exactly one inset's worth.
         let mut text = nui_text::TextSystem::with_embedded_font();
         let content = "alpha beta";
-        let (full, line_height) = text.measure(content, DEFAULT_FONT_SIZE_DP);
+        let (full, line_height) = text.measure(
+            content,
+            DEFAULT_FONT_SIZE_DP,
+            &nui_text::Typeface::default(),
+        );
         let box_width = full + 24.0;
 
         let mut tree = ElementTree::new();
@@ -1341,8 +1378,18 @@ mod text_field_tests {
     fn visual_lines_partition_the_text_and_carry_caret_offsets() {
         let mut text = nui_text::TextSystem::with_embedded_font();
         let content = "alpha beta gamma delta";
-        let (full, _) = text.measure(content, DEFAULT_FONT_SIZE_DP);
-        let lines = visual_lines(&mut text, content, DEFAULT_FONT_SIZE_DP, full / 2.0);
+        let (full, _) = text.measure(
+            content,
+            DEFAULT_FONT_SIZE_DP,
+            &nui_text::Typeface::default(),
+        );
+        let lines = visual_lines(
+            &mut text,
+            content,
+            DEFAULT_FONT_SIZE_DP,
+            full / 2.0,
+            &nui_text::Typeface::default(),
+        );
 
         assert!(lines.len() >= 2, "narrow enough to wrap: {lines:?}");
         assert_eq!(lines[0].start, 0);
@@ -1397,14 +1444,26 @@ mod text_field_tests {
     #[test]
     fn visual_lines_count_hard_breaks_too() {
         let mut text = nui_text::TextSystem::with_embedded_font();
-        let lines = visual_lines(&mut text, "one\ntwo\nthree", DEFAULT_FONT_SIZE_DP, 400.0);
+        let lines = visual_lines(
+            &mut text,
+            "one\ntwo\nthree",
+            DEFAULT_FONT_SIZE_DP,
+            400.0,
+            &nui_text::Typeface::default(),
+        );
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].end, 4, "the newline closes the line it ends");
         assert_eq!(lines[1].start, 4);
         assert_eq!(lines[2].end, "one\ntwo\nthree".chars().count());
         // An empty field is one empty line, not zero lines: the caret has
         // to be somewhere.
-        let empty = visual_lines(&mut text, "", DEFAULT_FONT_SIZE_DP, 400.0);
+        let empty = visual_lines(
+            &mut text,
+            "",
+            DEFAULT_FONT_SIZE_DP,
+            400.0,
+            &nui_text::Typeface::default(),
+        );
         assert_eq!(empty.len(), 1);
         assert_eq!((empty[0].start, empty[0].end), (0, 0));
         assert_eq!(empty[0].caret_x, vec![0.0]);

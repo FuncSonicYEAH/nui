@@ -337,11 +337,16 @@ impl WindowHost {
             None => String::new(),
         };
         let wrap_width = (bounds.size.width - inset * 2.0).max(1.0);
+        // Read before `&mut self.text`: the caret table has to be broken in the
+        // same face the field is painted in, or the caret drifts from the glyph
+        // it belongs to as soon as the field is anything but regular.
+        let typeface = nui_layout::typeface_of(element);
         return Some(nui_layout::visual_lines(
             &mut self.text,
             &content,
             font_size,
             wrap_width,
+            &typeface,
         ));
     }
 

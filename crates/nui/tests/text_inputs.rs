@@ -193,11 +193,15 @@ fn the_caret_line_table_matches_the_field_box() {
     let inset = nui_runtime::widget::chrome::text_inset(element);
     let font_size = nui_runtime::widget::chrome::text_size(element);
     let mut text = nui_text::TextSystem::with_embedded_font();
+    // The field's own typeface, for the same reason the host does it: the line
+    // table has to be broken in the face the field is painted in.
+    let typeface = nui_layout::typeface_of(element);
     let lines = nui_layout::visual_lines(
         &mut text,
         content,
         font_size,
         (bounds.size.width - inset * 2.0).max(1.0),
+        &typeface,
     );
     assert!(
         lines.len() > 2,
