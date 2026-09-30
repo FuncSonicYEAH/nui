@@ -355,11 +355,54 @@ pub fn check_with(document: &Document, extern_functions: &[String]) -> CheckOutc
 }
 
 /// Maps a syntax-level data operator onto its IR counterpart.
-fn init_kind(op: InitOp) -> InitKind {
+/// The kind an `=` assignment actually gets.
+///
+/// # Why `=` on a property read becomes a binding
+///
+/// `=` means "evaluate once". For a literal that is exactly what happens, and
+/// it is what makes `width = 12dp` a static value rather than a dependency. But
+/// a one-shot evaluation of `M3Shape(name = name)` is not expressible: the
+/// instance graph is built in a second pass, so at the moment the argument would
+/// be evaluated the parent property it reads may not exist yet — and the
+/// runtime's static path evaluates *literals* only, so a property read there is
+/// dropped. Silently. The component receives its declared default and renders
+/// it, which looks like a rendering bug and is not one.
+///
+/// That is the shape of every component that wraps another component, so it is
+/// not a corner case. Tracking is also what the author means by it: a wrapper
+/// passing its own property down wants the child to follow when the parent's
+/// changes, and "copied once at an unspecified moment" is not a thing anyone
+/// asks for.
+///
+/// The rule is therefore: `=` is static when the value is a literal, and a
+/// binding when it is a property read. `<-` is unchanged, and so is `= ` on
+/// everything the document can already evaluate without a tree.
+fn init_kind(op: InitOp, value: &TypedExpr) -> InitKind {
     return match op {
-        InitOp::Static => InitKind::Static,
+        InitOp::Static => {
+            if is_literal(value) {
+                InitKind::Static
+            } else {
+                InitKind::Bind
+            }
+        }
         InitOp::Bind => InitKind::Bind,
         InitOp::TwoWay => InitKind::TwoWay,
+    };
+}
+
+/// Whether a value can be evaluated without a tree.
+///
+/// The same set the runtime's `eval_literal` accepts: a constant, or an
+/// interpolation with no expression in it. Kept as a separate predicate so the
+/// two cannot drift — if `eval_literal` grows a case, this is where to note it.
+fn is_literal(value: &TypedExpr) -> bool {
+    return match value {
+        TypedExpr::Const(_) => true,
+        TypedExpr::Interp { parts } => parts
+            .iter()
+            .all(|part| return matches!(part, InterpPart::Text(_))),
+        _ => false,
     };
 }
 
@@ -440,6 +483,24 @@ impl<'source> ComponentBinder<'source> {
                 }
             }
         }
+        // The component's own element ids, which the runtime's id rewrite needs
+        // so it namespaces *these* and leaves a document-level id alone.
+        //
+        // Collected at the end rather than in `collect_info` because binding a
+        // member can declare ids the early pass has not seen -- a `For` row's
+        // prototype, or a `when` block's target.
+        //
+        // This field existed and was documented but nothing ever filled it, so
+        // the set the runtime derives was always empty. Nothing noticed,
+        // because before the id rewrite learned to consult it, *every* id was
+        // namespaced unconditionally -- the empty set never mattered. Once it
+        // is consulted, an empty set means "namespace nothing", and two
+        // instances of a component share one namespace.
+        component_ir.ids = self
+            .ids
+            .iter()
+            .map(|(name, ty)| return (name.clone(), ty.clone()))
+            .collect();
         self.check_binding_cycles();
         return component_ir;
     }
@@ -909,7 +970,7 @@ impl<'source> ComponentBinder<'source> {
                     .unwrap_or_else(|| return "<self>".to_string()),
                 name.clone(),
             ),
-            kind: init_kind(assignment.op),
+            kind: init_kind(assignment.op, &value),
             value,
         };
     }
@@ -976,7 +1037,7 @@ impl<'source> ComponentBinder<'source> {
                         .unwrap_or_else(|| return "<self>".to_string()),
                     assignment.target.parts[0].name.clone(),
                 ),
-                kind: init_kind(assignment.op),
+                kind: init_kind(assignment.op, &value),
                 value,
             };
         }
@@ -993,7 +1054,15 @@ impl<'source> ComponentBinder<'source> {
                 "two-way binding `<=>` requires a property path on the right-hand side",
             ));
         }
-        if assignment.op == InitOp::Bind
+        // The edge is recorded for whatever is *actually* reactive, not for
+        // what was written. `init_kind` promotes `=` on a property read to a
+        // binding (see its doc comment), so keying this off the syntax op
+        // would leave the promoted ones out of the cycle graph -- and
+        // `Text(content = content)`, a component property shadowing the element
+        // property of the same name, is exactly a self-edge that the runtime
+        // then loops on forever.
+        let kind = init_kind(assignment.op, &value);
+        if kind == InitKind::Bind
             && assignment.target.parts.len() == 1
             && self
                 .property_types
@@ -1011,7 +1080,7 @@ impl<'source> ComponentBinder<'source> {
             target: self.resolve_write_target(&assignment.target).unwrap_or(
                 PropertyTarget::Component(assignment.target.parts[0].name.clone()),
             ),
-            kind: init_kind(assignment.op),
+            kind,
             value,
         };
     }

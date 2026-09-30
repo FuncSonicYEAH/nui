@@ -740,15 +740,41 @@ pub fn layout_with_text(
                 element.set(slot, Value::Bool(auto));
             }
         }
+        // `offset_x` / `offset_y` shift the laid-out position.
+        //
+        // `x` and `y` are the layout's *output* -- this function writes them
+        // every pass -- so a document cannot move a child with them. That
+        // leaves no way to place something at a position the container's flow
+        // does not already put it at, which a slider handle, a switch thumb and
+        // a progress ring all need: the container is a `Stack`, so every child
+        // lands in the one cell and the only variable is where in it.
+        //
+        // The offset is added here rather than in the renderer so bounds, hit
+        // testing and drawing all agree: they all read the `x` / `y` this
+        // writes.
+        let offset_x = f32_property(element, "offset_x", 0.0) as f64;
+        let offset_y = f32_property(element, "offset_y", 0.0) as f64;
         if visible {
-            element.set("x", Value::Float(x));
-            element.set("y", Value::Float(y));
+            element.set("x", Value::Float(x + offset_x));
+            element.set("y", Value::Float(y + offset_y));
             element.set("width", Value::Float(width));
             element.set("height", Value::Float(height));
         }
         let children = element.children.clone();
         for child in children {
-            write_back(tree, child, (x, y), taffy_tree, node_map, viewport, visible);
+            // The child is positioned against its parent's *box*, so the
+            // parent's offset is part of where that box is. Without this a
+            // nested offset reads its parent at the un-offset position and the
+            // two do not compose.
+            write_back(
+                tree,
+                child,
+                (x + offset_x, y + offset_y),
+                taffy_tree,
+                node_map,
+                viewport,
+                visible,
+            );
         }
     }
     for root in tree.roots.clone() {
@@ -804,6 +830,102 @@ pub fn visual_lines(
         .collect();
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+/// The offset properties: what they are for and what they are not.
+mod offsets {
+    use super::*;
+
+    /// A `Stack` child is offset by `offset_x` / `offset_y`.
+    ///
+    /// The case that needs it: a slider's handle in a one-cell `Stack`, where
+    /// every child otherwise lands in the same place.
+    #[test]
+    fn a_stack_child_is_offset() {
+        let mut tree = ElementTree::new();
+        let stack = tree.insert(Element::new("Stack", None));
+        let child = tree.insert(Element::new("Rectangle", None));
+        tree.append_child(stack, child);
+        tree.push_root(stack);
+        tree.arena[stack].set("width", Value::Length(nui_core::Length::Dp(200.0)));
+        tree.arena[stack].set("height", Value::Length(nui_core::Length::Dp(40.0)));
+        tree.arena[child].set("width", Value::Length(nui_core::Length::Dp(20.0)));
+        tree.arena[child].set("height", Value::Length(nui_core::Length::Dp(20.0)));
+        tree.arena[child].set("offset_x", Value::Float(80.0));
+        tree.arena[child].set("offset_y", Value::Float(10.0));
+
+        layout(
+            &mut tree,
+            nui_core::Size {
+                width: 200.0,
+                height: 40.0,
+            },
+        );
+        assert_eq!(tree.arena[child].get("x"), Some(&Value::Float(80.0)));
+        assert_eq!(tree.arena[child].get("y"), Some(&Value::Float(10.0)));
+    }
+
+    /// A *nested* child's offset is relative to its own parent, and the
+    /// parent's offset carries down.
+    ///
+    /// The subtraction is the part worth pinning: the write-back recurses with
+    /// the parent's *un-offset* origin, so a child of an offset parent lands at
+    /// parent.origin + offset + child.offset rather than double-counting.
+    #[test]
+    fn a_child_offset_is_relative_to_its_own_parent() {
+        let mut tree = ElementTree::new();
+        let outer = tree.insert(Element::new("Stack", None));
+        let middle = tree.insert(Element::new("Stack", None));
+        let leaf = tree.insert(Element::new("Rectangle", None));
+        tree.append_child(outer, middle);
+        tree.append_child(middle, leaf);
+        tree.push_root(outer);
+        for (element, size) in [(outer, 200.0), (middle, 200.0), (leaf, 20.0)] {
+            tree.arena[element].set("width", Value::Length(nui_core::Length::Dp(size)));
+            tree.arena[element].set("height", Value::Length(nui_core::Length::Dp(size)));
+        }
+        tree.arena[outer].set("offset_x", Value::Float(30.0));
+        tree.arena[leaf].set("offset_x", Value::Float(7.0));
+
+        layout(
+            &mut tree,
+            nui_core::Size {
+                width: 200.0,
+                height: 200.0,
+            },
+        );
+        assert_eq!(
+            tree.arena[leaf].get("x"),
+            Some(&Value::Float(37.0)),
+            "the parent's offset and the leaf's own add up"
+        );
+    }
+
+    /// No offset declared, no change: the common case must be untouched.
+    #[test]
+    fn an_undeclared_offset_is_zero() {
+        let mut tree = ElementTree::new();
+        let stack = tree.insert(Element::new("Stack", None));
+        let child = tree.insert(Element::new("Rectangle", None));
+        tree.append_child(stack, child);
+        tree.push_root(stack);
+        tree.arena[stack].set("width", Value::Length(nui_core::Length::Dp(200.0)));
+        tree.arena[stack].set("height", Value::Length(nui_core::Length::Dp(40.0)));
+        tree.arena[child].set("width", Value::Length(nui_core::Length::Dp(20.0)));
+        tree.arena[child].set("height", Value::Length(nui_core::Length::Dp(20.0)));
+        layout(
+            &mut tree,
+            nui_core::Size {
+                width: 200.0,
+                height: 40.0,
+            },
+        );
+        assert_eq!(tree.arena[child].get("x"), Some(&Value::Float(0.0)));
+    }
+}
+
+// Gated, because a non-test build strips every `#[test]` function and leaves
+// this module's helpers unreferenced -- which `-D warnings` is right to report.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

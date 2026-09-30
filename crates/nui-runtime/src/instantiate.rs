@@ -54,10 +54,35 @@ pub fn instantiate_with(document: &DocumentIr, registry: Registry) -> Instance {
         if component.referenced {
             continue;
         }
+        // An entry component is an instance of itself, and needs the same
+        // rewrite an instance gets -- but for a different reason. `mangle_node`
+        // sends `PropertyTarget::Component(name)` to the instance element, and
+        // without it an entry component's own properties resolve to *the
+        // document's first root*: which is a different element as soon as the
+        // document has more than one entry component, and is that element's
+        // property, or nothing at all.
+        //
+        // It shows up as a component reading `0` where it declared `""`, with
+        // no diagnostic -- the property is simply a different element's.
+        let self_id = format!("entry{}::self", component.name);
+        let own: crate::mangle::OwnIds = component
+            .ids
+            .iter()
+            .map(|(id, _)| return id.clone())
+            .collect();
         for node in &component.roots {
-            let root =
-                instantiate_scoped_node(&mut tree, &mut engine, node, None, &mut instantiator);
+            let mut node = node.clone();
+            crate::mangle::mangle_node(&mut node, "", &self_id, &own);
+            let root = instantiate_scoped_node(
+                &mut tree,
+                &mut engine,
+                &node,
+                None,
+                &mut instantiator,
+                None,
+            );
             tree.push_root(root);
+            tree.register_id(&self_id, root);
             attach_machines(&mut tree, root, &component.machines);
             apply_component_properties(&mut tree, &mut engine, root, &component.properties);
         }
@@ -159,6 +184,33 @@ pub fn reload_from_source(instance: &mut Instance, source: &str) -> Result<(), S
     return Ok(());
 }
 
+/// The property values a component instance's root element must carry *before*
+/// its children are instantiated.
+///
+/// # Why they cannot wait
+///
+/// A component's subtree is built before the instance's declared properties and
+/// the caller's arguments are applied, because applying them needs the element
+/// handle. So a nested reference that *statically* initialises from a parent
+/// property -- `M3Shape(name = name)`, which is what a component wrapping
+/// another component almost always does -- reads the property's default instead
+/// of the value the caller passed.
+///
+/// A reactive binding self-corrects on the first propagate, which is before
+/// anything is laid out or drawn. A static initialiser does not: it is written
+/// once, at build time, and never again. The symptom is a component that shows
+/// the right shape in the source and the wrong one on screen, with no
+/// diagnostic anywhere -- `name` was `""`, which is a perfectly good string.
+///
+/// So the values are seeded here, at insertion, and the reactive ones are
+/// registered afterwards as usual.
+pub(crate) struct InstanceSeed<'a> {
+    /// The component's declared property defaults.
+    pub properties: &'a [nui_compiler::PropertyIr],
+    /// The caller's arguments for this reference.
+    pub reference: &'a NodeIr,
+}
+
 /// Instantiates one node (recursively) and returns its handle. `scope` is
 /// the enclosing `For` row scope for elements instantiated inside a row.
 pub(crate) fn instantiate_scoped_node(
@@ -167,6 +219,7 @@ pub(crate) fn instantiate_scoped_node(
     node: &NodeIr,
     scope: Option<crate::element::RowScope>,
     instantiator: &mut Instantiator<'_>,
+    seed: Option<&InstanceSeed<'_>>,
 ) -> ElementId {
     // A component reference expands into the referenced component's own
     // root, so the instance element is a real element in the tree with the
@@ -209,6 +262,12 @@ pub(crate) fn instantiate_scoped_node(
         });
     }
     let id = tree.insert(element);
+    // Before the children: a child's static initialiser may read this node's
+    // properties, and this element only has them because the caller passed
+    // them. See `InstanceSeed`.
+    if let Some(seed) = seed {
+        seed_instance(tree, engine, id, seed);
+    }
     // The keyboard focus order: text fields plus every control a user can
     // *operate* from the keyboard (see `widget::is_focusable_type` — a
     // Dialog is interactive but is not a tab stop).
@@ -246,7 +305,7 @@ pub(crate) fn instantiate_scoped_node(
     } else {
         for child in &node.children {
             let child_id =
-                instantiate_scoped_node(tree, engine, child, scope.clone(), instantiator);
+                instantiate_scoped_node(tree, engine, child, scope.clone(), instantiator, None);
             tree.append_child(id, child_id);
         }
     }
@@ -298,10 +357,25 @@ fn instantiate_component_instance(
     // The instance's own address. Chosen here and registered below, once
     // the element the rewrite points at actually exists.
     let self_id = format!("{prefix}self");
+    // The ids this component declares, which are the only ones the rewrite is
+    // allowed to namespace. A document-level id — one an entry component
+    // declares and this component reads (D20) — must survive verbatim, or the
+    // reference becomes `i29::shell` and every binding through it is
+    // unresolved at run time with no diagnostic, because it compiled.
+    let own: crate::mangle::OwnIds = component
+        .ids
+        .iter()
+        .map(|(id, _)| return id.clone())
+        .collect();
     let mut root_node = root_node;
-    crate::mangle::mangle_node(&mut root_node, &prefix, &self_id);
+    crate::mangle::mangle_node(&mut root_node, &prefix, &self_id, &own);
 
-    let element = instantiate_scoped_node(tree, engine, &root_node, scope, instantiator);
+    let seed = InstanceSeed {
+        properties: &properties,
+        reference,
+    };
+    let element =
+        instantiate_scoped_node(tree, engine, &root_node, scope, instantiator, Some(&seed));
     if let Some(call_site_id) = &reference.id {
         tree.register_id(call_site_id, element);
     }
@@ -328,7 +402,7 @@ fn instantiate_component_instance(
         });
     }
     for mut machine in machines {
-        crate::mangle::mangle_machine(&mut machine, &prefix, &self_id);
+        crate::mangle::mangle_machine(&mut machine, &prefix, &self_id, &own);
         attach_machine(tree, element, machine);
     }
     return element;
@@ -360,6 +434,9 @@ pub(crate) fn instantiate_prototype_node(
         node,
         scope,
         &mut Instantiator::new(ComponentCatalog::new(&[])),
+        // A `For` row cannot contain a component reference (it would have no
+        // document to expand), so there is never an instance to seed here.
+        None,
     );
 }
 
@@ -471,6 +548,38 @@ fn attach_machine(tree: &mut ElementTree, element: ElementId, machine: MachineIr
 
 /// Applies component-level property declarations onto the component instance
 /// element: static defaults write now; reactive defaults register bindings.
+/// Applies an instance's declared defaults and the caller's *static* arguments
+/// to its root element, before the subtree is built.
+///
+/// Only the static half. A reactive or two-way argument is registered as a
+/// binding and re-evaluated on the first propagate, which is early enough; a
+/// static one is written once and would otherwise be written with the wrong
+/// value.
+fn seed_instance(
+    tree: &mut ElementTree,
+    engine: &mut Engine,
+    root: ElementId,
+    seed: &InstanceSeed<'_>,
+) {
+    for property in seed.properties {
+        let Some(PropertyDefaultIr::Static(expr)) = &property.default else {
+            continue;
+        };
+        if let Some(value) = eval_literal(expr) {
+            tree.arena[root].set(&property.name, value);
+        }
+    }
+    for assignment in &seed.reference.assignments {
+        if assignment.kind == InitKind::Static {
+            apply_static(&mut tree.arena[root], assignment);
+        }
+    }
+    // The engine is not used yet: nothing here registers a binding. Kept in the
+    // signature so the two halves of seeding cannot drift apart, and so a
+    // future reactive default has somewhere obvious to go.
+    let _ = engine;
+}
+
 fn apply_component_properties(
     tree: &mut ElementTree,
     engine: &mut Engine,
