@@ -86,6 +86,18 @@ pub fn bool_property(element: &Element, name: &str) -> bool {
     return bool_property_or(element, name, false);
 }
 
+/// Reads an enum-shaped property (`variant`, `orientation`, `halign`) as
+/// its variant name.
+///
+/// Borrowed from the element rather than returned as a `String`: every
+/// caller compares it against literals, and this runs once per element per
+/// frame.
+pub fn enum_property<'a>(element: &'a Element, name: &str) -> Option<&'a str> {
+    return element
+        .get(name)
+        .and_then(|value| return value.as_enum().ok());
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

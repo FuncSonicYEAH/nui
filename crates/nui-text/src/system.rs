@@ -18,6 +18,11 @@ use crate::typeface::Typeface;
 /// uses ~1.2 for single-line text).
 const LINE_HEIGHT_FACTOR: f32 = 1.2;
 
+/// What an elided run ends with. U+2026, one glyph rather than three dots:
+/// the font's own ellipsis is spaced for the job, and a document measuring
+/// the elided string gets the same answer as the eye does.
+const ELLIPSIS: char = '\u{2026}';
+
 /// The measure-cache key for a single-line run.
 ///
 /// One named type rather than a bare tuple: the two caches differ by one field,
@@ -251,6 +256,62 @@ impl TextSystem {
             height,
             glyphs,
         };
+    }
+
+    /// Shortens `text` until it measures within `max_width`, ending the
+    /// result with `…`; returns `text` unchanged when it already fits.
+    ///
+    /// # Why a search and not a walk
+    ///
+    /// Each candidate costs a measure, so dropping one character at a time
+    /// is quadratic in the length of the string — and a long string is
+    /// exactly when elision runs. Binary search over the char boundaries
+    /// costs `log(n)` measures, and the char boundaries rather than bytes
+    /// are what keep a cut from splitting a character in half (which would
+    /// panic on a byte slice, and mojibake a CJK label even if it did not).
+    ///
+    /// The ellipsis is inside the budget, not extra: a run that fits the
+    /// box only because the `…` hangs outside it would overlap whatever
+    /// sits beside it. If not even the ellipsis fits, the answer is the
+    /// empty string — a box too narrow for one character has nothing
+    /// honest to show.
+    pub fn elide_end(
+        &mut self,
+        text: &str,
+        max_width: f32,
+        font_size: f32,
+        typeface: &Typeface,
+    ) -> String {
+        let (width, _) = self.measure(text, font_size, typeface);
+        if width <= max_width {
+            return text.to_string();
+        }
+        let (ellipsis_width, _) = self.measure(&ELLIPSIS.to_string(), font_size, typeface);
+        if ellipsis_width > max_width {
+            return String::new();
+        }
+        // `ends[k]` is the byte offset just past the first `k` characters,
+        // so `ends[0] == 0` and `ends[len] == text.len()` both address a
+        // valid slice — the search's `high` is `len`.
+        let mut ends: Vec<usize> = text.char_indices().map(|(index, _)| return index).collect();
+        ends.push(text.len());
+        let (mut low, mut high) = (0_usize, ends.len() - 1);
+        while low < high {
+            let middle = (low + high).div_ceil(2);
+            let mut candidate = text[..ends[middle]].to_string();
+            candidate.push(ELLIPSIS);
+            let (candidate_width, _) = self.measure(&candidate, font_size, typeface);
+            if candidate_width <= max_width {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        // A cut that lands after a space would leave a gap before the
+        // ellipsis; the prefix only ever gets shorter, so it still fits.
+        let mut elided = text[..ends[low]].trim_end().to_string();
+        elided.push(ELLIPSIS);
+        return elided;
     }
 
     /// Shapes `text` wrapped at `max_width`, returning the visual lines
@@ -611,6 +672,101 @@ mod tests {
             system.measure_wrapped("hello world", 20.0, 50.0, &Typeface::default()),
             (width, height)
         );
+    }
+
+    #[test]
+    fn elision_returns_a_run_that_fits_its_box() {
+        let mut system = TextSystem::with_embedded_font();
+        let typeface = Typeface::default();
+        let text = "the quick brown fox jumps over the lazy dog";
+        let (full, _) = system.measure(text, 16.0, &typeface);
+        let boxed = full / 3.0;
+        let elided = system.elide_end(text, boxed, 16.0, &typeface);
+        assert_ne!(elided, text, "the run was shortened");
+        assert!(
+            elided.ends_with('\u{2026}'),
+            "the mark is the last character: {elided:?}"
+        );
+        assert!(
+            text.starts_with(elided.trim_end_matches('\u{2026}')),
+            "what is left is a prefix of the whole: {elided:?}"
+        );
+        let (width, _) = system.measure(&elided, 16.0, &typeface);
+        assert!(width <= boxed, "elided width {width} fits {boxed}");
+    }
+
+    #[test]
+    fn the_prefix_is_the_longest_that_fits() {
+        // One repeated character and no whitespace, so the trim cannot
+        // shorten the prefix and the search's answer is exact: one more
+        // character plus the mark must overflow the box.
+        let mut system = TextSystem::with_embedded_font();
+        let typeface = Typeface::default();
+        let text = "aaaaaaaaaaaaaaaaaaaa";
+        let boxed = 60.0;
+        let elided = system.elide_end(text, boxed, 16.0, &typeface);
+        let kept = elided.chars().count() - 1;
+        assert!(kept > 0, "the box holds some of the run: {elided:?}");
+        assert!(kept < text.chars().count(), "{elided:?} was not shortened");
+        let mut longer: String = text.chars().take(kept + 1).collect();
+        longer.push('\u{2026}');
+        let (longer_width, _) = system.measure(&longer, 16.0, &typeface);
+        assert!(
+            longer_width > boxed,
+            "{longer:?} is {longer_width} and would also have fitted {boxed}"
+        );
+    }
+
+    #[test]
+    fn a_run_that_already_fits_is_untouched() {
+        let mut system = TextSystem::with_embedded_font();
+        let typeface = Typeface::default();
+        let (width, _) = system.measure("short", 16.0, &typeface);
+        assert_eq!(
+            system.elide_end("short", width + 1.0, 16.0, &typeface),
+            "short"
+        );
+    }
+
+    #[test]
+    fn elision_never_splits_a_character() {
+        let mut system = TextSystem::with_embedded_font();
+        let typeface = Typeface::default();
+        let text = "这是一段需要被截断的中文标签";
+        let (full, _) = system.measure(text, 16.0, &typeface);
+        // Every width from "nothing" to "everything" must produce a string
+        // that is a char-prefix plus the mark, never a split character.
+        for step in 1..20 {
+            let boxed = full * step as f32 / 20.0;
+            let elided = system.elide_end(text, boxed, 16.0, &typeface);
+            let prefix = elided.trim_end_matches('\u{2026}');
+            assert!(
+                text.starts_with(prefix),
+                "step {step}: {elided:?} is not a prefix of the source"
+            );
+            let (width, _) = system.measure(&elided, 16.0, &typeface);
+            assert!(
+                width <= boxed.max(0.0) + 0.01,
+                "step {step}: {width} > {boxed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_box_too_narrow_for_the_mark_shows_nothing() {
+        let mut system = TextSystem::with_embedded_font();
+        let typeface = Typeface::default();
+        assert_eq!(system.elide_end("hello", 0.0, 16.0, &typeface), "");
+        // And a wider box never shows less than a narrower one.
+        let mut previous = String::new();
+        for step in 1..12 {
+            let elided = system.elide_end("hello world", step as f32 * 8.0, 16.0, &typeface);
+            assert!(
+                elided.chars().count() >= previous.chars().count(),
+                "step {step}: {elided:?} is shorter than {previous:?}"
+            );
+            previous = elided;
+        }
     }
 
     /// The widest line of a layout, for assertions on wrapped text.

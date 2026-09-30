@@ -6,13 +6,14 @@
 //! the clip stack: `Scroll` elements (and anything with `clip = true`)
 //! clip their subtree in the shader; scroll offsets translate the subtree.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use nui_core::{Color, Point, Rect, Size};
 use nui_runtime::element::{ElementId, ElementTree};
 
 use crate::image::ImageDraw;
-use crate::props::{bool_property, color_property, dp_of, f_property};
+use crate::props::{bool_property, color_property, dp_of, enum_property, f_property};
 
 /// Default font size (dp) for `Text` elements without `font.size`.
 const DEFAULT_FONT_SIZE_DP: f32 = 16.0;
@@ -690,19 +691,39 @@ impl SceneBuilder {
             .clamp(0.0, 1.0);
         let tint = color.with_alpha(color.alpha() * opacity);
         let typeface = crate::props::typeface_of(element);
-        let shaped = text.shape(content, font_size, &typeface);
+        // `elide = end` spends the box's width on the *string* rather than
+        // on a clip: a clipped run stops mid-glyph and shows a half
+        // character, which reads as a rendering bug where `…` reads as a
+        // decision. Text is the only element that can elide — a one-line
+        // `TextInput` scrolls to its caret instead, because the caret has
+        // to stay reachable.
+        let content = match enum_property(element, "elide") {
+            Some("end") => Cow::Owned(text.elide_end(content, width, font_size, &typeface)),
+            _ => Cow::Borrowed(content),
+        };
+        let shaped = text.shape(&content, font_size, &typeface);
         let content_width = shaped.width;
-        self.push_placed(text, &shaped.glyphs, Point::new(x, y), tint, clip);
+        // `halign` / `valign` place the run *inside* its box. Both default
+        // to `start`, which is the origin the renderer has always used, so
+        // a document that says nothing sees no change.
+        let halign = alignment_of(element, "halign");
+        let valign = alignment_of(element, "valign");
+        let origin = Point::new(
+            x + (width - content_width) * halign,
+            y + (height - shaped.height) * valign,
+        );
+        self.push_placed(text, &shaped.glyphs, origin, tint, clip);
         if nui_runtime::widget::is_required(element) {
             // The asterisk trails the text, at the colour a form marker has
-            // to be to read as one (批次 6).
-            let marker_x = x + content_width + nui_runtime::widget::ASTERISK_GAP_DP;
+            // to be to read as one (批次 6). It follows the aligned run,
+            // not the box, so a centred label's marker stays beside it.
+            let marker_x = origin.x + content_width + nui_runtime::widget::ASTERISK_GAP_DP;
             self.push_glyphs(
                 text,
                 nui_runtime::widget::REQUIRED_MARK,
                 font_size,
                 marker_x,
-                y,
+                origin.y,
                 REQUIRED_COLOR.with_alpha(opacity),
                 clip,
                 &typeface,
@@ -1564,6 +1585,24 @@ fn text_color_of(element: &nui_runtime::Element) -> Color {
             Some(color) => color,
             None => Color::WHITE,
         },
+    };
+}
+
+/// `halign` / `valign` as the fraction of the leftover space that goes
+/// *before* the run: `0` for `start`, `0.5` for `center`, `1` for `end`.
+///
+/// One factor for both axes, because the two differ only in which extent
+/// they are measured against — the caller multiplies it by the free space.
+/// An unset *or unknown* variant reads as `start`: the same rule as the
+/// other readers here (a value that has not resolved yet must not move the
+/// text to an edge the author did not ask for), which also means a
+/// misspelled variant is silent. Closing that hole needs the property
+/// vocabulary the compiler does not have yet, not a special case here.
+fn alignment_of(element: &nui_runtime::Element, name: &str) -> f32 {
+    return match enum_property(element, name) {
+        Some("center") => 0.5,
+        Some("end") => 1.0,
+        _ => 0.0,
     };
 }
 
@@ -2762,5 +2801,145 @@ mod tests {
             1,
             "exactly one marker"
         );
+    }
+
+    /// A `Text` label with `content` in a box, at the tree origin.
+    fn label(content: &str, width: f32, height: f32) -> Element {
+        let mut element = widget("Text", width, height);
+        element.set("content", Value::String(content.to_string()));
+        return element;
+    }
+
+    /// Builds a scene from `elements` through `system`, so a test can ask
+    /// the same system what it shaped.
+    fn scene_of(system: &mut nui_text::TextSystem, elements: Vec<Element>) -> Scene {
+        return SceneBuilder::build_with_context(
+            &window_tree(elements),
+            system,
+            SceneContext {
+                focused: None,
+                image_keys: &HashMap::new(),
+            },
+        );
+    }
+
+    /// The leftmost / topmost quad origin of a scene.
+    fn corner_of(scene: &Scene) -> (f32, f32) {
+        let x = scene
+            .texts
+            .iter()
+            .map(|quad| return quad.origin.x)
+            .fold(f32::INFINITY, f32::min);
+        let y = scene
+            .texts
+            .iter()
+            .map(|quad| return quad.origin.y)
+            .fold(f32::INFINITY, f32::min);
+        return (x, y);
+    }
+
+    /// The right edge of the widest drawn quad.
+    fn right_edge_of(scene: &Scene) -> f32 {
+        return scene
+            .texts
+            .iter()
+            .map(|quad| return quad.origin.x + quad.size.width)
+            .fold(0.0_f32, f32::max);
+    }
+
+    #[test]
+    fn halign_and_valign_place_the_run_inside_its_box() {
+        let content = "hi";
+        let (box_width, box_height) = (200.0, 40.0);
+        let mut system = nui_text::TextSystem::with_embedded_font();
+        let typeface = nui_text::Typeface::default();
+        let (run_width, run_height) = system.measure(content, DEFAULT_FONT_SIZE_DP, &typeface);
+
+        // Glyph quads carry the mask's bearing, so the *absolute* corner is
+        // not the run's origin — but every glyph of one run shifts by the
+        // same amount, so the differences between alignments are exact.
+        let corner =
+            |system: &mut nui_text::TextSystem, halign: &str, valign: &str| -> (f32, f32) {
+                let mut element = label(content, box_width, box_height);
+                element.set("halign", Value::Enum(halign.to_string()));
+                element.set("valign", Value::Enum(valign.to_string()));
+                let scene = scene_of(system, vec![element]);
+                assert_eq!(scene.texts.len(), 2, "two glyphs drew");
+                return corner_of(&scene);
+            };
+        let (start_x, start_y) = corner(&mut system, "start", "start");
+        let (center_x, center_y) = corner(&mut system, "center", "center");
+        let (end_x, end_y) = corner(&mut system, "end", "end");
+        assert!(
+            (center_x - start_x - (box_width - run_width) / 2.0).abs() < 0.01,
+            "centred horizontally: {}",
+            center_x - start_x
+        );
+        assert!(
+            (end_x - start_x - (box_width - run_width)).abs() < 0.01,
+            "flushed to the right edge: {}",
+            end_x - start_x
+        );
+        assert!(
+            (center_y - start_y - (box_height - run_height) / 2.0).abs() < 0.01,
+            "centred vertically: {}",
+            center_y - start_y
+        );
+        assert!(
+            (end_y - start_y - (box_height - run_height)).abs() < 0.01,
+            "sitting on the bottom edge: {}",
+            end_y - start_y
+        );
+    }
+
+    #[test]
+    fn an_unset_alignment_draws_where_it_always_did() {
+        // The default has to be the pre-`halign` origin, or every existing
+        // document moves the moment this feature lands.
+        let mut system = nui_text::TextSystem::with_embedded_font();
+        let bare = scene_of(&mut system, vec![label("hi", 200.0, 40.0)]);
+        let mut explicit = label("hi", 200.0, 40.0);
+        explicit.set("halign", Value::Enum("start".to_string()));
+        let explicit = scene_of(&mut system, vec![explicit]);
+        assert_eq!(corner_of(&bare), corner_of(&explicit));
+    }
+
+    #[test]
+    fn an_elided_label_stops_inside_its_box() {
+        let content = "a label far too long for this box";
+        let (box_width, box_height) = (60.0, 20.0);
+        let mut system = nui_text::TextSystem::with_embedded_font();
+        let typeface = nui_text::Typeface::default();
+
+        let plain = scene_of(&mut system, vec![label(content, box_width, box_height)]);
+        let mut eliding = label(content, box_width, box_height);
+        eliding.set("elide", Value::Enum("end".to_string()));
+        let eliding = scene_of(&mut system, vec![eliding]);
+
+        // Nothing clips text to its box, so without `elide` the run simply
+        // runs past the right edge -- which is what `elide` exists to stop.
+        assert!(
+            right_edge_of(&plain) > box_width,
+            "the un-elided run overflows: {}",
+            right_edge_of(&plain)
+        );
+        assert!(
+            right_edge_of(&eliding) <= box_width,
+            "the elided run fits: {}",
+            right_edge_of(&eliding)
+        );
+        assert!(
+            eliding.texts.len() < plain.texts.len(),
+            "glyphs were dropped: {} vs {}",
+            eliding.texts.len(),
+            plain.texts.len()
+        );
+        // And it is the run `elide_end` names, drawn unchanged -- the
+        // marker is not a glyph the renderer bolts on afterwards.
+        let expected = system.elide_end(content, box_width, DEFAULT_FONT_SIZE_DP, &typeface);
+        assert!(expected.ends_with('\u{2026}'));
+        let same = scene_of(&mut system, vec![label(&expected, box_width, box_height)]);
+        assert_eq!(eliding.texts.len(), same.texts.len());
+        assert_eq!(corner_of(&eliding), corner_of(&same));
     }
 }
