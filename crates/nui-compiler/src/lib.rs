@@ -19,7 +19,7 @@ pub mod document;
 pub mod types;
 
 pub use bytecode::{AssignOp, Builtin, Effect, InterpPart, PropertyTarget, TypedExpr};
-pub use check::{CheckOutcome, check, check_with};
+pub use check::{CheckOutcome, check, check_with, check_with_host};
 pub use document::{
     AssignmentIr, ComponentIr, DocumentIr, ForIr, HandlerIr, InitKind, MachineIr, NodeIr,
     PropertyDefaultIr, PropertyIr, StateIr, TransitionIr, WhenIr, assign_op_name,
@@ -64,11 +64,57 @@ pub fn compile(source: &str) -> CompileOutcome {
 /// 互操作). Names not in the list still produce unknown-function
 /// diagnostics, so typos stay compile-time errors.
 pub fn compile_with_functions(source: &str, extern_functions: &[String]) -> CompileOutcome {
+    let host = HostVocabulary::new().with_functions(extern_functions.iter().cloned());
+    return compile_with_host(source, &host);
+}
+
+/// What a host can offer a document: the names it may call, and which of
+/// them are commands.
+///
+/// One type rather than two parallel parameters because the two lists
+/// belong together — a command *is* one of the callable names — and because
+/// every future addition to the host's surface (types, properties) belongs
+/// in the same place.
+#[derive(Debug, Clone, Default)]
+pub struct HostVocabulary {
+    /// Every name callable from a document, in any position.
+    pub functions: Vec<String>,
+    /// The subset of [`Self::functions`] that acts instead of returning:
+    /// legal as a statement, an error in a value position.
+    pub commands: Vec<String>,
+}
+
+impl HostVocabulary {
+    /// A vocabulary that knows no host names at all.
+    pub fn new() -> HostVocabulary {
+        return HostVocabulary::default();
+    }
+
+    /// Builder: the names a document may call.
+    pub fn with_functions(mut self, functions: impl IntoIterator<Item = String>) -> HostVocabulary {
+        self.functions.extend(functions);
+        return self;
+    }
+
+    /// Builder: declares commands, which are also callable names — a
+    /// command is registered once, not in both lists.
+    pub fn with_commands(mut self, commands: impl IntoIterator<Item = String>) -> HostVocabulary {
+        for command in commands {
+            self.functions.push(command.clone());
+            self.commands.push(command);
+        }
+        return self;
+    }
+}
+
+/// Compiles nui-lang source text against a host vocabulary; see
+/// [`HostVocabulary`].
+pub fn compile_with_host(source: &str, host: &HostVocabulary) -> CompileOutcome {
     let nui_syntax::ParseOutcome {
         document,
         mut diagnostics,
     } = nui_syntax::parse(source);
-    let outcome = check_with(&document, extern_functions);
+    let outcome = check_with_host(&document, &host.functions, &host.commands);
     diagnostics.extend(outcome.diagnostics);
     diagnostics.sort_by_key(|diagnostic| return diagnostic.span.start);
     return CompileOutcome {

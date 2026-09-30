@@ -162,8 +162,8 @@ impl<'doc> Instantiator<'doc> {
 /// the instance is left untouched and the rendered diagnostics are
 /// returned, so the caller keeps showing the last good UI.
 pub fn reload_from_source(instance: &mut Instance, source: &str) -> Result<(), String> {
-    let function_names = instance.engine.registry().function_names();
-    let outcome = nui_compiler::compile_with_functions(source, &function_names);
+    let vocabulary = instance.engine.registry().vocabulary();
+    let outcome = nui_compiler::compile_with_host(source, &vocabulary);
     if !outcome.diagnostics.is_empty() {
         let rendered = outcome
             .diagnostics

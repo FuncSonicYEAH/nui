@@ -425,11 +425,25 @@ fn cycle_path(path: &[String], repeated: &str) -> String {
 /// (plan §5 宿主互操作): calls to those names lower to [`TypedExpr::HostCall`]
 /// instead of producing an unknown-function diagnostic.
 pub fn check_with(document: &Document, extern_functions: &[String]) -> CheckOutcome {
+    return check_with_host(document, extern_functions, &[]);
+}
+
+/// [`check_with`], plus the subset of those names that are *commands*:
+/// host actions that return nothing, so a value position is an error
+/// rather than a runtime `Unresolved`.
+///
+/// Two lists rather than one because the document spells both the same way
+/// (`save()`) and only the checker can tell which one a position allows.
+pub fn check_with_host(
+    document: &Document,
+    extern_functions: &[String],
+    extern_commands: &[String],
+) -> CheckOutcome {
     let mut diagnostics = Vec::new();
     let index = DocumentIndex::build(document, &mut diagnostics);
     let mut components = Vec::new();
     for decl in &document.components {
-        let mut binder = ComponentBinder::new(decl, extern_functions, &index);
+        let mut binder = ComponentBinder::new(decl, extern_functions, extern_commands, &index);
         let component = binder.bind();
         diagnostics.append(&mut binder.diagnostics);
         components.push(component);
@@ -523,6 +537,10 @@ struct ComponentBinder<'source> {
     binding_edges: Vec<(String, String, Span)>,
     /// Host-registered function names; calls to them lower to `HostCall`.
     extern_functions: HashSet<String>,
+    /// Host-registered *command* names — the subset of [`Self::extern_functions`]
+    /// that acts rather than returns. A command is legal in statement
+    /// position only; see [`ComponentBinder::check_call`].
+    extern_commands: HashSet<String>,
     /// The document-wide component index (shared by every binder).
     index: &'source DocumentIndex,
     component: &'source ComponentDecl,
@@ -532,6 +550,7 @@ impl<'source> ComponentBinder<'source> {
     fn new(
         component: &'source ComponentDecl,
         extern_functions: &[String],
+        extern_commands: &[String],
         index: &'source DocumentIndex,
     ) -> ComponentBinder<'source> {
         return ComponentBinder {
@@ -545,6 +564,7 @@ impl<'source> ComponentBinder<'source> {
             local_count: 0,
             binding_edges: Vec::new(),
             extern_functions: extern_functions.iter().cloned().collect(),
+            extern_commands: extern_commands.iter().cloned().collect(),
             index,
             component,
         };
@@ -1388,6 +1408,12 @@ impl<'source> ComponentBinder<'source> {
         if callee.parts.len() == 1 {
             // Single-name call: a host-registered function (plan §5 宿主
             // 互操作), resolved from the runtime registry at emit time.
+            //
+            // Checked against the host's names for the same reason the
+            // *value* path is: a name the host never registered can only
+            // fail at runtime, where an evaluation error is dropped and the
+            // statement silently does nothing. A command is welcome here —
+            // statement position is the only place it is legal at all.
             let name = &callee.parts[0].name;
             let mut checked_args = Vec::new();
             for arg in args {
@@ -1398,6 +1424,13 @@ impl<'source> ComponentBinder<'source> {
                     ));
                 }
                 checked_args.push(self.check_expr(&arg.value));
+            }
+            if !self.extern_functions.contains(name) {
+                self.diagnostics.push(nui_syntax::Diagnostic::error(
+                    callee.parts[0].span,
+                    format!("unknown function `{name}`"),
+                ));
+                return None;
             }
             return Some(Effect::Call {
                 callee: vec![name.clone()],
@@ -1892,6 +1925,24 @@ impl<'source> ComponentBinder<'source> {
         };
         let Some(func) = Builtin::from_name(name) else {
             if self.extern_functions.contains(name) {
+                // A command acts; it has no value to hand back. Caught here
+                // rather than at runtime because a failed evaluation is
+                // dropped by the host (the statement or binding just does
+                // nothing) — the visible symptom would be a missing side
+                // effect with no message anywhere.
+                if self.extern_commands.contains(name) {
+                    self.diagnostics.push(nui_syntax::Diagnostic::error(
+                        *span,
+                        format!(
+                            "`{name}` is a host command and has no value; \
+                             call it as a statement instead"
+                        ),
+                    ));
+                    for arg in args {
+                        let _ = self.check_expr(&arg.value);
+                    }
+                    return TypedExpr::Error;
+                }
                 return self.check_host_call(name, args);
             }
             self.diagnostics.push(nui_syntax::Diagnostic::error(
@@ -3383,6 +3434,72 @@ mod document_id_fallback {
         assert!(
             error.contains("unknown name `label`"),
             "an instance's element id must stay inside its instance: {error}"
+        );
+    }
+
+    /// Compiles with a host vocabulary: `values` return, `commands` act.
+    fn compile_against(source: &str, values: &[&str], commands: &[&str]) -> crate::CompileOutcome {
+        let host = crate::HostVocabulary::new()
+            .with_functions(values.iter().map(|name| return (*name).to_string()))
+            .with_commands(commands.iter().map(|name| return (*name).to_string()));
+        return crate::compile_with_host(source, &host);
+    }
+
+    #[test]
+    fn a_command_is_callable_as_a_statement() {
+        let outcome = compile_against(
+            "component A { Button { on click => save(\"now\") } }",
+            &[],
+            &["save"],
+        );
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+    }
+
+    #[test]
+    fn a_command_has_no_value() {
+        // A command acts; there is nothing for an expression to read. The
+        // error has to be here rather than at run time: a failed evaluation
+        // is dropped by the host, so the only symptom would be a property
+        // that keeps its old value for no stated reason.
+        let outcome = compile_against(
+            "component A { property last: String <- save() }",
+            &[],
+            &["save"],
+        );
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| return d.message.contains("`save` is a host command")),
+            "{:?}",
+            outcome.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_value_function_is_still_callable_as_a_statement() {
+        // The reverse direction is fine and useful: `log("x")` as a
+        // statement runs the function and drops the result.
+        let outcome = compile_against(
+            "component A { Button { on click => log(\"x\") } }",
+            &["log"],
+            &[],
+        );
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+    }
+
+    #[test]
+    fn an_unregistered_statement_call_is_an_error() {
+        // Statement position used to accept *any* single name, so a typo
+        // compiled and then silently did nothing.
+        let outcome = compile("component A { Button { on click => togleTodo() } }");
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| return d.message.contains("unknown function `togleTodo`")),
+            "{:?}",
+            outcome.diagnostics
         );
     }
 }

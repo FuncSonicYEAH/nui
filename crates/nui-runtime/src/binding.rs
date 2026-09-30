@@ -1009,7 +1009,7 @@ impl Engine {
         }
         return match callee {
             [name] => {
-                self.call_host_function(name, &evaluated_args)?;
+                self.call_host_command(tree, element, name, &evaluated_args)?;
                 Ok(())
             }
             [id_name, method, ..] => {

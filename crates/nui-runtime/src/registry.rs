@@ -5,6 +5,25 @@
 //! registry's names via
 //! [`compile_with_functions`](nui_compiler::compile_with_functions), so a
 //! typo stays a compile-time error.
+//!
+//! # Two kinds of callable
+//!
+//! A [`HostFunction`] computes: it is called while an expression is being
+//! evaluated, sees only its arguments, and returns a [`Value`]. A
+//! [`HostCommand`] acts: it is called from an effect *statement*, and gets
+//! a [`BehaviorContext`] — property writes, signals, models — the same
+//! channel an element behavior uses.
+//!
+//! The split is forced by where the two run, not by taste. Expression
+//! evaluation borrows the engine immutably and tracks the properties it
+//! read to know what to recompute; a call that wrote a property there could
+//! not be accounted for. Statement execution owns the engine mutably and
+//! already expects to change things.
+//!
+//! Both are registered by name in one namespace, so a document's calls are
+//! checked against a single list ([`Registry::vocabulary`]); a command is
+//! additionally marked as one, so using it where a value is expected is a
+//! compile error.
 
 use std::collections::HashMap;
 
@@ -38,8 +57,52 @@ impl std::fmt::Display for FunctionError {
 
 impl std::error::Error for FunctionError {}
 
+/// A command's own failing and the engine's are the same kind of news to
+/// the host, so a command can use `?` on [`BehaviorContext`] calls
+/// (`context.emit(...)?`) instead of converting by hand at every line.
+impl From<EvalError> for FunctionError {
+    fn from(error: EvalError) -> FunctionError {
+        return FunctionError::new(error.to_string());
+    }
+}
+
 /// A host function callable from nui: maps evaluated arguments to a result.
 pub type HostFunction = Box<dyn Fn(&[Value]) -> Result<Value, FunctionError>>;
+
+/// A host *command*: an action callable from an effect statement, which may
+/// touch the engine and the tree.
+///
+/// The difference from [`HostFunction`] is what the two are allowed to do,
+/// not how a document spells them. A value function is called while an
+/// expression is being evaluated — the engine is borrowed immutably there,
+/// and a dependency-tracking walk has no way to notice a property the call
+/// changed — so it can only compute. A command is called from a statement,
+/// where the engine is `&mut`, and it gets the same [`BehaviorContext`] an
+/// element behavior gets: property writes, signals, models.
+///
+/// It receives the element whose effect called it, which is the element a
+/// document would have written the call on.
+pub type HostCommand =
+    Box<dyn Fn(&mut BehaviorContext<'_>, ElementId, &[Value]) -> Result<(), FunctionError>>;
+
+/// A registered command, as stored: a shared handle rather than a `Box`.
+///
+/// The engine has to hold the command *and* hand the command a mutable
+/// borrow of itself, which one `Box` cannot do — and unlike an element
+/// behavior, which is taken off the element for the call, a command stays
+/// registered while it runs. Sharing is what lets both be true at once.
+pub type HostCommandRef =
+    std::rc::Rc<dyn Fn(&mut BehaviorContext<'_>, ElementId, &[Value]) -> Result<(), FunctionError>>;
+
+/// One entry in the host callable table: a name is either a value or a
+/// command, and the registry keeps them in one namespace so that a document
+/// can be checked against a single list of names.
+enum HostCallable {
+    /// Returns a value; callable from an expression.
+    Value(HostFunction),
+    /// Acts; callable from a statement.
+    Command(HostCommandRef),
+}
 
 /// Factory creating one behavior per instantiated element.
 pub type BehaviorFactory = Box<dyn Fn() -> Box<dyn ElementBehavior>>;
@@ -128,6 +191,17 @@ impl BehaviorContext<'_> {
         return self.tree.arena[element].get(property).cloned();
     }
 
+    /// Resolves an element `id` — the name a document writes — to its
+    /// element, so a command can address one it was not called on.
+    pub fn lookup_id(&self, id: &str) -> Option<ElementId> {
+        return self.tree.lookup_id(id);
+    }
+
+    /// The element type name of `element` (`"Button"`, `"Text"`, …).
+    pub fn element_type(&self, element: ElementId) -> &str {
+        return &self.tree.arena[element].ty;
+    }
+
     /// Emits a signal from an element (fan-out to handlers, machines, and
     /// behaviors).
     pub fn emit(&mut self, element: ElementId, signal: &str) -> Result<(), EvalError> {
@@ -192,7 +266,9 @@ pub trait ElementBehavior: std::fmt::Debug {
 /// The host extension registry: custom components and host functions.
 #[derive(Default)]
 pub struct Registry {
-    functions: HashMap<String, HostFunction>,
+    /// Every callable name, both values and commands: one namespace, so a
+    /// document's names can be checked against one list.
+    functions: HashMap<String, HostCallable>,
     components: HashMap<String, ComponentDesc>,
     behaviors: HashMap<String, BehaviorFactory>,
     /// Hook run by the host every time an engine attaches the registry —
@@ -225,7 +301,22 @@ impl Registry {
 
     /// Registers a function callable from nui effects and expressions.
     pub fn register_function(&mut self, name: &str, function: HostFunction) {
-        self.functions.insert(name.to_string(), function);
+        self.functions
+            .insert(name.to_string(), HostCallable::Value(function));
+    }
+
+    /// Registers a *command*: an action callable from an effect statement,
+    /// which may touch the engine and the tree (see [`HostCommand`]).
+    ///
+    /// It counts as a callable name for the compiler like any other, so a
+    /// document needs no declaration for it — but the compiler is told
+    /// which names are commands, so using one where a value is expected is
+    /// a compile error rather than a silently-dropped evaluation failure.
+    pub fn register_command(&mut self, name: &str, command: HostCommand) {
+        self.functions.insert(
+            name.to_string(),
+            HostCallable::Command(HostCommandRef::from(command)),
+        );
     }
 
     /// Registers a custom component type: instances get the descriptor's
@@ -244,9 +335,25 @@ impl Registry {
         return self;
     }
 
-    /// The registered function with `name`, if any.
+    /// The registered *value* function with `name`, if any.
+    ///
+    /// A command is deliberately not answered here: the caller is an
+    /// expression, and a command has no value to give it.
     pub fn function(&self, name: &str) -> Option<&HostFunction> {
-        return self.functions.get(name);
+        return match self.functions.get(name) {
+            Some(HostCallable::Value(function)) => Some(function),
+            _ => None,
+        };
+    }
+
+    /// The registered command with `name`, if any. The handle is shared
+    /// rather than borrowed, so a caller can run the command while holding
+    /// a mutable borrow of the engine (see [`HostCommandRef`]).
+    pub fn command(&self, name: &str) -> Option<HostCommandRef> {
+        return match self.functions.get(name) {
+            Some(HostCallable::Command(command)) => Some(command.clone()),
+            _ => None,
+        };
     }
 
     /// The registered component descriptor with `name`, if any.
@@ -259,10 +366,42 @@ impl Registry {
         return self.behaviors.get(type_name);
     }
 
-    /// All registered function names (input for
-    /// [`compile_with_functions`](nui_compiler::compile_with_functions)).
+    /// All registered callable names — values and commands — which is what
+    /// the compiler needs to accept a document's calls at all
+    /// ([`compile_with_host`](nui_compiler::compile_with_host)).
     pub fn function_names(&self) -> Vec<String> {
         return self.functions.keys().cloned().collect();
+    }
+
+    /// The subset of [`Self::function_names`] that are commands, so the
+    /// compiler can reject a command used where a value is expected.
+    pub fn command_names(&self) -> Vec<String> {
+        return self
+            .functions
+            .iter()
+            .filter(|(_, callable)| return matches!(callable, HostCallable::Command(_)))
+            .map(|(name, _)| return name.clone())
+            .collect();
+    }
+
+    /// The vocabulary to compile a document against: every callable name,
+    /// plus which of them act rather than return.
+    ///
+    /// Built per document load (and again per hot reload) rather than
+    /// cached, so a host that registers a command mid-session gets the
+    /// checker's answer on the next compile like any other registration.
+    pub fn vocabulary(&self) -> nui_compiler::HostVocabulary {
+        // `with_commands` counts the commands as callable names too, so the
+        // separate list carries the *values* only — otherwise a command
+        // would appear in the vocabulary twice.
+        let values = self
+            .functions
+            .iter()
+            .filter(|(_, callable)| return matches!(callable, HostCallable::Value(_)))
+            .map(|(name, _)| return name.clone());
+        return nui_compiler::HostVocabulary::new()
+            .with_functions(values)
+            .with_commands(self.command_names());
     }
 }
 
@@ -287,12 +426,45 @@ impl Engine {
     ) -> Result<Value, EvalError> {
         let Some(function) = self.registry.function(name) else {
             return Err(EvalError::Unresolved {
-                what: format!("unknown function `{name}`"),
+                what: match self.registry.command(name) {
+                    // The name exists and does something; it just has
+                    // nothing to give an expression. Reachable only from a
+                    // document compiled without the host's command list.
+                    Some(_) => format!("`{name}` is a command and has no value"),
+                    None => format!("unknown function `{name}`"),
+                },
             });
         };
         return function(args).map_err(|error| {
             return EvalError::Unresolved {
                 what: format!("function `{name}`: {error}"),
+            };
+        });
+    }
+
+    /// Runs a registered host command from an effect statement, handing it
+    /// the same [`BehaviorContext`] an element behavior gets.
+    ///
+    /// `element` is the element whose effect called it. A name that is not
+    /// a command but *is* a value function falls through to
+    /// [`Self::call_host_function`] and its result is dropped: `log("x")`
+    /// as a statement is reasonable, and the reverse (a command read as a
+    /// value) is the one that cannot be made to work.
+    pub(crate) fn call_host_command(
+        &mut self,
+        tree: &mut ElementTree,
+        element: ElementId,
+        name: &str,
+        args: &[Value],
+    ) -> Result<(), EvalError> {
+        let Some(command) = self.registry.command(name) else {
+            self.call_host_function(name, args)?;
+            return Ok(());
+        };
+        let mut context = BehaviorContext { engine: self, tree };
+        return command(&mut context, element, args).map_err(|error| {
+            return EvalError::Unresolved {
+                what: format!("command `{name}`: {error}"),
             };
         });
     }

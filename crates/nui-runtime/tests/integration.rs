@@ -998,6 +998,94 @@ fn host_function_is_callable_from_bindings_and_effects() {
         .expect("host function call in effect succeeds");
 }
 
+#[test]
+fn a_host_command_can_touch_the_tree() {
+    use nui_runtime::{BehaviorContext, Registry, instantiate_with};
+
+    let source = r#"
+        component A {
+            property count: Int = 0
+            signal bumped
+
+            Window(id = root) {
+                on bumped => count += 1
+
+                Text(id = label, content <- "{count}")
+                Button(id = btn) {
+                    on click => bump(2)
+                }
+            }
+        }
+    "#;
+    let mut registry = Registry::new();
+    // A command gets the engine and the tree, which is the whole point:
+    // it reads one property, writes another, and emits a signal that the
+    // document then reacts to.
+    registry.register_command(
+        "bump",
+        Box::new(
+            |context: &mut BehaviorContext<'_>, element, args: &[nui_core::Value]| {
+                assert_eq!(
+                    context.element_type(element),
+                    "Button",
+                    "the element the effect was written on"
+                );
+                let step = args
+                    .first()
+                    .and_then(|value| return value.as_f64().ok())
+                    .unwrap_or(0.0) as i64;
+                let root = context.lookup_id("root").expect("the window has an id");
+                let count = context
+                    .property(root, "count")
+                    .and_then(|value| return value.as_f64().ok())
+                    .unwrap_or(0.0) as i64;
+                assert!(
+                    context.set_property(root, "count", nui_core::Value::Int(count + step)),
+                    "writing a different value reports the change"
+                );
+                // Signals are emitted the way a document emits them: from
+                // the element, downwards. The window hears it because the
+                // window is the element it was emitted from.
+                context.emit(root, "bumped")?;
+                return Ok(());
+            },
+        ),
+    );
+
+    // The compiler is told which names are commands, so a document that
+    // reads one as a value is rejected before any of this runs.
+    let vocabulary = registry.vocabulary();
+    let outcome = nui_compiler::compile_with_host(source, &vocabulary);
+    assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+    let misuse = nui_compiler::compile_with_host(
+        "component A { property last: String <- bump(1) }",
+        &vocabulary,
+    );
+    assert!(
+        misuse
+            .diagnostics
+            .iter()
+            .any(|diagnostic| return diagnostic.message.contains("is a host command")),
+        "{:?}",
+        misuse.diagnostics
+    );
+
+    let instance = instantiate_with(&outcome.document, registry);
+    let mut tree = instance.tree;
+    let mut engine = instance.engine;
+    engine.propagate(&mut tree);
+    let root = tree.lookup_id("root").unwrap();
+    let btn = tree.lookup_id("btn").unwrap();
+    engine
+        .emit_signal(&mut tree, btn, "click")
+        .expect("the command ran");
+    assert_eq!(
+        tree.arena[root].get("count"),
+        Some(&Value::Int(3)),
+        "two from the command, one from the handler it woken"
+    );
+}
+
 /// A custom Rust component: a counter box that increments itself on click.
 #[derive(Debug)]
 struct TallyBehavior;

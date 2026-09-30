@@ -73,7 +73,7 @@ fn snapshots() {
 
     let source = host::document();
     let registry = host::build_registry();
-    let outcome = nui_compiler::compile_with_functions(&source, &registry.function_names());
+    let outcome = nui_compiler::compile_with_host(&source, &registry.vocabulary());
     assert!(
         outcome.diagnostics.is_empty(),
         "gallery document does not compile:\n{}",
