@@ -103,7 +103,8 @@ impl WindowHost {
         display: winit::event_loop::OwnedDisplayHandle,
     ) -> Result<WindowHost, String> {
         let (image_tx, image_rx) = std::sync::mpsc::channel();
-        let outcome = nui_compiler::compile_with_functions(source, &registry.function_names());
+        let vocabulary = registry.vocabulary();
+        let outcome = nui_compiler::compile_with_host(source, &vocabulary);
         if !outcome.diagnostics.is_empty() {
             let first = &outcome.diagnostics[0];
             return Err(format!("compile error: {}", first.message));
@@ -351,11 +352,19 @@ impl WindowHost {
                 if self.activate_focused(key) {
                     return true;
                 }
-                let handled = self.engine.handle_key(&mut self.tree, key, modifiers);
-                if handled {
+                if self.engine.handle_key(&mut self.tree, key, modifiers) {
+                    self.run_frame_pipeline(nui_core::Duration::ZERO);
+                    return true;
+                }
+                // Nothing in the widget layer wanted the key, so it is the
+                // document's: `on key` gets it, with the key's name, the
+                // character it types and the modifiers written onto the
+                // focus target first.
+                let signal = self.dispatch_key_signal(key, modifiers);
+                if signal {
                     self.run_frame_pipeline(nui_core::Duration::ZERO);
                 }
-                return handled;
+                return signal;
             }
             Event::WheelScrolled { position, delta } => {
                 // A modal dialog freezes scrolling outside its subtree.

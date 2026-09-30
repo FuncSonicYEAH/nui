@@ -28,8 +28,7 @@ const VIEWPORT: Size = host::WINDOW;
 
 fn example() -> (ElementTree, Engine) {
     let source = host::document();
-    let outcome =
-        nui_compiler::compile_with_functions(&source, &host::build_registry().function_names());
+    let outcome = nui_compiler::compile_with_host(&source, &host::build_registry().vocabulary());
     assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
     let mut instance = nui_runtime::instantiate_with(&outcome.document, host::build_registry());
     instance.engine.run_registry_init(&mut instance.tree);
@@ -86,6 +85,20 @@ struct Ui {
 }
 
 impl Ui {
+    /// A UI around the shipped gallery, already settled.
+    fn new() -> Ui {
+        let (tree, engine) = example();
+        let mut ui = Ui {
+            tree,
+            engine,
+            widgets: WidgetStates::new(),
+            cursor: Point::ZERO,
+            text: nui_text::TextSystem::with_embedded_font(),
+        };
+        ui.frame();
+        return ui;
+    }
+
     fn move_to(&mut self, point: Point) {
         self.cursor = point;
         let input = nui_runtime::PointerInput {
@@ -263,4 +276,47 @@ fn switching_pages_then_clicking_each_field_focuses_and_types() {
     ui.engine
         .handle_key(&mut ui.tree, Key::Tab, Modifiers::NONE);
     assert!(ui.engine.focused().is_some(), "tab keeps focus somewhere");
+}
+
+/// The key layer, end to end: a key no widget wants reaches the window's
+/// `on key` shortcut and steps the gallery.
+///
+/// The gallery is the case the routing has to get right — nothing is
+/// focused when the window opens, and the shortcut lives on the `Window`,
+/// which is an *ancestor* of every page. If the key layer delivered to the
+/// element under the pointer, or bubbled downwards, this would do nothing.
+#[test]
+fn arrow_keys_step_through_the_pages() {
+    let mut ui = Ui::new();
+    let root = find(&ui.tree, "root");
+    assert_eq!(ui.engine.focused(), None, "nothing is focused");
+
+    let press = |ui: &mut Ui, key: Key| {
+        let _ = ui.engine.dispatch_key(&mut ui.tree, key, Modifiers::NONE);
+        ui.frame();
+    };
+    press(&mut ui, Key::ArrowRight);
+    assert_eq!(
+        ui.tree.arena[root].get("page"),
+        Some(&Value::Int(1)),
+        "ArrowRight steps to the second page"
+    );
+    press(&mut ui, Key::ArrowLeft);
+    assert_eq!(ui.tree.arena[root].get("page"), Some(&Value::Int(0)));
+    // Wrapping backwards off the first page lands on the last one, which is
+    // the arithmetic the handler does with `%`.
+    press(&mut ui, Key::ArrowLeft);
+    let last = host::PAGES.len() as i64 - 1;
+    assert_eq!(
+        ui.tree.arena[root].get("page"),
+        Some(&Value::Int(last)),
+        "the last page is page {last}"
+    );
+
+    // What the document read is an ordinary property on the window root,
+    // written by the key layer like any other host-observed state.
+    assert_eq!(
+        ui.tree.arena[root].get(nui_runtime::KEY_PROPERTY),
+        Some(&Value::String("ArrowLeft".to_string()))
+    );
 }

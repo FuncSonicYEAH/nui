@@ -223,10 +223,17 @@ pub(crate) fn document() -> String {
         ));
         content.push('\n');
     }
+    let page_count = PAGES.len();
     return format!(
         r#"
 component Gallery {{
     property page: Int = 0
+
+    // The key layer writes the last keystroke onto the window root (see
+    // `nui_runtime::keys`). Declaring the property is what makes `key` in
+    // the handler below a *read*: an undeclared name would resolve to the
+    // enum literal `key`, and the comparison would be quietly false.
+    property key: String = ""
 
     // Host-supplied models, seeded by `build_registry`. They are component
     // properties rather than element attributes on purpose: `root.x` is
@@ -239,6 +246,19 @@ component Gallery {{
     property todoItems: Model
 
     Window(id = root) {{
+        // A whole-window shortcut, so it lives on the `Window`: the key
+        // layer hands an unfocused key to the window root and bubbles it
+        // from there, and bubbling only travels upwards -- a handler on a
+        // page (a descendant) would never be reached.
+        on key => {{
+            if key == "ArrowRight" {{
+                root.page = (root.page + 1) % {page_count}
+            }}
+            if key == "ArrowLeft" {{
+                root.page = (root.page + {page_count} - 1) % {page_count}
+            }}
+        }}
+
         Row(spacing = 0dp, height = 100%) {{
             Column(id = sidebar, width = {SIDEBAR_WIDTH}dp, height = 100%,
                    spacing = 4dp, padding = 12dp, fill = #171b22) {{

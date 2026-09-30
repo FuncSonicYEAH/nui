@@ -47,6 +47,30 @@ impl Modifiers {
     pub fn is_none(&self) -> bool {
         return *self == Modifiers::NONE;
     }
+
+    /// The modifiers as one name a document can match: `"ctrl+shift"`, or
+    /// `""` when none are held.
+    ///
+    /// A single string rather than four Booleans because that is what a
+    /// shortcut table compares against, and it is what a diagnostic can
+    /// print. The order is fixed (ctrl, shift, alt, meta) so the same set
+    /// is always spelled the same way.
+    pub fn name(&self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        if self.ctrl {
+            parts.push("ctrl");
+        }
+        if self.shift {
+            parts.push("shift");
+        }
+        if self.alt {
+            parts.push("alt");
+        }
+        if self.meta {
+            parts.push("meta");
+        }
+        return parts.join("+");
+    }
 }
 
 /// Keyboard key.
@@ -86,6 +110,48 @@ pub enum Key {
     PageUp,
     /// Page down.
     PageDown,
+}
+
+impl Key {
+    /// The key's name, the spelling a document matches against in `on key`.
+    ///
+    /// A printable key is named by the character itself — `"7"`, `"+"` — so
+    /// a calculator can match what a keyboard actually sends without a
+    /// table of scancodes. The named keys use the variant's own spelling,
+    /// which is also what a diagnostic prints.
+    pub fn name(self) -> String {
+        return match self {
+            Key::Character(character) => character.to_string(),
+            Key::Enter => "Enter".to_string(),
+            Key::Escape => "Escape".to_string(),
+            Key::Backspace => "Backspace".to_string(),
+            Key::Delete => "Delete".to_string(),
+            Key::Tab => "Tab".to_string(),
+            Key::Space => "Space".to_string(),
+            Key::ArrowUp => "ArrowUp".to_string(),
+            Key::ArrowDown => "ArrowDown".to_string(),
+            Key::ArrowLeft => "ArrowLeft".to_string(),
+            Key::ArrowRight => "ArrowRight".to_string(),
+            Key::Home => "Home".to_string(),
+            Key::End => "End".to_string(),
+            Key::PageUp => "PageUp".to_string(),
+            Key::PageDown => "PageDown".to_string(),
+        };
+    }
+
+    /// The character this key types, if it types one.
+    ///
+    /// Space is [`Key::Space`], *not* [`Key::Character(' ')`]: the winit
+    /// translation names the key before it reaches the character branch, so
+    /// a caller that wants "what would be typed" has to ask here rather
+    /// than match a space character.
+    pub fn character(self) -> Option<char> {
+        return match self {
+            Key::Character(character) => Some(character),
+            Key::Space => Some(' '),
+            _ => None,
+        };
+    }
 }
 
 /// Wheel scroll delta.

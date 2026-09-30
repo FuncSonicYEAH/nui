@@ -38,7 +38,7 @@
 //! engine, the cursor position, and the gesture — and threading those
 //! through a parameters list would obscure more than the `impl` block does.
 
-use nui_core::{Key, PointerButton};
+use nui_core::{Key, Modifiers, PointerButton};
 use nui_runtime::element::ElementId;
 
 use crate::app::hit_test;
@@ -151,12 +151,19 @@ impl WindowHost {
     ///
     /// Text inputs keep their Space (a literal character) and submit on
     /// Enter through `handle_key`, so they are excluded.
+    ///
+    /// Both spellings of Space are accepted. The winit translation reports
+    /// the key as [`Key::Space`] — `NamedKey::Space` is matched before the
+    /// character branch, so [`Key::Character(' ')`] never arrives from a
+    /// real keyboard. Matching only the character spelling meant Space
+    /// activated nothing, and no test said so, because a test can build
+    /// either value by hand.
     pub(super) fn activate_focused(&mut self, key: Key) -> bool {
         let Some(focused) = self.engine.focused() else {
             return false;
         };
         if self.tree.arena[focused].is_text_input()
-            || !matches!(key, Key::Character(' ') | Key::Enter)
+            || !matches!(key, Key::Space | Key::Character(' ') | Key::Enter)
             || !nui_runtime::widget::is_activatable(&self.engine, &self.tree, focused)
         {
             return false;
@@ -165,6 +172,17 @@ impl WindowHost {
         self.update_widget_states();
         self.run_frame_pipeline(nui_core::Duration::ZERO);
         return true;
+    }
+
+    /// Hands a key the widget layer declined to the document.
+    ///
+    /// The routing is [`Engine::dispatch_key`]'s — who the key is for, the
+    /// three properties it writes, the signal it bubbles. It lives in
+    /// `nui-runtime` because that is where it can be tested: this host
+    /// cannot be built headless, so logic kept here would only be reachable
+    /// by a test that re-implemented it.
+    pub(super) fn dispatch_key_signal(&mut self, key: Key, modifiers: Modifiers) -> bool {
+        return self.engine.dispatch_key(&mut self.tree, key, modifiers);
     }
 
     /// The keyboard half of the modal gate: `Some(handled)` when the key
