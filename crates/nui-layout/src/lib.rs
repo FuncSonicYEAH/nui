@@ -14,7 +14,7 @@
 use taffy::prelude::*;
 
 use nui_core::Value;
-use nui_runtime::element::{Element, ElementId, ElementTree};
+use nui_runtime::element::{Element, ElementId, ElementTree, SLOT};
 use nui_runtime::widget::chrome;
 
 /// Default font size (dp) for `Text` elements without an explicit
@@ -86,12 +86,16 @@ impl Arrangement {
     /// consequence is the title inset folded into their top padding.
     fn of(element: &Element) -> Option<Arrangement> {
         return match element.ty.as_str() {
-            "Window" | "Column" | "Panel" | "Card" | "Dialog" | "For" | "Scroll" | "ListView" => {
-                Some(Arrangement::Flex {
-                    direction: taffy::FlexDirection::Column,
-                    wrap: false,
-                })
-            }
+            // `Slot` is a plain column: it holds whatever a call site passed
+            // and otherwise gets out of the way. It is not a `Column` by
+            // another name -- a column the caller can style is a different
+            // thing from a hole in a component's layout, and conflating them
+            // would make `spacing` on a slot a silently-ignored property.
+            "Window" | "Column" | "Panel" | "Card" | "Dialog" | "For" | "Scroll" | "ListView"
+            | SLOT => Some(Arrangement::Flex {
+                direction: taffy::FlexDirection::Column,
+                wrap: false,
+            }),
             "Row" => Some(Arrangement::Flex {
                 direction: taffy::FlexDirection::Row,
                 wrap: false,

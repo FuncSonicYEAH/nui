@@ -18,6 +18,7 @@ use nui_compiler::{
 use nui_core::Value;
 
 use crate::binding::{Binding, Engine, TwoWayEdge};
+use crate::element::SLOT;
 use crate::element::{
     Element, ElementId, ElementTree, FOR_VALUE_PROPERTY, ForBinding, HandlerEntry, WhenEntry,
 };
@@ -376,6 +377,29 @@ fn instantiate_component_instance(
     };
     let element =
         instantiate_scoped_node(tree, engine, &root_node, scope, instantiator, Some(&seed));
+    // The slot: the call site's content, dropped into the `Slot` element the
+    // component declares. Done after the subtree exists because the slot is
+    // found by looking at what was built, not by re-deriving from the
+    // component's IR -- the slot can sit anywhere in the subtree, and the
+    // instantiator is what knows where.
+    //
+    // The content is the *reference's* nodes, so it is not namespaced with the
+    // instance prefix: an `id` inside a slot belongs to the call site, exactly
+    // as it would outside a component.
+    for slot in tree.descendants_of_type(element, SLOT) {
+        let slot_scope = tree.arena[slot].for_scope.clone();
+        for child in &reference.children {
+            let child_id = instantiate_scoped_node(
+                tree,
+                engine,
+                child,
+                slot_scope.clone(),
+                instantiator,
+                None,
+            );
+            tree.append_child(slot, child_id);
+        }
+    }
     if let Some(call_site_id) = &reference.id {
         tree.register_id(call_site_id, element);
     }

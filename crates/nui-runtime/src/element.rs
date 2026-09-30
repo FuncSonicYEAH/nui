@@ -300,6 +300,15 @@ impl Element {
     }
 }
 
+/// The element a component declares to receive a call site's content.
+///
+/// Spelled here and in the compiler rather than shared, because the compiler
+/// cannot depend on the runtime and this is one string. Both are checked
+/// against each other by the slot tests: a document that declares `Slot` and a
+/// runtime that looks for a different name fails every slot at once, with
+/// content simply not appearing.
+pub const SLOT: &str = "Slot";
+
 /// The element arena: flat storage plus root list and id resolution.
 #[derive(Debug, Default)]
 pub struct ElementTree {
@@ -332,6 +341,35 @@ impl ElementTree {
     /// Appends a root element.
     pub fn push_root(&mut self, root: ElementId) {
         self.roots.push(root);
+    }
+
+    /// Visits `id` and its descendants, in pre-order.
+    ///
+    /// [`Self::visit_pre_order`] walks from the roots, which is the right shape
+    /// for a whole-tree pass. Filling a component's slot needs the other one:
+    /// the *instance's* subtree, not the document's, and a document can have
+    /// several instances of the same component. Walking from the roots would
+    /// find every instance's slot on the first instance.
+    pub fn visit_subtree(&self, id: ElementId, mut visit: impl FnMut(ElementId, &Element)) {
+        fn walk(tree: &ElementTree, id: ElementId, visit: &mut impl FnMut(ElementId, &Element)) {
+            let element = &tree.arena[id];
+            visit(id, element);
+            for child in &element.children {
+                walk(tree, *child, visit);
+            }
+        }
+        walk(self, id, &mut visit);
+    }
+
+    /// The descendants of `id` that are elements of type `ty`, in pre-order.
+    pub fn descendants_of_type(&self, id: ElementId, ty: &str) -> Vec<ElementId> {
+        let mut found = Vec::new();
+        self.visit_subtree(id, |candidate, element| {
+            if element.ty == ty {
+                found.push(candidate);
+            }
+        });
+        return found;
     }
 
     /// Registers an id name for an element (later declaration wins for

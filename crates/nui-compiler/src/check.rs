@@ -55,6 +55,8 @@ pub fn check(document: &Document) -> CheckOutcome {
 struct ComponentSignature {
     /// The declared component's name (for diagnostics).
     name: String,
+    /// Whether the component declares a `Slot` to receive a call site's content.
+    has_slot: bool,
     /// Declared property name -> declared type (`Unknown` when inferred
     /// from a default, which the pre-pass does not evaluate).
     properties: HashMap<String, Type>,
@@ -249,6 +251,18 @@ impl DocumentIndex {
 /// the referenced component's own references are collected when *its*
 /// declaration is processed. That keeps the edge set one level per
 /// declaration, which is what the cycle walk above expects.
+/// Collects every component a subtree instantiates, with the span of the node
+/// that named each one.
+///
+/// A reference's *body* is walked as well as recorded. It has to be, since the
+/// slot: the children of a component reference are the caller's content, and
+/// that content can instantiate further components. Stopping at the reference
+/// -- which is what this did -- made every component below a slot look
+/// unreferenced, and an unreferenced component is instantiated as a *tree root*
+/// by the runtime. So a gallery whose pages were all inside one `M3Page` ended
+/// up with a `M3Fab` and a `M3IconButton` drawn at the origin with their default
+/// empty icon names, and no diagnostic anywhere: the icon atlas lookup failed at
+/// run time, in a component nobody had asked for.
 fn collect_node_references(
     node: &NodeDecl,
     signatures: &HashMap<String, ComponentSignature>,
@@ -256,7 +270,8 @@ fn collect_node_references(
 ) {
     if signatures.contains_key(&node.ty.name) {
         out.push((node.ty.name.clone(), node.ty.span));
-        return;
+        // Not a `return`: the reference's body is the caller's slot content,
+        // which may instantiate components of its own.
     }
     for member in &node.body {
         if let NodeMember::Node(child) = member {
@@ -286,10 +301,81 @@ fn collect_node_ids(node: &NodeDecl, out: &mut HashMap<String, String>) {
     }
 }
 
+/// The edge-graph node a *node's* own property is recorded against.
+///
+/// `None` for the component's root, where the node's property and the
+/// component's property are the same slot -- so the key must coincide for a real
+/// self-assignment to be caught. A distinct sink for a nested node, whose
+/// property lives on a different element entirely.
+fn node_edge_sink(is_root: bool) -> Option<&'static str> {
+    if is_root {
+        return None;
+    }
+    return Some(NESTED_NODE_SINK);
+}
+
+/// The edge-graph node a component argument's target is recorded against.
+///
+/// A name nothing writes, so an edge into it cannot close a cycle. See
+/// [`ComponentBinder::bind_node_assignment`] for why a component argument needs
+/// one at all.
+const ARGUMENT_SINK: &str = "<argument>";
+
+/// The edge-graph node a nested node's own property is recorded against.
+const NESTED_NODE_SINK: &str = "<node>";
+
+/// The element a component declares to receive a call site's content.
+///
+/// A name, not a type, because the language has no user-defined types: a
+/// component is the only way to name anything, and the slot is part of a
+/// component's contract. `Slot` is otherwise an ordinary element -- it lays out
+/// as a plain column and paints nothing -- so a document can use it outside a
+/// component and get a transparent column, which is harmless and consistent.
+const SLOT: &str = "Slot";
+
+/// Every `Slot` in a subtree, with the span of the node that declares it.
+fn collect_slot_spans(node: &NodeDecl, out: &mut Vec<Span>) {
+    if node.ty.name == SLOT {
+        out.push(node.ty.span);
+    }
+    for member in &node.body {
+        let NodeMember::Node(child) = member else {
+            continue;
+        };
+        collect_slot_spans(child, out);
+    }
+}
+
+/// Whether a component declaration contains a `Slot`.
+///
+/// Walks the whole body rather than just the root, because a slot usually sits
+/// nested inside a `Column` that gives the content a frame -- which is the
+/// point of having one.
+fn declares_slot(decl: &ComponentDecl) -> bool {
+    fn in_node(node: &NodeDecl) -> bool {
+        if node.ty.name == SLOT {
+            return true;
+        }
+        return node.body.iter().any(|member| {
+            let NodeMember::Node(child) = member else {
+                return false;
+            };
+            return in_node(child);
+        });
+    }
+    return decl.members.iter().any(|member| {
+        let ComponentMember::Node(node) = member else {
+            return false;
+        };
+        return in_node(node);
+    });
+}
+
 /// The declared API of one component declaration.
 fn signature_of(decl: &ComponentDecl) -> ComponentSignature {
     let mut signature = ComponentSignature {
         name: decl.name.name.clone(),
+        has_slot: declares_slot(decl),
         span: decl.name.span,
         properties: HashMap::new(),
         signals: HashSet::new(),
@@ -479,7 +565,7 @@ impl<'source> ComponentBinder<'source> {
                     component_ir.machines.push(self.bind_machine(decl));
                 }
                 ComponentMember::Node(node) => {
-                    component_ir.roots.push(self.bind_node(node));
+                    component_ir.roots.push(self.bind_node(node, true));
                 }
             }
         }
@@ -501,8 +587,44 @@ impl<'source> ComponentBinder<'source> {
             .iter()
             .map(|(name, ty)| return (name.clone(), ty.clone()))
             .collect();
+        self.check_slots();
         self.check_binding_cycles();
         return component_ir;
+    }
+
+    /// A component declares where a call site's children land, with `Slot`.
+    ///
+    /// Two rules, both about making the mistake loud:
+    ///
+    /// - **At most one slot per component.** With one, a call site's content
+    ///   has exactly one possible home, so there is no ordering question. More
+    ///   than one would need names, and an unnamed second slot would be
+    ///   ambiguous -- so it is refused rather than half-supported.
+    /// - **Content needs a slot to go into.** A reference that passes children
+    ///   to a component with no `Slot` would silently drop them, which is the
+    ///   exact failure this feature exists to prevent, so it is a diagnostic.
+    ///
+    /// Reported here rather than at each call site so the message names the
+    /// component, which is where the fix is.
+    fn check_slots(&mut self) {
+        let mut slots: Vec<Span> = Vec::new();
+        for member in &self.component.members {
+            let ComponentMember::Node(node) = member else {
+                continue;
+            };
+            collect_slot_spans(node, &mut slots);
+        }
+        for extra in slots.iter().skip(1) {
+            self.diagnostics.push(nui_syntax::Diagnostic::error(
+                *extra,
+                format!(
+                    "component `{}` declares more than one `{SLOT}`; a component has \
+                     exactly one place a call site's content can go, so merge them \
+                     or wrap the second in its own element",
+                    self.component.name.name
+                ),
+            ));
+        }
     }
 
     /// First pass: collect property names, signals, machines, and ids so
@@ -712,7 +834,17 @@ impl<'source> ComponentBinder<'source> {
         };
     }
 
-    fn bind_node(&mut self, decl: &NodeDecl) -> NodeIr {
+    /// `is_root` says whether this node *is* the component instance.
+    ///
+    /// It decides the edge-graph key for the node's own properties, and the
+    /// distinction is the difference between a real cycle and a common idiom. A
+    /// component property and the **root** element's property of the same name
+    /// are one slot on one element: `Text(content = content)` is genuinely
+    /// `content <- content`, and the runtime loops on it. A *nested* node's
+    /// property is a different slot on a different element, so
+    /// `Column(width = width)` is the ordinary way to size a child from a
+    /// component property, and the two must not share a node in this graph.
+    fn bind_node(&mut self, decl: &NodeDecl, is_root: bool) -> NodeIr {
         // A node whose type names a component declared in this document is
         // a *reference*, not an element: the subtree lives in that
         // component, and this node carries the call site's arguments and
@@ -740,7 +872,8 @@ impl<'source> ComponentBinder<'source> {
                     node.id = Some(id.name.clone());
                 }
                 NodeArg::Property(assignment) => {
-                    assignments_from_args.push(self.bind_node_assignment(assignment, &node));
+                    let sink = node_edge_sink(is_root);
+                    assignments_from_args.push(self.bind_node_assignment(assignment, &node, sink));
                 }
                 NodeArg::Handler(handler) => {
                     handlers_from_args.push(self.bind_handler(handler));
@@ -769,22 +902,23 @@ impl<'source> ComponentBinder<'source> {
             self.push_scope();
             self.declare_local(&binding.variable.name, Type::Unknown);
             self.reject_component_in_for(decl);
-            self.bind_node_members(&mut node, &decl.body);
+            self.bind_node_members(&mut node, &decl.body, is_root);
             self.pop_scope();
             return node;
         }
-        self.bind_node_members(&mut node, &decl.body);
+        self.bind_node_members(&mut node, &decl.body, is_root);
         return node;
     }
 
     /// Binds body members in source order; handlers and `when` blocks are
     /// appended to the node, child nodes recurse.
-    fn bind_node_members(&mut self, node: &mut NodeIr, members: &[NodeMember]) {
+    fn bind_node_members(&mut self, node: &mut NodeIr, members: &[NodeMember], is_root: bool) {
         for member in members {
             match member {
                 NodeMember::Assignment(assignment) => {
+                    let sink = node_edge_sink(is_root);
                     node.assignments
-                        .push(self.bind_node_assignment(assignment, node));
+                        .push(self.bind_node_assignment(assignment, node, sink));
                 }
                 NodeMember::Handler(handler) => {
                     node.handlers.push(self.bind_handler(handler));
@@ -794,7 +928,7 @@ impl<'source> ComponentBinder<'source> {
                     node.when_blocks.push(bound);
                 }
                 NodeMember::Node(child) => {
-                    node.children.push(self.bind_node(child));
+                    node.children.push(self.bind_node(child, false));
                 }
             }
         }
@@ -837,12 +971,20 @@ impl<'source> ComponentBinder<'source> {
     /// `id`, the arguments written against the instance, and the handlers
     /// for the component's declared signals.
     ///
-    /// The body is deliberately narrow: handlers only. A child node, a
-    /// body assignment or a `when` block would each need a rule about
-    /// *where* in the referenced subtree it lands, and every such rule is
-    /// a silent-surprise waiting to happen. Properties go in the argument
-    /// list instead, which is checked against the component's declared
-    /// types.
+    /// The body carries a handler, or the slot's content, and nothing else.
+    ///
+    /// Handlers subscribe to the component's own signals, which the checker
+    /// validates against the declaration. Child nodes are the *slot*: they
+    /// replace the `Slot` element the referenced component declares, and
+    /// because they are bound here they belong to the caller's scope rather
+    /// than the callee's -- which is what makes a slot useful.
+    ///
+    /// A body assignment and a `when` block are still rejected. Each would need
+    /// a rule about *where* in the referenced subtree it lands, and `when` has
+    /// no answer at all: its condition would be evaluated once at instantiation
+    /// and never again, which is a silent surprise rather than a limitation.
+    /// Properties go in the argument list instead, checked against the
+    /// component's declared types.
     fn bind_component_reference(&mut self, decl: &NodeDecl, target: &ComponentSignature) -> NodeIr {
         let mut node = NodeIr {
             ty: decl.ty.name.clone(),
@@ -893,11 +1035,25 @@ impl<'source> ComponentBinder<'source> {
                     self.require_component_signal(handler, target);
                     node.handlers.push(self.bind_handler(handler));
                 }
-                NodeMember::Node(node) => self.reject_reference_body_member(
-                    node.ty.span,
-                    decl.ty.name.as_str(),
-                    "child nodes",
-                ),
+                // Child nodes are the slot. They land in the referenced
+                // component's `Slot` element, and because they are bound
+                // *here* they belong to the caller's scope rather than the
+                // callee's -- which is the whole point: an `id` or a
+                // `shell.dark` inside a slot means what it says in the
+                // component that wrote it.
+                NodeMember::Node(child) => {
+                    if !target.has_slot {
+                        self.diagnostics.push(nui_syntax::Diagnostic::error(
+                            child.ty.span,
+                            format!(
+                                "`{}` takes no content: it declares no `{SLOT}`, so \
+                                 these child nodes have nowhere to go",
+                                decl.ty.name
+                            ),
+                        ));
+                    }
+                    node.children.push(self.bind_node(child, false));
+                }
                 NodeMember::Assignment(assignment) => self.reject_reference_body_member(
                     assignment.span,
                     decl.ty.name.as_str(),
@@ -943,7 +1099,7 @@ impl<'source> ComponentBinder<'source> {
     ) -> AssignmentIr {
         let name = &assignment.target.parts[0].name;
         let Some(declared) = target.properties.get(name) else {
-            return self.bind_node_assignment(assignment, node);
+            return self.bind_node_assignment(assignment, node, Some(ARGUMENT_SINK));
         };
         let value = self.check_expr(&assignment.value);
         let value_ty = value.type_of();
@@ -1001,10 +1157,20 @@ impl<'source> ComponentBinder<'source> {
     /// Binds an assignment whose target is a node's own property
     /// (constructor args and node-body assignments): a bare path addresses
     /// the node itself, not the component.
+    /// `edge_sink` names the node the recorded edge points *at*.
+    ///
+    /// For an ordinary assignment that is the property itself. For a
+    /// component argument it cannot be: the argument lands on the *callee's*
+    /// element while the value reads the *caller's*, so keying both on the bare
+    /// property name makes `Wrapper(icon = icon)` look like `icon <- icon` --
+    /// a cycle that does not exist, and the shape every slot-bearing component
+    /// is written in. A distinct sink is a node nothing writes, so the edge can
+    /// never close a loop.
     fn bind_node_assignment(
         &mut self,
         assignment: &PropertyAssignment,
         node: &NodeIr,
+        edge_sink: Option<&str>,
     ) -> AssignmentIr {
         if assignment.target.parts.len() == 1
             && !self
@@ -1041,10 +1207,14 @@ impl<'source> ComponentBinder<'source> {
                 value,
             };
         }
-        return self.bind_assignment(assignment);
+        return self.bind_assignment(assignment, edge_sink);
     }
 
-    fn bind_assignment(&mut self, assignment: &PropertyAssignment) -> AssignmentIr {
+    fn bind_assignment(
+        &mut self,
+        assignment: &PropertyAssignment,
+        edge_sink: Option<&str>,
+    ) -> AssignmentIr {
         let value = self.check_expr(&assignment.value);
         if assignment.op == InitOp::TwoWay
             && !matches!(&assignment.value, Expr::Ident { .. } | Expr::Member { .. })
@@ -1068,7 +1238,8 @@ impl<'source> ComponentBinder<'source> {
                 .property_types
                 .contains_key(&assignment.target.parts[0].name)
         {
-            self.record_binding_edge(&assignment.target.parts[0].name, &value, assignment.span);
+            let sink = edge_sink.unwrap_or(&assignment.target.parts[0].name);
+            self.record_binding_edge(sink, &value, assignment.span);
         }
         return AssignmentIr {
             path: assignment
@@ -1099,7 +1270,7 @@ impl<'source> ComponentBinder<'source> {
         let assignments = when
             .assignments
             .iter()
-            .map(|assignment| return self.bind_node_assignment(assignment, node))
+            .map(|assignment| return self.bind_node_assignment(assignment, node, None))
             .collect();
         return WhenIr {
             condition,
@@ -2928,6 +3099,108 @@ component Widgets {
 /// These are the properties the change is *allowed* to have, written down next
 /// to the implementation so a later change to the resolution order is caught
 /// here rather than discovered in a downstream project.
+/// The cycle graph's keys: a nested node's property is not the component's, and
+/// a component argument's target is not either.
+#[cfg(test)]
+mod edge_keys {
+    use crate::compile;
+
+    fn expect_clean(source: &str) {
+        let outcome = compile(source);
+        assert!(
+            outcome.diagnostics.is_empty(),
+            "should compile cleanly: {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    /// A nested node's property is not the component's property of that name.
+    ///
+    /// `Column(width = width)` is the ordinary way to size a child from a
+    /// component property, and the two are different slots on different
+    /// elements: the value reads the *instance* and the target is the *Column*.
+    /// Keying both on `width` in the cycle graph made that a self-edge, so every
+    /// slot-bearing component that passed a property down was reported as a
+    /// cycle.
+    #[test]
+    fn a_nested_node_may_reuse_a_component_property_name() {
+        expect_clean(
+            r#"
+            component Panel {
+                property width: Float = 300.0
+                Scroll(id = self) {
+                    Column(width = width, height = 100%) { }
+                }
+            }
+            component App {
+                Window(id = shell) { Panel(width = 600.0) }
+            }
+        "#,
+        );
+    }
+
+    /// The root element's property of the same name *is* a cycle.
+    ///
+    /// The counterpart, and the reason the fix is a distinction rather than a
+    /// blanket new key: on the root the component property and the element
+    /// property are the same slot on the same element, so
+    /// `Text(content = content)` is `content <- content` and the runtime loops on
+    /// it forever. Un-sharing *every* key would have lost this one.
+    #[test]
+    fn the_root_element_property_is_a_real_cycle() {
+        let outcome = compile(
+            r#"
+            component Label {
+                property content: String = ""
+                Text(id = self, content = content) { }
+            }
+            component App {
+                Window(id = shell) { Label(content = "x") }
+            }
+        "#,
+        );
+        let error = outcome
+            .diagnostics
+            .iter()
+            .map(|diagnostic| return diagnostic.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            error.contains("reactive binding cycle"),
+            "a root element shadowing a component property is a real cycle: {error}"
+        );
+    }
+
+    /// `Wrapper(icon = icon)` is not a cycle.
+    ///
+    /// The argument lands on the *callee's* element and the value reads the
+    /// *caller's*, so the two are different properties on different elements. The
+    /// edge graph keys on names, and without a distinct sink for the argument
+    /// the edge reads `icon <- icon` -- a cycle that does not exist.
+    ///
+    /// Reachable whenever the caller and the callee both use a name but only one
+    /// declares it, which is what happens the moment a component renames a
+    /// property. The shape every slot-bearing component is written in:
+    /// `Frame(icon = icon)`.
+    #[test]
+    fn passing_a_property_to_an_undeclared_argument_is_not_a_cycle() {
+        expect_clean(
+            r#"
+            component Inner {
+                Rectangle(id = box, radius = 4dp) { }
+            }
+            component Outer {
+                property icon: String = "x"
+                Stack(id = self) { Inner(icon = icon) }
+            }
+            component App {
+                Window(id = shell) { Outer(icon = "home") }
+            }
+        "#,
+        );
+    }
+}
+
 #[cfg(test)]
 mod document_id_fallback {
     use crate::compile;

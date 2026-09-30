@@ -536,15 +536,193 @@ fn a_component_property_argument_is_type_checked() {
     assert!(rendered.contains("expected Int"), "{rendered}");
 }
 
-#[test]
-fn a_component_reference_takes_no_child_nodes() {
-    let rendered = diagnostics_of(
-        r#"
-        component Chip { Rectangle(id = box) {} }
-        component App { Window(id = root) { Chip(id = a) { Text(content = "x") } } }
-    "#,
-    );
-    assert!(rendered.contains("takes no child nodes"), "{rendered}");
+/// The slot: a component declares a `Slot`, a call site fills it.
+///
+/// These are the properties the feature is *allowed* to have, written down
+/// next to the implementation so a later change is caught here rather than
+/// discovered by a component that quietly renders nothing.
+mod slot {
+    use super::*;
+    use nui_runtime::element::{ElementId, SLOT as SLOT_ID};
+
+    /// Content lands inside the component, in the slot's place.
+    ///
+    /// The load-bearing case: the point of a slot is that the caller decides
+    /// *what* is in the middle of someone else's layout, and the component still
+    /// owns everything around it.
+    #[test]
+    fn content_lands_in_the_slot() {
+        let (tree, _engine) = build(
+            r#"
+            component Frame {
+                Stack(id = self, width = 200dp, height = 200dp) {
+                    Rectangle(id = head, width = 200dp, height = 40dp)
+                    Slot { }
+                }
+            }
+            component App {
+                Window(id = root, width = 400dp, height = 400dp) {
+                    Frame { Rectangle(id = body, width = 200dp, height = 80dp) }
+                }
+            }
+            "#,
+        );
+        let root = tree.lookup_id("root").expect("the window");
+        let slot = tree
+            .descendants_of_type(root, SLOT_ID)
+            .first()
+            .copied()
+            .expect("a slot element");
+        let body = tree.lookup_id("body").expect("the slotted content");
+        assert_eq!(
+            tree.arena[body].parent,
+            Some(slot),
+            "the content is a child of the slot, not a sibling of it"
+        );
+    }
+
+    /// The content keeps the *caller's* scope, not the component's.
+    ///
+    /// This is what makes a slot usable rather than merely possible: a
+    /// component's internals are namespaced per instance, so a slotted node
+    /// that came in already-namespaced would be renamed twice and its `id`
+    /// would be unreachable from the document that wrote it.
+    #[test]
+    fn content_is_in_the_callers_scope() {
+        let (tree, _engine) = build(
+            r#"
+            component Frame { Column(id = self) { Slot { } } }
+            component App {
+                property dark: Bool = true
+                Window(id = root, width = 400dp, height = 400dp) {
+                    Frame { Rectangle(id = mine, fill = #ff0000) }
+                }
+            }
+            "#,
+        );
+        let mine = tree
+            .lookup_id("mine")
+            .expect("the content's id is reachable");
+        // Not `i1::mine`: the caller's name, unprefixed.
+        assert!(
+            tree.lookup_id("i1::mine").is_none(),
+            "the content must not be namespaced with the instance"
+        );
+        assert_eq!(tree.arena[mine].ty, "Rectangle");
+    }
+
+    /// Two instances of a slotted component each get their own content.
+    ///
+    /// The bug this catches is a slot filled from the *first* instance's
+    /// subtree, which would put instance one's content in instance two.
+    #[test]
+    fn each_instance_gets_its_own_content() {
+        let (tree, _engine) = build(
+            r#"
+            component Frame { Column(id = self) { Slot { } } }
+            component App {
+                Window(id = root, width = 400dp, height = 400dp) {
+                    Row {
+                        Frame { Rectangle(id = one) }
+                        Frame { Rectangle(id = two) }
+                    }
+                }
+            }
+            "#,
+        );
+        let one = tree.lookup_id("one").expect("first content");
+        let two = tree.lookup_id("two").expect("second content");
+        let slot_of = |content: ElementId| -> Option<ElementId> {
+            let mut parent = tree.arena[content].parent;
+            while let Some(id) = parent {
+                if tree.arena[id].ty == SLOT_ID {
+                    return Some(id);
+                }
+                parent = tree.arena[id].parent;
+            }
+            return None;
+        };
+        assert_ne!(
+            slot_of(one),
+            slot_of(two),
+            "both instances put their content in one slot"
+        );
+    }
+
+    /// Content with no slot to go into is an error, not a silent drop.
+    #[test]
+    fn content_without_a_slot_is_reported() {
+        let rendered = diagnostics_of(
+            r#"
+            component Chip { Rectangle(id = box) {} }
+            component App {
+                Window(id = root) { Chip { Text(content = "x") } }
+            }
+        "#,
+        );
+        assert!(rendered.contains("declares no `Slot`"), "{rendered}");
+    }
+
+    /// Two slots in one component is an error, because "which one?" has no
+    /// good answer and guessing one is worse than refusing.
+    #[test]
+    fn two_slots_are_reported() {
+        let rendered = diagnostics_of(
+            r#"
+            component Frame {
+                Stack(id = self) { Slot { } Slot { } }
+            }
+            component App { Window(id = root) { Frame { Rectangle(id = x) } } }
+        "#,
+        );
+        assert!(rendered.contains("more than one `Slot`"), "{rendered}");
+    }
+
+    /// A slot left empty is legal: an optional body is a real thing, and
+    /// refusing it would force every caller to pass a `Rectangle(width = 1dp)`.
+    #[test]
+    fn an_unfilled_slot_is_legal() {
+        let (tree, _engine) = build(
+            r#"
+            component Frame { Column(id = self) { Slot { } } }
+            component App { Window(id = root) { Frame() } }
+        "#,
+        );
+        let root = tree.lookup_id("root").expect("the window");
+        assert_eq!(tree.arena[root].ty, "Window");
+    }
+
+    /// The slot is a layout box, not an invisible gap.
+    ///
+    /// Asserted through the tree rather than by reading positions: what matters
+    /// here is that a slot holds its content, and the geometry belongs to
+    /// `nui-layout`'s own tests. A slot that were not a container would give
+    /// its content no box at all.
+    #[test]
+    fn a_slot_is_a_layout_container() {
+        let (tree, _engine) = build(
+            r#"
+            component Frame {
+                Stack(id = self, width = 200dp, height = 200dp) { Slot { } }
+            }
+            component App {
+                Window(id = root, width = 400dp, height = 400dp) {
+                    Frame { Rectangle(id = body, width = 60dp, height = 30dp) }
+                }
+            }
+        "#,
+        );
+        let root = tree.lookup_id("root").expect("the window");
+        let slot = tree
+            .descendants_of_type(root, SLOT_ID)
+            .first()
+            .copied()
+            .expect("the slot survived instantiation");
+        assert!(
+            !tree.arena[slot].children.is_empty(),
+            "the slot holds its content"
+        );
+    }
 }
 
 #[test]
