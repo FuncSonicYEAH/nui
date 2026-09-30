@@ -515,3 +515,83 @@ fn an_element_type_is_still_answered_from_its_name() -> TestResult {
     );
     return Ok(());
 }
+
+/// A document that names a registered type *directly*, declaring no
+/// `component` for it — the host-interop seam the gallery's `TodoCheckbox`
+/// uses. No component name is recorded on the element, so the type name is
+/// the only identity there is.
+fn one_bare_type(interaction: Interaction) -> (ElementTree, Engine, ElementId) {
+    let (mut tree, mut engine) = build(
+        r#"
+        component App {
+            Window(id = root) { TodoCheckbox(id = box) }
+        }
+    "#,
+        registry_named("TodoCheckbox", interaction),
+    );
+    let element = tree.lookup_id("box").expect("the element exists");
+    tree.arena[element].set("x", Value::Float(0.0));
+    tree.arena[element].set("y", Value::Float(0.0));
+    tree.arena[element].set("width", Value::Float(100.0));
+    tree.arena[element].set("height", Value::Float(40.0));
+    let _ = engine.propagate(&mut tree);
+    return (tree, engine, element);
+}
+
+#[test]
+fn a_registered_type_name_is_a_control_too() -> TestResult {
+    // `register_component` attaches a behavior by *type name*
+    // (`instantiate.rs` looks it up with `&node.ty`), so the interaction
+    // half has to be answered from the same key. Answering only from a
+    // recorded component name — which a bare node never has — gave these
+    // elements a click and nothing else: no hover, no press, no Tab stop,
+    // no Space/Enter. The gallery's `TodoCheckbox` is registered that way.
+    let (tree, engine, element) = one_bare_type(Interaction::momentary());
+    assert_eq!(
+        tree.arena[element].component, None,
+        "a bare node records no component name"
+    );
+    let interaction = engine.interaction(&tree, element);
+    assert_eq!(interaction.kind, Some(nui_runtime::WidgetKind::Momentary));
+    assert!(interaction.is_control());
+    assert!(interaction.focusable, "and it is a Tab stop");
+    // The focus walk reads the element flag rather than the interaction, so
+    // the two must be set from the same registration.
+    assert!(
+        tree.arena[element].focusable,
+        "the Tab flag follows the declared interaction"
+    );
+    return Ok(());
+}
+
+#[test]
+fn hovering_a_registered_type_name_writes_its_state_properties() -> TestResult {
+    let (mut tree, mut engine, element) = one_bare_type(Interaction::momentary());
+    let mut tracker = WidgetStates::new();
+    tracker.update(&mut engine, &mut tree, input(500.0, 500.0, false));
+    assert_eq!(
+        tree.arena[element].get("hovered"),
+        Some(&Value::Bool(false))
+    );
+    tracker.update(&mut engine, &mut tree, input(50.0, 20.0, false));
+    assert_eq!(
+        tree.arena[element].get("hovered"),
+        Some(&Value::Bool(true)),
+        "a registered control tracks the pointer like a built-in one"
+    );
+    tracker.capture(Some(element));
+    tracker.update(&mut engine, &mut tree, input(50.0, 20.0, true));
+    assert_eq!(tree.arena[element].get("armed"), Some(&Value::Bool(true)));
+    return Ok(());
+}
+
+#[test]
+fn a_registered_type_name_without_an_interaction_stays_inert() -> TestResult {
+    // The fallback must not invent a control: a registered type that
+    // declares no interaction is still inert, exactly as a reference to a
+    // component that declares none.
+    let (tree, engine, element) = one_bare_type(Interaction::default());
+    assert!(!engine.interaction(&tree, element).is_control());
+    assert!(!tree.arena[element].focusable);
+    return Ok(());
+}

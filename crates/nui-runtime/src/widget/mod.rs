@@ -188,13 +188,14 @@ pub fn is_widget_type(ty: &str) -> bool {
 
 /// How one element behaves under the pointer and the keyboard.
 ///
-/// This is the answer every interaction caller wants, and it has two
-/// sources. A built-in control is identified by its type name. A
-/// host-registered component is identified by the name recorded on the
-/// element at instantiation, which is the *only* place a component's
-/// identity survives: an instance of `component RippleButton` is a
-/// `Rectangle` to layout and to the renderer, so nothing downstream can
-/// tell it apart from a plain rectangle without asking.
+/// This is the answer every interaction caller wants. A built-in control is
+/// identified by its type name, and so is a host-registered type a document
+/// names directly — the two are told apart by whether the built-in table
+/// has anything to say. A `component RippleButton {}` *reference* is the
+/// one case that needs more than a name: its instance element is the
+/// component's own root, which is a `Rectangle` to layout and to the
+/// renderer, so the declared name is recorded on the element and read back
+/// from there. See [`Engine::interaction`].
 ///
 /// `kind: None` means "not a control": no hover tracking, no press, no
 /// keyboard activation, and no Tab stop.
@@ -307,9 +308,23 @@ impl Interaction {
 impl Engine {
     /// The pointer and keyboard behaviour of `element`.
     ///
-    /// A component instance is answered from its registration, so a custom
-    /// control gets hover, press, activation and focus exactly like a
-    /// built-in one. Anything else falls back to the type-name table.
+    /// There are two ways a host-registered control can be named, and the
+    /// answer has to follow the same one the *behavior* half was attached
+    /// with (`instantiate` looks a behavior up with `registry().behavior(&
+    /// node.ty)`):
+    ///
+    /// | how the document reaches it | identity | why |
+    /// |---|---|---|
+    /// | a bare type name — `TodoCheckbox(...)` | the type name | nothing else records who the element is |
+    /// | a `component Foo {}` reference | the recorded name | the instance element *is* the component's root, so its type is the root's (`Rectangle`), not the component's |
+    ///
+    /// Answering only from the recorded name left the first row with a
+    /// click and nothing else: no hover, no press, no Tab stop, no
+    /// Space/Enter. The gallery registers `TodoCheckbox` that way.
+    ///
+    /// The built-in table wins wherever it has an answer, which is what
+    /// stops a registration from redefining `Button`. It is *silent* about
+    /// a type it does not know, and only there is the registry consulted.
     pub fn interaction(&self, tree: &ElementTree, id: ElementId) -> Interaction {
         let element = &tree.arena[id];
         if let Some(component) = &element.component
@@ -317,7 +332,14 @@ impl Engine {
         {
             return descriptor.interaction;
         }
-        return Interaction::of_type(&element.ty);
+        let built_in = Interaction::of_type(&element.ty);
+        if built_in.is_control() || built_in.focusable {
+            return built_in;
+        }
+        if let Some(descriptor) = self.registry().component(&element.ty) {
+            return descriptor.interaction;
+        }
+        return built_in;
     }
 }
 

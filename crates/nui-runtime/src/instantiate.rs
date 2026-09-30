@@ -286,6 +286,14 @@ pub(crate) fn instantiate_scoped_node(
     // and a fresh behavior instance (plan §5 宿主互操作).
     if let Some(desc) = engine.registry().component(&node.ty).cloned() {
         crate::registry::apply_descriptor_defaults(&mut tree.arena[id], &desc);
+        // The interaction half of the same registration. The focus walk
+        // reads this flag rather than `Engine::interaction`, so a registered
+        // type that declares itself focusable has to set it here or the two
+        // disagree — a bare `TodoCheckbox` would report a control with hover
+        // states and still never be reachable from the keyboard.
+        if desc.interaction.focusable {
+            tree.arena[id].focusable = true;
+        }
     }
     if let Some(factory) = engine.registry().behavior(&node.ty) {
         let behavior = factory();
