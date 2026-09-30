@@ -376,10 +376,9 @@ crate 间路径依赖已在骨架 Cargo.toml 中连好；统一 lints（`unsafe_
 - 项目与语言命名：工作名 `nui` / `nui-lang`，发布前需查 crates.io 占用情况。
 - License 假定 `MIT OR Apache-2.0`（Cargo.toml 已按此填写），如有其他偏好需确认。
 - **可变字体轴（除 `wght` 外）未开放**：nui 向 cosmic-text 要的是「一个 face + 一个 weight」，不是「轴上的一个 location」，所以 `FILL` / `opsz` / `wdth` 这类轴文档现在够不着。要开放需要一条从 `font.*` 到 shaping location 的通路，且字形缓存键要带上 location——即 `Typeface` 要再带一个坐标，而不只是三个标量。设计系统里 `FILL` 很常见（选中态图标），所以这是已知缺口而非取舍
-"不是「轴上的一个 location」，所以 `FILL` / `opsz` / `wdth` 这类轴文档现在够不着。"
-"要开放需要一条从 `font.*` 到 shaping location 的通路，且字形缓存键要带上 location——"
-"即 `Typeface` 要再带一个坐标，而不只是三个标量。设计系统里 `FILL` 很常见（选中态图标），"
-"所以这是已知缺口而非取舍
+- **元素属性名没有编译期词表**：`Text(contnt = "x")` 这类拼写错误今天只在运行时表现为「什么都没发生」。看似加一张表就能修，但属性名空间是**故意共享**的——平台惯用法就是把每页状态挂在元素上（`Column(id = containers_page, clicks = 0)`，读 `containers_page.clicks`），而宿主注册的组件又能带自己的属性，所以「这个名字是内建属性，还是这个元素自己的状态」编译器无从判断。两条出路：(a) 自定义状态必须显式声明（`state clicks: Int = 0`，与 `property` 同族），词表只覆盖内建属性；(b) 给状态一个前缀（`state.clicks`），让属性名空间彻底干净。这是一次语言层面的决策，不是补一张表
+  - 已补的一小块（同一目标里没有歧义的部分）：效果语句里的单名调用现在要对着宿主词表校验，`on click => togle()` 从「运行时静默失败」变成编译期报错；宿主函数与宿主命令也在编译期分开（命令不能当值用）
+  - 类型名（`Buton(...)`）是另一个可以独立推进的子集：它没有共享命名空间的问题，宿主词表（`HostVocabulary`）已经有 `functions` / `commands` 两个槽位，再加一个 `types` 即可直接报错
 
 ## 14. 当前状态
 
