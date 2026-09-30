@@ -193,7 +193,7 @@ pub fn reload_from_source(instance: &mut Instance, source: &str) -> Result<(), S
 /// A component's subtree is built before the instance's declared properties and
 /// the caller's arguments are applied, because applying them needs the element
 /// handle. So a nested reference that *statically* initialises from a parent
-/// property -- `M3Shape(name = name)`, which is what a component wrapping
+/// property -- `Wrapper(kind = kind)`, which is what a component wrapping
 /// another component almost always does -- reads the property's default instead
 /// of the value the caller passed.
 ///

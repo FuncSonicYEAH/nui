@@ -244,25 +244,30 @@ impl DocumentIndex {
     }
 }
 
-/// Appends the components `node` instantiates to `out`.
+/// Appends the components `node` instantiates to `out`, with the span of the
+/// node that named each one.
 ///
-/// A component reference node has no children of its own (its body takes
-/// handlers only, which the checker enforces), so the walk stops there:
-/// the referenced component's own references are collected when *its*
-/// declaration is processed. That keeps the edge set one level per
-/// declaration, which is what the cycle walk above expects.
-/// Collects every component a subtree instantiates, with the span of the node
-/// that named each one.
+/// # Why a reference's body is walked
 ///
-/// A reference's *body* is walked as well as recorded. It has to be, since the
-/// slot: the children of a component reference are the caller's content, and
-/// that content can instantiate further components. Stopping at the reference
-/// -- which is what this did -- made every component below a slot look
-/// unreferenced, and an unreferenced component is instantiated as a *tree root*
-/// by the runtime. So a gallery whose pages were all inside one `M3Page` ended
-/// up with a `M3Fab` and a `M3IconButton` drawn at the origin with their default
-/// empty icon names, and no diagnostic anywhere: the icon atlas lookup failed at
-/// run time, in a component nobody had asked for.
+/// A reference's children are the *caller's* slot content, and that content can
+/// instantiate further components. So the walk continues past a reference into
+/// its body, rather than recording the reference and returning.
+///
+/// Stopping there -- which is what this did, for the reason that a reference
+/// used to have no children at all -- makes every component below a slot look
+/// unreferenced. And an unreferenced component is instantiated as a *tree root*
+/// by the runtime, so it is still built: still type-checked, still rendered,
+/// just at the origin and in nobody's place.
+///
+/// The failure is silent, which is what makes it worth stating. Put a
+/// document's whole content inside one slotted container and every component in
+/// it appeared twice — once where it belonged, once at the top-left corner with
+/// its declared defaults. No diagnostic anywhere, because the stray instance was
+/// a correct instance of a correctly declared component: every check that looked
+/// at the *component* rather than at the *tree* passed, and the only symptom was
+/// an extra shape in the corner. A test that instantiated the document and
+/// looked at the result would have caught it; one that only checked the
+/// component's own diagnostics never would.
 fn collect_node_references(
     node: &NodeDecl,
     signatures: &HashMap<String, ComponentSignature>,
@@ -447,7 +452,7 @@ pub fn check_with(document: &Document, extern_functions: &[String]) -> CheckOutc
 ///
 /// `=` means "evaluate once". For a literal that is exactly what happens, and
 /// it is what makes `width = 12dp` a static value rather than a dependency. But
-/// a one-shot evaluation of `M3Shape(name = name)` is not expressible: the
+/// a one-shot evaluation of `Wrapper(kind = kind)` is not expressible: the
 /// instance graph is built in a second pass, so at the moment the argument would
 /// be evaluated the parent property it reads may not exist yet — and the
 /// runtime's static path evaluates *literals* only, so a property read there is
