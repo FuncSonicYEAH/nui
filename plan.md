@@ -32,6 +32,7 @@
 | D18 | 组件交互声明 | 由 `ComponentDesc::interaction` 声明，而非扩充 `WIDGET_TYPES` 硬编码表：组件实例化后其类型名是 `Rectangle`，名字只留在元素上，下游无从分辨 | 2026-09-27 |
 | D19 | `emphasized` 半段曲线的来源 | 表中 `emphasized-first-half` / `emphasized-last-half` 是**推导值**（`emphasized` 两段各自 rescale 到整条时间轴），非照抄设计系统的同名 token——设计系统那两个 token 一个是 8 个数的畸形列表（照读只走到 x=1/6），另一个是未 rescale 的重锚定结果。推导过程由测试从 `emphasized` 现算，不再只是注释里的断言 | 2026-09-27 |
 | D20 | 组件体的名字解析 | 组件体内**可以**引用文档中任一「入口组件」的元素 id（`DocumentIndex.document_ids`，在 `referenced` 算完之后收集）；组件自身的 id 优先。入口组件由运行时直接实例化、id 不被改写，所以只有它的 id 是文档级的；被实例化的组件 id 改写成 `iN::` 命名空间，裸名不指向任何东西。**不传递**：A 读到 `shell` 不等于 B 能经 A 读到。裸的未知标识符仍是枚举字面量（`check_ident`），本条只影响 `a.b` 的成员访问。动机：设计系统的明暗开关在窗口上，约 80 处控件都要读——作为参数传下去会把组件埋进一个不属于它的参数里 | 2026-09-30 |
+| D21 | 矩形描边 | `Rectangle` 新增 `border.width` / `border.color` 两个属性，描边画在**框内**（等价 CSS `border-box`），不参与布局。关键在顺序：描边必须在 `fill` 之前读取——只有描边没有填充的矩形（outlined button、text field、divider）是真实形状，不能走「透明容器」提前返回；顺序写反的后果是整个设计系统的描边**静默消失**（元素不画了，不是画错）。GPU 侧 `RectInstance` 早有 `border_width`/`border_color` 字段、`push_rect_outline` 早被 widget part 用着，缺的只是元素属性这一个接线 | 2026-09-30 |
 
 **节点思想**（设计基座）：一切皆节点——可视节点（Rectangle/Text/Column…）、逻辑节点（Timer/State/Model，不绘制但参与树与绑定）、资源节点（Font/Image）。属性绑定构成数据流 DAG，引擎 = 节点树 + 响应式依赖图 + 每帧脏传播管线（绑定 → 布局 → 绘制）。
 
@@ -467,3 +468,8 @@ crate 间路径依赖已在骨架 Cargo.toml 中连好；统一 lints（`unsafe_
   - **`nui_text::TextSystem::rasterise(cache_key)`**：构建期烘焙工具要拿到字形的覆盖率位图，而运行时 atlas 只给 placement。多一个方法，形状与 `glyph_quad` 同一条光栅化路径，所以「烘焙出来的图标」与「排版出来的字形」是同一批像素。另加 `with_single_font(bytes)`——烘焙工具要单一字体，多字体集合会让缺失的连字悄悄用替代字体排出字形、烘出一整张字母表进图集
   - 验收：`cargo fmt --all -- --check` / `clippy --workspace --all-targets -D warnings` / `test`（**659 全绿**，基线 654）/ `build --release` 全通过；D13 grep 通过；`examples/gallery --snap` 14 页出图**逐字节不变**
   - 教训：第一个版本把文档级 id 收集放在了 `referenced` 之前，于是「实例的私有 id 不可见」这条测试直接失败——它证明了这条性质是可测的，也证明了它一开始就是错的
+- [x] **M14.3 追加（2026-09-30）**：`Rectangle` 的 `border.width` / `border.color`
+  - 描边走 `push_rect_outline`（widget part 的 Surface 边框已经在用同一条路径），不新增 GPU 代码；`RectInstance` 的 `border_width`/`border_color` 字段本就存在
+  - 提前返回的顺序是这件事的全部：`fill`/`gradient` 都没有时元素被当作透明容器而**什么都不画**。只有描边的元素——M3 的 outlined button、text field 描边、checkbox 边框——正好落进这个分支，所以描边不是画错而是消失。6 条测试写死：填充+描边各有一次绘制、**无填充也能画**（两种写法：显式 transparent 与根本没有 `fill` 键）、只写一半不画、`opacity` 折进描边（否则淡化的控件会留一道硬边）、既无填充也无描边仍什么都不画（常见路径不能回归）
+  - 描边画在框内且不影响布局盒子，与 `shadow.*` 不影响布局一致
+  - 验收：fmt / clippy `-D warnings` / `test`（**665 全绿**，基线 659）/ `build --release` 全通过；`examples/gallery --snap` 14 页逐字节不变

@@ -568,10 +568,20 @@ impl SceneBuilder {
         // Quick Item semantics): Window, Column, Row, Scroll and Spacer let
         // the host clear color show through. The placeholder fill here is
         // overridden by the gradient in the shader.
+        // A border is read before the fill, because a bordered rectangle with
+        // no fill of its own -- an outlined button, a text field, a divider
+        // drawn as an outline -- is a real shape and must not take the
+        // "transparent container" path below. Getting this order wrong makes
+        // every outline in a design system invisible, silently: the element
+        // simply stops being drawn.
+        let border_color = color_property(element, "border.color");
+        let border_width = f_property(element, "border.width").unwrap_or(0.0);
+        let has_border = border_width > 0.0 && border_color.is_some();
         let gradient_from = color_property(element, "gradient.from");
-        let Some(fill) = color_property(element, "fill").or(gradient_from) else {
+        let fill = color_property(element, "fill").or(gradient_from);
+        if fill.is_none() && !has_border {
             return;
-        };
+        }
         let corner_radius = f_property(element, "radius").unwrap_or(0.0);
         // Rotation (degrees, clockwise, around the rect center). Only plain
         // rect surfaces rotate; Text/Image/TextInput decorations keep their
@@ -611,15 +621,34 @@ impl SceneBuilder {
                 color: color.with_alpha(color.alpha() * opacity),
             };
         });
-        self.rects.push(RectDraw {
-            geometry: bounds,
-            corner_radius,
-            fill: fill.with_alpha(fill.alpha() * opacity),
-            shadow,
-            clip,
-            rotation,
-            gradient,
-        });
+        if let Some(fill) = fill {
+            self.rects.push(RectDraw {
+                geometry: bounds,
+                corner_radius,
+                fill: fill.with_alpha(fill.alpha() * opacity),
+                shadow,
+                clip,
+                rotation,
+                gradient,
+            });
+        }
+        if let (Some(color), true) = (border_color, has_border) {
+            // Inside the box, like CSS `border-box`: the layout size is the
+            // size, and the border eats into it. An outline drawn on the edge
+            // would push a control 1dp larger than the space laid out for it.
+            push_rect_outline(
+                self,
+                Point::new(0.0, 0.0),
+                bounds.origin.x,
+                bounds.origin.y,
+                bounds.size.width,
+                bounds.size.height,
+                border_width,
+                corner_radius,
+                color.with_alpha(color.alpha() * opacity),
+                clip,
+            );
+        }
         self.sources.push(id);
     }
 
@@ -1930,6 +1959,139 @@ mod tests {
         assert_eq!(draw.corner_radius, 8.0);
         // Premultiplied by opacity at build time.
         assert!((draw.fill.alpha() - 0.5).abs() < 1e-6);
+    }
+
+    /// A `Rectangle` border: the two properties, the two ways to get them
+    /// wrong, and the case that motivated them.
+    mod border {
+        use super::*;
+
+        /// Builds a scene from one rectangle.
+        fn scene_of(mutate: impl FnOnce(&mut Element)) -> crate::Scene {
+            let mut tree = ElementTree::new();
+            let mut element = sized_element(100.0, 50.0);
+            mutate(&mut element);
+            let id = tree.insert(element);
+            tree.push_root(id);
+            return SceneBuilder::build_with_context(
+                &tree,
+                &mut nui_text::TextSystem::with_embedded_font(),
+                SceneContext {
+                    focused: None,
+                    image_keys: &HashMap::new(),
+                },
+            );
+        }
+
+        /// A border over a fill: one rect, one outline.
+        #[test]
+        fn a_border_adds_an_outline_and_keeps_the_fill() {
+            let scene = scene_of(|element| {
+                element.set("border.width", Value::Float(1.0));
+                element.set("border.color", Value::Color(Color::WHITE));
+                element.set("radius", Value::Float(8.0));
+            });
+            assert_eq!(scene.rects.len(), 1, "the fill is still drawn");
+            assert_eq!(scene.polylines.len(), 1, "and so is the outline");
+            assert_eq!(scene.polylines[0].width, 1.0);
+        }
+
+        /// The case that made this worth having: an outlined button has *no*
+        /// fill. Before the fix the element took the transparent-container
+        /// path and drew nothing at all, so the outline was invisible -- not
+        /// wrong, just absent, which is the worst way to be wrong.
+        #[test]
+        fn a_border_without_a_fill_still_draws() {
+            let scene = scene_of(|element| {
+                element.set("fill", Value::Color(Color::TRANSPARENT));
+                element.set("border.width", Value::Float(1.0));
+                element.set("border.color", Value::Color(Color::WHITE));
+            });
+            assert_eq!(scene.polylines.len(), 1, "the outline is the whole shape");
+        }
+
+        /// A border alone, with the fill key *absent* rather than transparent,
+        /// which is the other spelling of the same thing.
+        #[test]
+        fn a_border_with_no_fill_key_at_all_still_draws() {
+            let mut tree = ElementTree::new();
+            let mut element = Element::new("Rectangle", None);
+            element.set("width", Value::Length(nui_core::Length::Dp(40.0)));
+            element.set("height", Value::Length(nui_core::Length::Dp(20.0)));
+            element.set("border.width", Value::Float(1.0));
+            element.set("border.color", Value::Color(Color::WHITE));
+            let id = tree.insert(element);
+            tree.push_root(id);
+            let scene = SceneBuilder::build_with_context(
+                &tree,
+                &mut nui_text::TextSystem::with_embedded_font(),
+                SceneContext {
+                    focused: None,
+                    image_keys: &HashMap::new(),
+                },
+            );
+            assert!(scene.rects.is_empty(), "no fill to draw");
+            assert_eq!(scene.polylines.len(), 1, "but the outline is there");
+        }
+
+        /// A width with no colour, or a colour with no width, is not a border.
+        ///
+        /// Both are the shape a half-finished declaration takes, and both must
+        /// be a no-op rather than a default-width white ring.
+        #[test]
+        fn a_half_declared_border_draws_nothing() {
+            let scene = scene_of(|element| {
+                element.set("border.width", Value::Float(1.0));
+            });
+            assert!(scene.polylines.is_empty(), "a width with no colour");
+
+            let scene = scene_of(|element| {
+                element.set("border.color", Value::Color(Color::WHITE));
+            });
+            assert!(scene.polylines.is_empty(), "a colour with no width");
+        }
+
+        /// The element's opacity reaches the border.
+        ///
+        /// It reaches the fill already; a border that ignored it would make a
+        /// faded control keep a hard edge.
+        #[test]
+        fn opacity_folds_into_the_border() {
+            let scene = scene_of(|element| {
+                element.set("border.width", Value::Float(1.0));
+                element.set("border.color", Value::Color(Color::WHITE));
+                element.set("opacity", Value::Float(0.25));
+            });
+            assert_eq!(scene.polylines.len(), 1);
+            assert!(
+                (scene.polylines[0].color.alpha() - 0.25).abs() < 1e-6,
+                "got alpha {}",
+                scene.polylines[0].color.alpha()
+            );
+        }
+
+        /// The transparent-container early return is still a transparent
+        /// container when there is no border either -- the common case must not
+        /// regress.
+        #[test]
+        fn no_fill_and_no_border_is_still_nothing() {
+            let mut tree = ElementTree::new();
+            let mut element = Element::new("Rectangle", None);
+            element.set("width", Value::Length(nui_core::Length::Dp(40.0)));
+            element.set("height", Value::Length(nui_core::Length::Dp(20.0)));
+            let id = tree.insert(element);
+            tree.push_root(id);
+            let scene = SceneBuilder::build_with_context(
+                &tree,
+                &mut nui_text::TextSystem::with_embedded_font(),
+                SceneContext {
+                    focused: None,
+                    image_keys: &HashMap::new(),
+                },
+            );
+            assert!(scene.rects.is_empty());
+            assert!(scene.polylines.is_empty());
+        }
     }
 
     #[test]
