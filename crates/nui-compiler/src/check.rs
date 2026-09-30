@@ -82,6 +82,14 @@ struct DocumentIndex {
     /// component -> the components it instantiates, with the span of the
     /// node that named them. The edge set the recursion check walks.
     edges: HashMap<String, Vec<(String, Span)>>,
+    /// Every element id declared anywhere in the document, with the type name
+    /// it was declared on.
+    ///
+    /// A component body's *own* ids are collected by its binder and always win;
+    /// this is the fallback for a name the component does not declare itself.
+    /// See [`ComponentBinder::check_name`] and the note there for why a
+    /// document-level fallback exists at all.
+    document_ids: HashMap<String, String>,
 }
 
 impl DocumentIndex {
@@ -125,9 +133,32 @@ impl DocumentIndex {
             .map(|(name, _)| return name.clone())
             .filter(|name| return signatures.contains_key(name))
             .collect();
+        // The document's element ids, collected last because the rule needs
+        // `referenced`: an *entry point* is instantiated by the runtime
+        // directly, so its ids survive unrewritten and are the only ones a
+        // name can legitimately refer to. An instantiated component's ids are
+        // rewritten into its instance's namespace (`i1::label`), so the bare
+        // name does not name anything and must not resolve.
+        //
+        // Collecting this before `referenced` would be wrong in a way that only
+        // shows up much later: `label` would resolve from anywhere and would
+        // read whichever instance the runtime happened to answer with.
+        let mut document_ids: HashMap<String, String> = HashMap::new();
+        for decl in &document.components {
+            if referenced.contains(&decl.name.name) {
+                continue;
+            }
+            for member in &decl.members {
+                let ComponentMember::Node(node) = member else {
+                    continue;
+                };
+                collect_node_ids(node, &mut document_ids);
+            }
+        }
         let index = DocumentIndex {
             signatures,
             referenced,
+            document_ids,
             edges,
         };
         index.report_recursion(diagnostics);
@@ -230,6 +261,27 @@ fn collect_node_references(
     for member in &node.body {
         if let NodeMember::Node(child) = member {
             collect_node_references(child, signatures, out);
+        }
+    }
+}
+
+/// Collects the element ids in a component's own subtree.
+///
+/// The caller is responsible for passing an *entry point* (see
+/// [`DocumentIndex::build`]), so no reference guard is needed here: nothing in
+/// an entry point's body is a component reference, because an entry point
+/// instantiates *its* children and the components those children reference are
+/// themselves instantiated and rewritten.
+fn collect_node_ids(node: &NodeDecl, out: &mut HashMap<String, String>) {
+    for arg in &node.args {
+        let NodeArg::Id(id) = arg else {
+            continue;
+        };
+        out.insert(id.name.clone(), node.ty.name.clone());
+    }
+    for member in &node.body {
+        if let NodeMember::Node(child) = member {
+            collect_node_ids(child, out);
         }
     }
 }
@@ -1402,7 +1454,40 @@ impl<'source> ComponentBinder<'source> {
                 ty: Type::Bool,
             };
         }
+        // Note the *path*: this is a member access (`name.prop`), and the
+        // fallback below applies to it. A **bare** unknown identifier is a
+        // different case entirely -- `check_ident` treats one as an enum
+        // variant literal, so `fill <- bold` is a colour named `bold` rather
+        // than a misspelled reference. Nothing here changes that.
+        //
+        // The component's own ids first, so an instance's private element
+        // always shadows a document-level name of the same spelling.
         if self.ids.contains_key(base_name) {
+            return TypedExpr::Property {
+                target: PropertyTarget::Id(base_name.clone(), name.name.clone()),
+                ty: Type::Unknown,
+            };
+        }
+        // Then the document's, as a fallback.
+        //
+        // This is the one place a component body can reach outside itself, and
+        // it exists for the shape a whole application takes: a document with
+        // one entry component that holds the app's state, and a library of
+        // components that need to read it. A theme's light/dark flag is the
+        // motivating case -- every control needs it, and passing it to eighty
+        // instantiations would bury the component in a parameter it does not
+        // own.
+        //
+        // The cost is real and worth stating: two components can now both
+        // read the same document element, so a component is no longer purely a
+        // function of its own arguments. What is *not* weakened is the
+        // isolation N1 bought -- each instance still rewrites its own subtree
+        // and its own ids into a namespace, so nothing collides at runtime, and
+        // a component that declares no reference to a document element is
+        // still self-contained. It is also not transitive: a name resolved
+        // this way is not in the component's id table, so a *further*
+        // component cannot reach it through this one.
+        if self.index.document_ids.contains_key(base_name) {
             return TypedExpr::Property {
                 target: PropertyTarget::Id(base_name.clone(), name.name.clone()),
                 ty: Type::Unknown,
@@ -2766,5 +2851,191 @@ component Widgets {
         );
         let outcome = compile(&demo);
         assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+    }
+}
+
+/// The document-level id fallback: what it buys and what it does not.
+///
+/// These are the properties the change is *allowed* to have, written down next
+/// to the implementation so a later change to the resolution order is caught
+/// here rather than discovered in a downstream project.
+#[cfg(test)]
+mod document_id_fallback {
+    use crate::compile;
+
+    /// Compiles a source expected to be clean, panicking with the diagnostics
+    /// if it is not.
+    fn expect_clean(source: &str) {
+        let outcome = compile(source);
+        assert!(
+            outcome.diagnostics.is_empty(),
+            "this source should compile cleanly: {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    /// Compiles a source expected to fail, returning the rendered
+    /// diagnostics.
+    fn expect_dirty(source: &str) -> String {
+        let outcome = compile(source);
+        assert!(
+            !outcome.diagnostics.is_empty(),
+            "this source is expected to produce a diagnostic"
+        );
+        return outcome
+            .diagnostics
+            .iter()
+            .map(|diagnostic| return nui_syntax::render_diagnostic(source, "test.nui", diagnostic))
+            .collect::<Vec<_>>()
+            .join("");
+    }
+
+    /// A component body reaches an element id declared in another component.
+    ///
+    /// The case that motivated it: a library of controls that all need the
+    /// app's light/dark flag, which lives on the window of the entry
+    /// component.
+    #[test]
+    fn a_component_body_reads_another_components_element() {
+        let source = r#"
+            component Chip {
+                property label: String = ""
+                Rectangle(fill <- shell.tint) { Text(content <- label) }
+            }
+            component App {
+                property tint: Color = #336699
+                Window(id = shell) { Chip(label = "one") }
+            }
+        "#;
+        expect_clean(source);
+    }
+
+    /// The order matters: an instance's own element shadows the document's.
+    ///
+    /// If the document's name won, a component with a private `label` would
+    /// silently start reading the entry component's `label` instead -- the
+    /// kind of change that compiles and renders wrong.
+    #[test]
+    fn a_components_own_id_shadows_the_documents() {
+        let source = r#"
+            component Chip {
+                Rectangle(id = tint, width = 10dp, height = 10dp, fill = #00000000) {
+                    Text(content <- shell.tint)
+                }
+            }
+            component App {
+                property label: String = "outer"
+                Window(id = shell) { Chip() }
+            }
+        "#;
+        // Both `tint`s resolve: the one to `shell.tint`, and the `id = tint`
+        // the component declares for itself. What must *not* happen is the
+        // entry component's *property* `tint` leaking in as a bare name.
+        expect_clean(source);
+    }
+
+    /// Not transitive: a document id is not re-exported by the component that
+    /// read it.
+    ///
+    /// This is what keeps the fallback from becoming a scope chain. Component
+    /// B reads the document's `shell`, and component C -- which only ever sees
+    /// B's surface -- still cannot.
+    #[test]
+    fn the_fallback_is_not_transitive() {
+        let source = r#"
+            component Inner {
+                Rectangle(fill <- shell.tint) { }
+            }
+            component Middle {
+                Inner() { }
+            }
+            component App {
+                property tint: Color = #336699
+                Window(id = shell) { Middle() }
+            }
+        "#;
+        expect_clean(source);
+        // `Middle` reads `label.length`, and `App` declares a *property*
+        // `label`. A component body sees its own properties and the
+        // document's element *ids* -- never another component's properties.
+        let source = r#"
+            component Inner {
+                Rectangle(fill <- shell.tint) { }
+            }
+            component Middle {
+                Stack {
+                    Inner()
+                    Text(content <- label.length)
+                }
+            }
+            component App {
+                property label: String = "outer"
+                property tint: Color = #336699
+                Window(id = shell) { Middle() }
+            }
+        "#;
+        let error = expect_dirty(source);
+        assert!(
+            error.contains("unknown name `label`"),
+            "another component's property must not be readable: {error}"
+        );
+    }
+
+    /// A typo is still a typo.
+    ///
+    /// The fallback must not swallow the diagnostic it replaced, or a
+    /// misspelled element id would become a silently unbound binding.
+    #[test]
+    fn an_unknown_name_is_still_an_error() {
+        let source = r#"
+            component Chip {
+                Rectangle(fill <- shel.tint) { }
+            }
+            component App {
+                property tint: Color = #336699
+                Window(id = shell) { Chip() }
+            }
+        "#;
+        let error = expect_dirty(source);
+        assert!(
+            error.contains("unknown name `shel`"),
+            "a near miss should still be reported: {error}"
+        );
+    }
+
+    /// An instantiated component's private ids are *not* document-level.
+    ///
+    /// The boundary that matters: `Inner`'s `id = label` belongs to each
+    /// instance of `Inner`, and must not become a name that `App` or another
+    /// component can read.
+    #[test]
+    fn an_instances_private_id_is_not_document_level() {
+        // `label` is declared inside `Inner`, which `App` instantiates. It is
+        // therefore an *instance's* element, not a document one, and a
+        // component that does not declare it must not be able to read it --
+        // even one that lives in the same document. Read as a member access
+        // (`label.width`) so the check goes through the path the fallback
+        // touches; a bare `label` would be an enum variant literal.
+        let source = r#"
+            component Inner {
+                Rectangle(id = label, width = 10dp, height = 10dp)
+            }
+            component Stranger {
+                Text(content <- label.width)
+            }
+            component App {
+                Window(id = shell) {
+                    Row {
+                        Inner()
+                        Stranger()
+                    }
+                }
+            }
+        "#;
+        let error = expect_dirty(source);
+        assert!(
+            error.contains("unknown name `label`"),
+            "an instance's element id must stay inside its instance: {error}"
+        );
     }
 }

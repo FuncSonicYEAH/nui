@@ -31,6 +31,7 @@
 | D17 | 缓动曲线 | **具名曲线表**（设计系统的固定曲线集），不做通用 `bezier(x1,y1,x2,y2)` builtin——四个数字要有地方放进动态类型 `Value`；通用 builtin 留作后续，且届时无需迁移既有名字 | 2026-09-27 |
 | D18 | 组件交互声明 | 由 `ComponentDesc::interaction` 声明，而非扩充 `WIDGET_TYPES` 硬编码表：组件实例化后其类型名是 `Rectangle`，名字只留在元素上，下游无从分辨 | 2026-09-27 |
 | D19 | `emphasized` 半段曲线的来源 | 表中 `emphasized-first-half` / `emphasized-last-half` 是**推导值**（`emphasized` 两段各自 rescale 到整条时间轴），非照抄设计系统的同名 token——设计系统那两个 token 一个是 8 个数的畸形列表（照读只走到 x=1/6），另一个是未 rescale 的重锚定结果。推导过程由测试从 `emphasized` 现算，不再只是注释里的断言 | 2026-09-27 |
+| D20 | 组件体的名字解析 | 组件体内**可以**引用文档中任一「入口组件」的元素 id（`DocumentIndex.document_ids`，在 `referenced` 算完之后收集）；组件自身的 id 优先。入口组件由运行时直接实例化、id 不被改写，所以只有它的 id 是文档级的；被实例化的组件 id 改写成 `iN::` 命名空间，裸名不指向任何东西。**不传递**：A 读到 `shell` 不等于 B 能经 A 读到。裸的未知标识符仍是枚举字面量（`check_ident`），本条只影响 `a.b` 的成员访问。动机：设计系统的明暗开关在窗口上，约 80 处控件都要读——作为参数传下去会把组件埋进一个不属于它的参数里 | 2026-09-30 |
 
 **节点思想**（设计基座）：一切皆节点——可视节点（Rectangle/Text/Column…）、逻辑节点（Timer/State/Model，不绘制但参与树与绑定）、资源节点（Font/Image）。属性绑定构成数据流 DAG，引擎 = 节点树 + 响应式依赖图 + 每帧脏传播管线（绑定 → 布局 → 绘制）。
 
@@ -460,3 +461,9 @@ crate 间路径依赖已在骨架 Cargo.toml 中连好；统一 lints（`unsafe_
   - **双端控件**(`WidgetKind::Range`):一次手势移动值空间里更近的一端,平局取低端;未设的两端按 `min` 读,不除以缺失值
   - M14 验收：`cargo fmt --all -- --check` / `clippy --workspace --all-targets -D warnings` / `test`（**652 全绿**,基线 566）/ `build --release` 全通过;D13 grep 通过;`examples/gallery --snap` 14 页出图与改动前一致(无回归)
   - 已知限制:组件引用暂不支持出现在 `For` 体内（行由引擎实例化,引擎不携带文档）;缓动曲线名不做编译期校验（`easing` 是 `Enum`,拼错静默降级为默认曲线,与既有行为一致）;`Path` 填充仍无抗锯齿;未做系统调色板跟随（`nui-winit` 无 `QStyleHints::colorScheme` 对应能力）
+
+- [x] **M14.2 追加（2026-09-30）**：为组件库落地补齐两块地基，由下游 `m3-gallery` 移植驱动
+  - **组件体可读入口组件的元素 id**（D20）：`.nui` 没有 `import`，一个应用的所有组件都在同一文档里，而每个控件都要读窗口上的明暗开关。检查器的名字解析在组件自身 id 之后加一层文档级兜底。两处踩过的坑都留在了代码注释里：兜底集合必须在 `referenced` **之后**收集（否则被实例化组件的 id 也会进来，而那些 id 运行时已改写，裸名解析到哪个实例取决于当次实例化——这类错误编译通过、渲染错）；兜底只作用于 `a.b` 成员访问，裸标识符走 `check_ident` 的枚举字面量分支，不动。5 条新测试写死了「允许的性质」：能读到文档 id、自身 id 优先、**不传递**、拼错仍报错、实例的私有 id 不泄漏
+  - **`nui_text::TextSystem::rasterise(cache_key)`**：构建期烘焙工具要拿到字形的覆盖率位图，而运行时 atlas 只给 placement。多一个方法，形状与 `glyph_quad` 同一条光栅化路径，所以「烘焙出来的图标」与「排版出来的字形」是同一批像素。另加 `with_single_font(bytes)`——烘焙工具要单一字体，多字体集合会让缺失的连字悄悄用替代字体排出字形、烘出一整张字母表进图集
+  - 验收：`cargo fmt --all -- --check` / `clippy --workspace --all-targets -D warnings` / `test`（**659 全绿**，基线 654）/ `build --release` 全通过；D13 grep 通过；`examples/gallery --snap` 14 页出图**逐字节不变**
+  - 教训：第一个版本把文档级 id 收集放在了 `referenced` 之前，于是「实例的私有 id 不可见」这条测试直接失败——它证明了这条性质是可测的，也证明了它一开始就是错的

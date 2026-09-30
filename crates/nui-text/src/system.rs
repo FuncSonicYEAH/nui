@@ -147,6 +147,17 @@ impl std::fmt::Debug for TextSystem {
 }
 
 impl TextSystem {
+    /// Creates a system with only `font_bytes` as its family.
+    ///
+    /// For a build-time baker that shapes with one specific font and needs no
+    /// fallback: a font *set* would let a missing ligature silently shape with
+    /// a substitute and bake the substitute's letterforms into an icon atlas.
+    /// An empty byte slice is the caller's mistake to report.
+    pub fn with_single_font(font_bytes: &[u8]) -> TextSystem {
+        let source = fontdb::Source::Binary(std::sync::Arc::new(font_bytes.to_vec()));
+        return TextSystem::from_font_system(FontSystem::new_with_fonts([source]));
+    }
+
     /// Creates a system with only the bundled DejaVu Sans: deterministic
     /// and offline-safe (golden tests; guaranteed fallback family).
     pub fn with_embedded_font() -> TextSystem {
@@ -315,6 +326,27 @@ impl TextSystem {
     /// The glyph atlas (page polling for GPU upload).
     pub fn atlas(&mut self) -> &mut GlyphAtlas {
         return &mut self.atlas;
+    }
+
+    /// Rasterises one glyph and returns its coverage mask.
+    ///
+    /// The counterpart to [`Self::glyph_quad`] for a caller that wants the
+    /// pixels rather than a placement. It exists for *baking*: a tool that
+    /// packs a set of glyphs into one texture at build time needs the masks,
+    /// and reaching them through the runtime atlas would mean uploading pages
+    /// it never draws. So the mask is rasterised and cached but not placed.
+    ///
+    /// Returns `None` for a key the font has no outline for, and for a glyph
+    /// that is blank or zero-sized — a space, or a combining mark alone.
+    pub fn rasterise(&mut self, key: &cosmic_text::CacheKey) -> Option<GlyphMask> {
+        let image = self
+            .swash_cache
+            .get_image(&mut self.font_system, *key)
+            .clone()?;
+        let mask = alpha_mask(&image)?;
+        let (left, top) = (image.placement.left, -image.placement.top);
+        self.placements.insert(*key, (left, top));
+        return Some(mask);
     }
 }
 
