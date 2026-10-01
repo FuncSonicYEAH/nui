@@ -725,6 +725,348 @@ mod slot {
     }
 }
 
+/// `component Child extends Parent`: the checker flattens the parent into the
+/// child at compile time, so these tests exist to answer one question — does
+/// the *runtime* need to know? It does not, and that is the point: no
+/// `mangle.rs` or `instantiate.rs` change was needed for inheritance to work,
+/// which these tests pin down.
+///
+/// If the flattening ever stops happening, the failure mode is quiet: the
+/// parent's ids would miss the instance namespace and the first instance's
+/// `chip_box` would collide with the second's.
+mod extends {
+    use super::*;
+    use nui_runtime::element::SLOT as SLOT_ID;
+
+    /// The inherited body is built as if the child had written it itself.
+    #[test]
+    fn a_derived_component_builds_the_inherited_tree() {
+        let (tree, _engine) = build(
+            r#"
+            component Chip {
+                property label: String = "unnamed"
+                Rectangle(id = chip_box, width = 80dp, height = 30dp) {
+                    Text(id = chip_label, content <- label)
+                }
+            }
+            component Badge extends Chip {
+                property tone: Color = #ff0000
+            }
+            component App { Window(id = root) { Badge(id = a) } }
+            "#,
+        );
+        // The ids come from the parent, but they belong to the *derived*
+        // component's instance, so they carry that instance's namespace.
+        assert!(
+            tree.lookup_id("i1::chip_box").is_some(),
+            "the parent's box is namespaced to the derived instance"
+        );
+        assert!(
+            tree.lookup_id("i1::chip_label").is_some(),
+            "the parent's label is namespaced to the derived instance"
+        );
+    }
+
+    /// A derived body appends into the slot the parent left open.
+    #[test]
+    fn a_derived_body_lands_in_the_inherited_slot() {
+        let (tree, _engine) = build(
+            r#"
+            component Card {
+                Stack(id = self, width = 200dp, height = 200dp) {
+                    Rectangle(id = head, width = 200dp, height = 40dp)
+                    Slot { }
+                }
+            }
+            component Tinted extends Card {
+                Rectangle(id = tail, width = 200dp, height = 20dp)
+            }
+            component App { Window(id = root) { Tinted(id = a) } }
+            "#,
+        );
+        let root = tree.lookup_id("root").expect("the window");
+        let slot = tree
+            .descendants_of_type(root, SLOT_ID)
+            .first()
+            .copied()
+            .expect("the inherited slot survived");
+        let tail = tree.lookup_id("i1::tail").expect("the derived body node");
+        assert_eq!(
+            tree.arena[tail].parent,
+            Some(slot),
+            "the derived body is a child of the inherited slot"
+        );
+        // The parent's own head is still there, at the top of the stack.
+        let head = tree.lookup_id("i1::head").expect("the inherited head");
+        assert_ne!(
+            tree.arena[head].parent,
+            Some(slot),
+            "the inherited head stays where the parent put it"
+        );
+    }
+
+    /// Two instances of a derived component stay independent.
+    ///
+    /// This is the case the compile-time flattening exists to get right: the
+    /// parent's ids must be in the derived component's `own` set, or both
+    /// instances would share one `chip_box`.
+    #[test]
+    fn two_instances_of_a_derived_component_are_independent() {
+        let (mut tree, mut engine) = build(
+            r#"
+            component Chip {
+                property label: String = "unnamed"
+                Rectangle(id = chip_box, width = 80dp, height = 30dp) {
+                    Text(id = chip_label, content <- label, width = 80dp, height = 30dp)
+                }
+            }
+            component Badge extends Chip { property tone: Color = #ff0000 }
+            component App {
+                Window(id = root) {
+                    Row {
+                        Badge(id = one, label = "first")
+                        Badge(id = two, label = "second")
+                    }
+                }
+            }
+            "#,
+        );
+        engine.propagate(&mut tree);
+        let one_label = tree.lookup_id("i1::chip_label").expect("first label");
+        let two_label = tree.lookup_id("i2::chip_label").expect("second label");
+        assert_ne!(one_label, two_label, "each instance has its own label");
+        assert_eq!(
+            tree.arena[one_label].get("content"),
+            Some(&Value::String("first".to_string()))
+        );
+        assert_eq!(
+            tree.arena[two_label].get("content"),
+            Some(&Value::String("second".to_string()))
+        );
+    }
+
+    /// An overridden default reaches the inherited binding.
+    #[test]
+    fn an_overridden_property_feeds_the_inherited_tree() {
+        let (mut tree, mut engine) = build(
+            r#"
+            component Chip {
+                property label: String = "unnamed"
+                Text(id = chip_label, content <- label)
+            }
+            component Badge extends Chip {
+                property label: String = "badge"
+            }
+            component App { Window(id = root) { Badge(id = a) } }
+            "#,
+        );
+        engine.propagate(&mut tree);
+        let label = tree
+            .lookup_id("i1::chip_label")
+            .expect("the inherited label");
+        assert_eq!(
+            tree.arena[label].get("content"),
+            Some(&Value::String("badge".to_string())),
+            "the derived default wins over the parent's"
+        );
+    }
+
+    /// A three-level chain flattens all the way down.
+    #[test]
+    fn a_three_level_chain_instantiates() {
+        let (mut tree, mut engine) = build(
+            r#"
+            component A {
+                property tone: Color = #111111
+                Rectangle(id = box, fill <- tone) { }
+            }
+            component B extends A { property tone: Color = #222222 }
+            component C extends B { property tone: Color = #333333 }
+            component App { Window(id = root) { C(id = a) } }
+            "#,
+        );
+        engine.propagate(&mut tree);
+        let box_element = tree.lookup_id("i1::box").expect("the inherited box");
+        assert_eq!(
+            tree.arena[box_element].get("fill"),
+            Some(&Value::Color(nui_core::Color::from_rgb8(0x33, 0x33, 0x33))),
+            "the deepest override wins"
+        );
+    }
+
+    /// A derived component's element is the built-in it extends.
+    ///
+    /// The whole point of `extends Button`: the instance is a `Button` to
+    /// the widget layer, so hover, press and keyboard activation all
+    /// arrive without the document re-declaring them.
+    #[test]
+    fn a_derived_builtin_instances_as_that_builtin() {
+        let (tree, _engine) = build(
+            r#"
+            component Fancy extends Button {
+                property label: String = "Save"
+            }
+            component App { Window(id = root) { Fancy(id = save) } }
+            "#,
+        );
+        let save = tree.lookup_id("save").expect("the instance");
+        assert_eq!(
+            tree.arena[save].ty, "Button",
+            "the instance element is the built-in, not a wrapper"
+        );
+        assert_eq!(
+            tree.arena[save].component.as_deref(),
+            Some("Fancy"),
+            "and it still knows which component it came from"
+        );
+    }
+
+    /// The inherited properties reach the element, defaults included.
+    #[test]
+    fn inherited_builtin_properties_are_applied() {
+        let (mut tree, mut engine) = build(
+            r#"
+            component Fancy extends Button {
+                property label: String = "Save"
+                property variant: Enum = danger
+            }
+            component App { Window(id = root) { Fancy(id = save) } }
+            "#,
+        );
+        engine.propagate(&mut tree);
+        let save = tree.lookup_id("save").expect("the instance");
+        assert_eq!(
+            tree.arena[save].get("label"),
+            Some(&Value::String("Save".to_string())),
+            "the derived default reaches the element"
+        );
+        assert_eq!(
+            tree.arena[save].get("variant"),
+            Some(&Value::Enum("danger".to_string())),
+            "an overridden enum default reaches it too"
+        );
+    }
+
+    /// A call-site argument overrides the derived default.
+    #[test]
+    fn a_call_site_argument_overrides_the_derived_default() {
+        let (mut tree, mut engine) = build(
+            r#"
+            component Fancy extends Button {
+                property label: String = "Save"
+            }
+            component App {
+                Window(id = root) {
+                    Fancy(id = one)
+                    Fancy(id = two, label = "Cancel")
+                }
+            }
+            "#,
+        );
+        engine.propagate(&mut tree);
+        let one = tree.lookup_id("one").expect("first");
+        let two = tree.lookup_id("two").expect("second");
+        assert_eq!(
+            tree.arena[one].get("label"),
+            Some(&Value::String("Save".to_string()))
+        );
+        assert_eq!(
+            tree.arena[two].get("label"),
+            Some(&Value::String("Cancel".to_string())),
+            "the argument wins on the instance it was written on"
+        );
+    }
+
+    /// Two instances of a derived built-in stay independent.
+    ///
+    /// The same silent-failure shape as the plain-component case: it is
+    /// settled by the `iN::` namespace, which the flattened IR makes
+    /// correct without the runtime knowing about `extends`.
+    #[test]
+    fn two_instances_of_a_derived_builtin_are_independent() {
+        let (mut tree, mut engine) = build(
+            r#"
+            component Fancy extends Button {
+                property label: String = "Save"
+            }
+            component App {
+                Window(id = root) {
+                    Row {
+                        Fancy(id = one, label = "first")
+                        Fancy(id = two, label = "second")
+                    }
+                }
+            }
+            "#,
+        );
+        engine.propagate(&mut tree);
+        let one = tree.lookup_id("one").expect("first");
+        let two = tree.lookup_id("two").expect("second");
+        assert_eq!(
+            tree.arena[one].get("label"),
+            Some(&Value::String("first".to_string()))
+        );
+        assert_eq!(
+            tree.arena[two].get("label"),
+            Some(&Value::String("second".to_string()))
+        );
+    }
+
+    /// A chain works when it bottoms out in a built-in.
+    ///
+    /// `Bold extends Fancy extends Button`: the middle link is an ordinary
+    /// component, the last is a built-in, and the two mechanisms have to
+    /// compose rather than each handling only its own end.
+    #[test]
+    fn a_chain_through_a_component_to_a_builtin_works() {
+        let (mut tree, mut engine) = build(
+            r#"
+            component Fancy extends Button {
+                property label: String = "Save"
+                property variant: Enum = ghost
+            }
+            component Bold extends Fancy {
+                property label: String = "Delete"
+            }
+            component App { Window(id = root) { Bold(id = a) } }
+            "#,
+        );
+        engine.propagate(&mut tree);
+        let a = tree.lookup_id("a").expect("the instance");
+        assert_eq!(tree.arena[a].ty, "Button", "still a Button at the root");
+        assert_eq!(
+            tree.arena[a].get("label"),
+            Some(&Value::String("Delete".to_string())),
+            "the nearest override wins"
+        );
+        assert_eq!(
+            tree.arena[a].get("variant"),
+            Some(&Value::Enum("ghost".to_string())),
+            "the middle link's override survives"
+        );
+    }
+
+    /// Body nodes under a built-in parent are refused, not dropped.
+    ///
+    /// A built-in draws its own chrome and declares no `Slot`, so there is
+    /// nowhere for content to go. Silently ignoring it would render a
+    /// control missing whatever the author wrote, which is the failure D26
+    /// exists to prevent.
+    #[test]
+    fn a_body_under_a_builtin_parent_is_reported() {
+        let rendered = diagnostics_of(
+            r#"
+            component Fancy extends Button {
+                property label: String = "Save"
+                Rectangle(id = extra)
+            }
+            component App { Window(id = root) { Fancy(id = a) } }
+        "#,
+        );
+        assert!(rendered.contains("takes no content"), "{rendered}");
+    }
+}
+
 #[test]
 fn a_component_reference_takes_no_body_assignments() {
     let rendered = diagnostics_of(

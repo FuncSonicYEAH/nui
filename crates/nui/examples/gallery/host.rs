@@ -42,6 +42,14 @@ pub(crate) struct Page {
     pub(crate) label: &'static str,
     /// The `.nui` fragment (a single top-level element).
     pub(crate) body: &'static str,
+    /// Top-level `component` declarations the fragment uses, if any.
+    ///
+    /// A page body is spliced *inside* the gallery's `Scroll`, where only
+    /// element children are legal — a `component` written next to the
+    /// page's element would land inside that element and fail to parse.
+    /// Declarations therefore live beside the fragment and are hoisted to
+    /// document top level, before `Gallery`.
+    pub(crate) defs: &'static str,
 }
 
 /// Every page, in sidebar order.
@@ -54,71 +62,91 @@ pub(crate) const PAGES: &[Page] = &[
         key: "counter",
         label: "Counter",
         body: include_str!("pages/counter.nui"),
+        defs: "",
     },
     Page {
         key: "widgets",
         label: "Widgets",
         body: include_str!("pages/widgets.nui"),
+        defs: "",
     },
     Page {
         key: "text_fields",
         label: "Text fields",
         body: include_str!("pages/text_fields.nui"),
+        defs: "",
     },
     Page {
         key: "containers",
         label: "Containers",
         body: include_str!("pages/containers.nui"),
+        defs: "",
+    },
+    Page {
+        key: "inherit",
+        label: "Inheritance",
+        body: include_str!("pages/inherit.nui"),
+        defs: include_str!("pages/inherit_defs.nui"),
     },
     Page {
         key: "form",
         label: "Form",
         body: include_str!("pages/form.nui"),
+        defs: "",
     },
     Page {
         key: "list",
         label: "Virtual list",
         body: include_str!("pages/list.nui"),
+        defs: "",
     },
     Page {
         key: "todo",
         label: "Todo (model)",
         body: include_str!("pages/todo.nui"),
+        defs: "",
     },
     Page {
         key: "showcase",
         label: "Scroll + layers",
         body: include_str!("pages/showcase.nui"),
+        defs: "",
     },
     Page {
         key: "canvas",
         label: "Canvas",
         body: include_str!("pages/canvas.nui"),
+        defs: "",
     },
     Page {
         key: "paths",
         label: "Paths",
         body: include_str!("pages/paths.nui"),
+        defs: "",
     },
     Page {
         key: "strokes",
         label: "Strokes",
         body: include_str!("pages/strokes.nui"),
+        defs: "",
     },
     Page {
         key: "waves",
         label: "Waveline",
         body: include_str!("pages/waves.nui"),
+        defs: "",
     },
     Page {
         key: "transform",
         label: "Transform",
         body: include_str!("pages/transform.nui"),
+        defs: "",
     },
     Page {
         key: "image",
         label: "Image",
         body: include_str!("pages/image.nui"),
+        defs: "",
     },
 ];
 
@@ -199,7 +227,14 @@ pub(crate) fn document() -> String {
     write_demo_texture(&texture);
     let mut sidebar = String::new();
     let mut content = String::new();
+    let mut defs = String::new();
     for (slot, page) in PAGES.iter().enumerate() {
+        // Component declarations go to document top level: the body below
+        // is spliced *inside* the gallery's `Scroll`, and a `component`
+        // there would be a child node of the Scroll rather than a
+        // declaration.
+        defs.push_str(page.defs);
+        defs.push('\n');
         // Sidebar entry. `Rectangle` + `on click` rather than a `Button`:
         // any element receives `click` (the host emits it on the captured
         // element, not only on widget types), and a plain rect gives the
@@ -226,6 +261,7 @@ pub(crate) fn document() -> String {
     let page_count = PAGES.len();
     return format!(
         r#"
+{defs}
 component Gallery {{
     property page: Int = 0
 

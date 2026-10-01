@@ -1,0 +1,76 @@
+// The base. `Slot` is where derived bodies (and call sites) put their
+// content; `title` / `tone` are the API a derived component overrides.
+component Card {
+    property title: String = "Untitled"
+    property tone: Color = #336699
+    signal activated
+
+    Stack(id = self, width = 200dp, height = 190dp, padding = 14dp) {
+        Column(id = card_body, spacing = 8dp) {
+            Text(id = card_title, content <- title, font.size = 14dp,
+                 color = #e8ecf2)
+            Rectangle(id = card_mark, fill <- tone, height = 4dp, width = 60dp,
+                      radius = 2dp)
+            Slot { }
+        }
+    }
+}
+
+// One level down: override the defaults, add a reading and a bar.
+//
+// Note what is *not* written here — no `Stack`, no `Text(content <-
+// title)`, no `Slot`. All of that is `Card`'s tree, inherited whole.
+component StatCard extends Card {
+    property title: String = "Stat"
+    property tone: Color = #4c8bf5
+    property reading: Int = 0
+    property delta: Int = 0
+
+    Column(id = stat_body, spacing = 8dp) {
+        Text(id = stat_reading, content <- "reading = {reading}",
+             font.size = 26dp, color = #e8ecf2)
+        Text(id = stat_delta, content <- "delta = {delta}", font.size = 13dp,
+             color = #9aa4b2)
+        Rectangle(id = stat_bar, fill <- tone, height = 6dp, radius = 3dp,
+                  width = 140dp)
+    }
+}
+
+// Two levels down: `StatCard`'s body is now part of *this* body's
+// inherited tree, and this body's node lands after `stat_bar`.
+component SparkCard extends StatCard {
+    property tone: Color = #4caf7d
+
+    Column(id = spark_body, spacing = 6dp) {
+        Row(id = spark_row, spacing = 4dp, height = 24dp) {
+            Rectangle(fill <- tone, width = 12dp, radius = 2dp)
+            Rectangle(fill <- tone, width = 20dp, radius = 2dp)
+            Rectangle(fill <- tone, width = 8dp, radius = 2dp)
+            Rectangle(fill <- tone, width = 26dp, radius = 2dp)
+            Rectangle(fill <- tone, width = 16dp, radius = 2dp)
+        }
+    }
+}
+
+// Deriving from a *built-in* element.
+//
+// `Button` is not declared in this document — it is an element type the
+// runtime knows — so there is no `.nui` tree to inherit. What the derived
+// component gets instead is `Button`'s **property surface**, from the
+// table in `nui_core::props`: `label`, `variant`, `enabled`, `padding`,
+// `radius` and the rest, typed, with their defaults.
+//
+// Two consequences worth noticing:
+//
+// 1. The body may only *override inherited properties*. A bare node has
+//    nowhere to land — a `Button` declares no `Slot` — so the checker
+//    refuses it rather than dropping it silently.
+// 2. `PrimaryButton` is a `Button`: the runtime instantiates it as one,
+//    which is what lets a page treat it as a clickable control without
+//    the host having registered anything.
+component PrimaryButton extends Button {
+    property label: String = "Save"
+    property variant: Enum = primary
+    property radius: Length = 16dp
+    property height: Length = 32dp
+}

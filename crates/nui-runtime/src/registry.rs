@@ -385,10 +385,19 @@ impl Registry {
     }
 
     /// The vocabulary to compile a document against: every callable name,
-    /// plus which of them act rather than return.
+    /// which of them act rather than return, and the type names the host
+    /// registered.
+    ///
+    /// The component names matter for the same reason the function names
+    /// do, and their absence was a real gap: the compiler only knows the
+    /// *built-in* element types, so a document instantiating a
+    /// host-registered component looked identical to one instantiating a
+    /// type that does not exist. Reporting the names here is what lets the
+    /// checker keep the typo diagnostic (`Buton(...)`) without rejecting
+    /// the host's own types.
     ///
     /// Built per document load (and again per hot reload) rather than
-    /// cached, so a host that registers a command mid-session gets the
+    /// cached, so a host that registers a component mid-session gets the
     /// checker's answer on the next compile like any other registration.
     pub fn vocabulary(&self) -> nui_compiler::HostVocabulary {
         // `with_commands` counts the commands as callable names too, so the
@@ -401,7 +410,8 @@ impl Registry {
             .map(|(name, _)| return name.clone());
         return nui_compiler::HostVocabulary::new()
             .with_functions(values)
-            .with_commands(self.command_names());
+            .with_commands(self.command_names())
+            .with_components(self.components.keys().cloned());
     }
 }
 

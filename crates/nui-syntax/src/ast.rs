@@ -18,6 +18,13 @@ pub struct ComponentDecl {
     pub span: Span,
     /// Component name.
     pub name: Ident,
+    /// The `extends Parent` clause, if present.
+    ///
+    /// The parent names either another component in this document or a type
+    /// the host registered. The parent's properties, signals and body are
+    /// inherited; the declaring component's own members are layered on top.
+    /// See `nui-compiler` for the merge rules.
+    pub extends: Option<Ident>,
     /// Body members.
     pub members: Vec<ComponentMember>,
 }

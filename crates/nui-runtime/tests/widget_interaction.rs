@@ -9,7 +9,6 @@
 //! seam being tested.
 #![allow(clippy::unwrap_used)]
 
-use nui_compiler::compile;
 use nui_core::Value;
 use nui_runtime::{
     BehaviorContext, ComponentDesc, ElementBehavior, ElementId, ElementTree, Engine, Interaction,
@@ -21,8 +20,15 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 /// Compiles and instantiates a document with a registry, asserting the
 /// document is clean.
+///
+/// The document is checked against the *registry's* vocabulary rather than
+/// the built-in table alone: every source here instantiates a type the host
+/// registered (`RippleButton`, or whatever name the test chose), and a host
+/// type the compiler is not told about reads as a typo. Compiling and
+/// instantiating then agree by construction, which is the contract
+/// `Registry::vocabulary` exists to keep.
 fn build(source: &str, registry: Registry) -> (ElementTree, Engine) {
-    let outcome = compile(source);
+    let outcome = nui_compiler::compile_with_host(source, &registry.vocabulary());
     assert!(
         outcome.diagnostics.is_empty(),
         "test source must compile cleanly: {:?}",

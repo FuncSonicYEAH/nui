@@ -42,10 +42,14 @@ fn indent(level: usize) -> String {
 
 fn dump_component(component: &ComponentDecl, output: &mut String, level: usize) {
     output.push_str(&format!(
-        "{}(component {}\n",
+        "{}(component {}",
         indent(level),
         component.name.name
     ));
+    if let Some(parent) = &component.extends {
+        output.push_str(&format!(" extends {}", parent.name));
+    }
+    output.push('\n');
     for member in &component.members {
         dump_component_member(member, output, level + 1);
     }
@@ -721,6 +725,69 @@ component List {
     }
 }
 "#;
+
+const DERIVED: &str = r#"
+component Base {
+    property tone: Color = #336699
+    signal picked
+}
+
+component Tag extends Base {
+    property label: String = ""
+    Text(content <- label)
+}
+"#;
+
+#[test]
+fn snapshot_extends_component() {
+    let golden = r#"tokens:
+  keyword component
+  ident Base
+  punct {
+  keyword property
+  ident tone
+  punct :
+  ident Color
+  punct =
+  color #336699
+  keyword signal
+  ident picked
+  punct }
+  keyword component
+  ident Tag
+  ident extends
+  ident Base
+  punct {
+  keyword property
+  ident label
+  punct :
+  ident String
+  punct =
+  string ""
+  ident Text
+  punct (
+  ident content
+  punct <-
+  ident label
+  punct )
+  punct }
+  eof
+ast:
+  (component Base
+    (property tone :Color = (color #336699))
+    (signal picked)
+  }
+  (component Tag extends Base
+    (property label :String = (string ""))
+    (node Text
+      (assign content <- (ident label))
+    }
+  }
+diagnostics:
+  (none)
+"#;
+    assert_eq!(dump(DERIVED), golden);
+}
 
 #[test]
 fn snapshot_for_component() {

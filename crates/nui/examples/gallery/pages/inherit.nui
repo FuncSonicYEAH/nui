@@ -1,0 +1,76 @@
+// Component inheritance — `component Child extends Parent`.
+//
+// A page fragment is a single top-level element, so the demos below are
+// wrapped in one `Column`. The three component declarations follow it,
+// which also reads in the right order: the call sites, then the base,
+// then the two levels of derivation.
+//
+// The page shows the three things `extends` does, in the order they are
+// easy to get wrong:
+//
+// 1. `StatCard` inherits `Card`'s whole tree — boxes, ids, signals —
+//    without repeating it;
+// 2. `StatCard` *overrides* two of the properties `Card` declared, and
+//    the override reaches the inherited tree's bindings;
+// 3. `StatCard`'s own nodes are appended into the `Slot` `Card` left
+//    open, so the derived body extends the parent's layout instead of
+//    replacing it.
+Column(id = inherit_page, spacing = 14dp, padding = 24dp, height = 100%,
+       clicks = 0) {
+
+    Text(content = "extends", font.size = 16dp, color = #e8ecf2)
+
+    Text(content = "Card is the base: a title, a body slot, a tone.",
+         font.size = 13dp, color = #9aa4b2)
+
+    Row(spacing = 12dp, height = 200dp) {
+        // Overrides `title` and `tone`; the `Text` with
+        // `content <- title` inside `Card` picks both up, and the
+        // derived body's bar lands in `Card`'s slot.
+        StatCard(id = inherit_revenue, title = "Revenue", tone = #4c8bf5,
+                 reading = 128, delta = 12)
+        // The same derived component with different arguments: proof
+        // that two instances share nothing.
+        StatCard(id = inherit_latency, title = "Latency", tone = #e2a03f,
+                 reading = 41, delta = -3)
+        // A two-level chain: `SparkCard` extends `StatCard` extends
+        // `Card`. Its own body node lands in the same inherited slot,
+        // after `StatCard`'s bar.
+        SparkCard(id = inherit_requests, title = "Requests", tone = #4caf7d,
+                  reading = 302)
+    }
+    Separator(id = inherit_rule)
+
+    Text(content = "Card declares the Slot; every level below fills it.",
+         font.size = 13dp, color = #9aa4b2)
+
+    Row(spacing = 12dp, height = 44dp, align = "center") {
+        Button(label = "Count clicks", width = 130dp, height = 30dp) {
+            // `clicks` belongs to the page; the inherited tree is
+            // live, not a snapshot of it.
+            on click => inherit_page.clicks += 1
+        }
+        Text(content <- "clicks = {inherit_page.clicks}", font.size = 13dp,
+             color = #9aa4b2)
+    }
+
+    Separator(id = inherit_rule_2)
+
+    Text(content = "A built-in can be a parent too: PrimaryButton extends Button.",
+         font.size = 13dp, color = #9aa4b2)
+
+    Row(spacing = 12dp, height = 44dp, align = "center") {
+        // No tree of its own — `Button` has none to inherit. The derived
+        // component *is* one property table plus the overrides above, so
+        // it instantiates as a `Button` the runtime can click.
+        PrimaryButton(id = inherit_primary, width = 120dp)
+        // The same overrides with a different label: two instances, each
+        // carrying the derived defaults independently.
+        PrimaryButton(id = inherit_secondary, label = "Cancel", width = 120dp)
+    }
+
+    Spacer(id = inherit_filler)
+
+    Text(content = "Nothing here repeats Card's Stack, title or Slot.",
+         font.size = 13dp, color = #9aa4b2)
+}

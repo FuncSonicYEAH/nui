@@ -212,6 +212,9 @@ fn no_page_file_is_orphaned() {
     // `include_str!` already fails the build when a PAGES entry has no
     // file; this is the other direction — a file with no entry would
     // silently never appear in the gallery.
+    //
+    // A page may have two files: `<key>.nui` (the fragment) and
+    // `<key>_defs.nui` (the top-level component declarations it uses).
     let keys: Vec<&str> = host::PAGES.iter().map(|page| return page.key).collect();
     let dir = std::fs::read_dir("examples/gallery/pages")
         .expect("tests run from the crate root, so the pages dir is reachable");
@@ -221,8 +224,9 @@ fn no_page_file_is_orphaned() {
             continue;
         }
         let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        let owner = stem.strip_suffix("_defs").unwrap_or(&stem);
         assert!(
-            keys.contains(&stem.as_str()),
+            keys.contains(&owner),
             "`pages/{stem}.nui` is not in the gallery's PAGES table — it will never be shown"
         );
     }

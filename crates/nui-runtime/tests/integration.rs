@@ -4,16 +4,20 @@
 //! timers — without any rendering.
 #![allow(clippy::unwrap_used)]
 
-use nui_compiler::compile;
 use nui_core::{Duration, Value};
-use nui_runtime::{Engine, instantiate};
+use nui_runtime::{Engine, instantiate, instantiate_with};
 
 /// Test error type for `Result`-returning tests.
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// Compiles and instantiates a source document.
+/// Compiles and instantiates a source document whose types are all built in.
+///
+/// A document that names a *host*-registered type has to go through
+/// [`compile_for`] instead: the compiler only knows the built-in element
+/// table, so a host type that is never declared in the vocabulary reads as
+/// a typo.
 fn build(source: &str) -> (nui_runtime::ElementTree, Engine) {
-    let outcome = compile(source);
+    let outcome = nui_compiler::compile(source);
     assert!(
         outcome.diagnostics.is_empty(),
         "test source must compile cleanly: {:?}",
@@ -21,6 +25,34 @@ fn build(source: &str) -> (nui_runtime::ElementTree, Engine) {
     );
     let instance = instantiate(&outcome.document);
     return (instance.tree, instance.engine);
+}
+
+/// Compiles a document that names host-registered element types.
+///
+/// These tests drive a `TextField` or a `Checkbox` — types the *host* owns,
+/// which the compiler has no built-in entry for. They still have to compile
+/// against a vocabulary that names them, or the checker reports them as
+/// typos (`unknown element type`). The vocabulary is built from the same
+/// registry the document is then instantiated with, which is the contract
+/// `Registry::vocabulary` exists to serve.
+fn compile_for(registry: &nui_runtime::Registry, source: &str) -> nui_compiler::CompileOutcome {
+    let outcome = nui_compiler::compile_with_host(source, &registry.vocabulary());
+    assert!(
+        outcome.diagnostics.is_empty(),
+        "test source must compile cleanly: {:?}",
+        outcome.diagnostics
+    );
+    return outcome;
+}
+
+/// A registry that registers the named types with a do-nothing behavior,
+/// for the tests whose point is the *typing* rather than the behavior.
+fn types_only(names: &[&str]) -> nui_runtime::Registry {
+    let mut registry = nui_runtime::Registry::new();
+    for name in names {
+        registry.register_component(nui_runtime::ComponentDesc::new(*name), None);
+    }
+    return registry;
 }
 
 const STATEFUL_COUNTER: &str = r#"
@@ -265,7 +297,10 @@ fn two_way_binding_syncs_both_directions() {
             }
         }
     "#;
-    let (mut tree, mut engine) = build(source);
+    let registry = types_only(&["TextField"]);
+    let outcome = compile_for(&registry, source);
+    let instance = instantiate_with(&outcome.document, registry);
+    let (mut tree, mut engine) = (instance.tree, instance.engine);
     let field = tree.lookup_id("field").unwrap();
     let root = tree.lookup_id("root").unwrap();
     assert!(
@@ -314,7 +349,10 @@ fn a_two_way_pair_is_driven_from_a_visual_state_block() {
             }
         }
     "#;
-    let (mut tree, mut engine) = build(source);
+    let registry = types_only(&["TextField"]);
+    let outcome = compile_for(&registry, source);
+    let instance = instantiate_with(&outcome.document, registry);
+    let (mut tree, mut engine) = (instance.tree, instance.engine);
     let field = tree.lookup_id("field").unwrap();
     let root = tree.lookup_id("root").unwrap();
 
@@ -353,7 +391,10 @@ fn an_effect_write_reaches_a_two_way_partner() {
             }
         }
     "#;
-    let (mut tree, mut engine) = build(source);
+    let registry = types_only(&["TextField"]);
+    let outcome = compile_for(&registry, source);
+    let instance = instantiate_with(&outcome.document, registry);
+    let (mut tree, mut engine) = (instance.tree, instance.engine);
     let field = tree.lookup_id("field").unwrap();
     let opener = tree.lookup_id("opener").unwrap();
     let root = tree.lookup_id("root").unwrap();
@@ -386,7 +427,10 @@ fn a_two_way_pair_declared_from_both_sides_terminates() {
             }
         }
     "#;
-    let (mut tree, mut engine) = build(source);
+    let registry = types_only(&["TextField"]);
+    let outcome = compile_for(&registry, source);
+    let instance = instantiate_with(&outcome.document, registry);
+    let (mut tree, mut engine) = (instance.tree, instance.engine);
     let a = tree.lookup_id("a").unwrap();
     let b = tree.lookup_id("b").unwrap();
 
@@ -1129,7 +1173,7 @@ fn custom_component_carries_descriptor_and_behavior() {
         }),
         Some(Box::new(|| return Box::new(TallyBehavior))),
     );
-    let outcome = nui_compiler::compile(source);
+    let outcome = compile_for(&registry, source);
     assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
     let instance = instantiate_with(&outcome.document, registry);
     let mut tree = instance.tree;
@@ -1156,7 +1200,7 @@ fn custom_component_carries_descriptor_and_behavior() {
 /// remove button, and a tweened opacity driven by the model field.
 #[test]
 fn todo_demo_pipeline_end_to_end() {
-    use nui_compiler::{Type, compile};
+    use nui_compiler::Type;
     use nui_core::Color;
     use nui_runtime::{
         BehaviorContext, ComponentDesc, ElementBehavior, PropertyDescriptor, Registry, VecModel,
@@ -1260,7 +1304,7 @@ fn todo_demo_pipeline_end_to_end() {
     );
     registry.register_function("log", Box::new(|_| return Ok(Value::Bool(true))));
 
-    let outcome = compile(TODO);
+    let outcome = compile_for(&registry, TODO);
     assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
     let instance = instantiate_with(&outcome.document, registry);
     let mut tree = instance.tree;

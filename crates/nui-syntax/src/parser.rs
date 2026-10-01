@@ -63,6 +63,12 @@ impl Parser {
             return None;
         }
         let name = self.expect_ident()?;
+        let extends = if self.at_word("extends") {
+            self.bump(); // `extends`
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
         if !self.expect_punct(Punct::LBrace) {
             return None;
         }
@@ -71,6 +77,7 @@ impl Parser {
         return Some(ComponentDecl {
             span: self.span_from(start_index),
             name,
+            extends,
             members,
         });
     }
@@ -716,6 +723,13 @@ impl Parser {
         return None;
     }
 
+    /// Whether the cursor is an identifier with exactly this text, without
+    /// consuming it. The lookahead half of [`Self::expect_word`], for a
+    /// contextual keyword that may or may not appear (`extends`).
+    fn at_word(&self, word: &str) -> bool {
+        return matches!(self.peek(), TokenKind::Ident(name) if name == word);
+    }
+
     /// Matches an identifier by exact text without reserving it (`from` in
     /// transitions); reports a diagnostic on mismatch.
     fn expect_word(&mut self, word: &str) -> bool {
@@ -1049,5 +1063,58 @@ mod tests {
             &assignment.value,
             Expr::Length { length, .. } if matches!(length, nui_core::Length::Dp(420.0))
         ));
+    }
+
+    #[test]
+    fn a_component_may_extend_another() {
+        let source = r#"
+            component Base { property tone: Color = #336699 }
+            component Derived extends Base {
+                property extra: Int = 1
+            }
+        "#;
+        let document = parse_ok(source);
+        assert!(
+            document.components[0].extends.is_none(),
+            "the base extends nothing"
+        );
+        let parent = document.components[1]
+            .extends
+            .as_ref()
+            .expect("Derived extends Base");
+        assert_eq!(parent.name, "Base");
+        // The parent's own members are unaffected.
+        assert_eq!(document.components[1].members.len(), 1);
+    }
+
+    #[test]
+    fn extends_is_not_a_reserved_word() {
+        // A contextual keyword, like `from`: a component may still call a
+        // property, an id or a node type `extends`.
+        let source = r#"
+            component A {
+                property extends: Int = 0
+                Window(id = extends) { Text(content = "extends") }
+            }
+        "#;
+        let document = parse_ok(source);
+        let ComponentMember::Property(property) = &document.components[0].members[0] else {
+            panic!("expected the property declaration");
+        };
+        assert_eq!(property.name.name, "extends");
+        assert!(document.components[0].extends.is_none(), "no parent clause");
+    }
+
+    #[test]
+    fn a_dangling_extends_is_diagnosed() {
+        let outcome = parse("component A extends { }");
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| return d.message.contains("identifier")),
+            "the missing parent name is reported: {:?}",
+            outcome.diagnostics
+        );
     }
 }

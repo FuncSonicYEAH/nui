@@ -33,6 +33,13 @@
 //! [`host::PAGES`] stays the single source of truth for what the sidebar
 //! shows and what index selects it.
 //!
+//! A third convention covers `component` declarations: a fragment is
+//! spliced *inside* the gallery's `Scroll`, where only element children
+//! are legal, so a `component` written next to the page's element would
+//! be a child node of that element and fail to parse. Declarations
+//! therefore live in a sibling `<key>_defs.nui`, and the assembly hoists
+//! them to document top level (see `Page::defs`).
+//!
 //! The document text, the page table, and the host-side models and
 //! behaviors live in [`host`] — a module `tests/gallery.rs` includes too,
 //! by path, so the test drives the very same gallery rather than a
