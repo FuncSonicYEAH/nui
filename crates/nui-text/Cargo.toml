@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 nui-core.workspace = true
+nui-tools.workspace = true
 cosmic-text = "0.19"
 fontdb = "0.23"
 swash = "0.2"

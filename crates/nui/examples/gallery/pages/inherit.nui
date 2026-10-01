@@ -15,8 +15,8 @@
 // 3. `StatCard`'s own nodes are appended into the `Slot` `Card` left
 //    open, so the derived body extends the parent's layout instead of
 //    replacing it.
-Column(id = inherit_page, spacing = 14dp, padding = 24dp, height = 100%,
-       clicks = 0) {
+Column(id = inherit_page, spacing = 14dp, padding = 24dp, height = 100%) {
+    state clicks: Int = 0
 
     Text(content = "extends", font.size = 16dp, color = #e8ecf2)
 

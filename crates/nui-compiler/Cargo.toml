@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 nui-core.workspace = true
 nui-syntax.workspace = true
+nui-tools.workspace = true
 
 [lints]
 workspace = true

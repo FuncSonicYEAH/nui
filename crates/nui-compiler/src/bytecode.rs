@@ -174,6 +174,27 @@ pub enum TypedExpr {
         /// Result type (unknown for host functions; the host owns typing).
         ty: Type,
     },
+    /// A call to a document-declared `fn` (see [`crate::document::FunctionIr`]).
+    ///
+    /// Arguments are checked against the declared parameter list at compile
+    /// time (arity, types, named/default filling), so the runtime only has
+    /// to bind the values into a fresh frame and run the body.
+    UserCall {
+        /// Declared function name.
+        name: String,
+        /// Checked arguments, in declaration order.
+        ///
+        /// A *supplied* argument is its expression; an *omitted* one with a
+        /// default is [`TypedExpr::Error`] at the matching index, and the
+        /// runtime substitutes the declaration's default (see the
+        /// `defaulted` mask).
+        args: Vec<TypedExpr>,
+        /// Parallel to `args`: whether the argument was omitted and must be
+        /// filled from the declaration's default.
+        defaulted: Vec<bool>,
+        /// Result type.
+        ty: Type,
+    },
     /// Interpolated string.
     Interp {
         /// Text and expression parts.
@@ -212,7 +233,8 @@ impl TypedExpr {
             | TypedExpr::Binary { ty, .. }
             | TypedExpr::Ternary { ty, .. }
             | TypedExpr::Call { ty, .. }
-            | TypedExpr::HostCall { ty, .. } => *ty,
+            | TypedExpr::HostCall { ty, .. }
+            | TypedExpr::UserCall { ty, .. } => *ty,
             TypedExpr::Interp { .. } => Type::String,
             TypedExpr::Dynamic { .. } => Type::Unknown,
             TypedExpr::Error => Type::Unknown,
@@ -239,6 +261,10 @@ impl TypedExpr {
                 .map(|arg| return arg.span())
                 .unwrap_or(Span::new(0, 0)),
             TypedExpr::HostCall { args, .. } => args
+                .first()
+                .map(|arg| return arg.span())
+                .unwrap_or(Span::new(0, 0)),
+            TypedExpr::UserCall { args, .. } => args
                 .first()
                 .map(|arg| return arg.span())
                 .unwrap_or(Span::new(0, 0)),
@@ -298,6 +324,31 @@ pub enum Effect {
         callee: Vec<String>,
         /// Checked arguments.
         args: Vec<TypedExpr>,
+    },
+    /// Call to a document-declared function in statement position
+    /// (`announce(2)`).
+    ///
+    /// Distinct from [`Effect::Call`], which addresses an element by id and
+    /// dispatches through the method table: a user function is resolved by
+    /// name from the engine's function table and its result (for a valued
+    /// function) is discarded.
+    UserCall {
+        /// Declared function name.
+        name: String,
+        /// Checked arguments, in declaration order.
+        args: Vec<TypedExpr>,
+        /// Parallel to `args`: whether the argument was omitted and must be
+        /// filled from the declaration's default.
+        defaulted: Vec<bool>,
+    },
+    /// `return expr` inside a document-level function body.
+    ///
+    /// A bare expression evaluates for its side effect and its value is
+    /// discarded; the runtime stops the body and hands the value back to
+    /// the caller's call frame.
+    Return {
+        /// Returned value; `None` returns `Void` early.
+        value: Option<TypedExpr>,
     },
 }
 

@@ -21,8 +21,9 @@ pub mod types;
 pub use bytecode::{AssignOp, Builtin, Effect, InterpPart, PropertyTarget, TypedExpr};
 pub use check::{CheckOutcome, check, check_with, check_with_host, check_with_vocabulary};
 pub use document::{
-    AssignmentIr, ComponentIr, DocumentIr, ForIr, HandlerIr, InitKind, MachineIr, NodeIr,
-    PropertyDefaultIr, PropertyIr, StateIr, TransitionIr, WhenIr, assign_op_name,
+    AssignmentIr, ComponentIr, DocumentIr, ForIr, FunctionIr, HandlerIr, InitKind, MachineIr,
+    NodeIr, ParameterIr, PropertyDefaultIr, PropertyIr, StateIr, TransitionIr, WhenIr,
+    assign_op_name,
 };
 pub use types::{Type, unify};
 

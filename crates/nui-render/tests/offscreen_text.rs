@@ -35,6 +35,7 @@ fn text_pipeline_draws_glyph_pixels() {
         nui_render::SceneContext {
             focused: None,
             image_keys: &std::collections::HashMap::new(),
+            engine: None,
         },
     );
     assert!(

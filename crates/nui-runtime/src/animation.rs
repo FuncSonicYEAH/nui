@@ -327,9 +327,15 @@ fn numeric_value(raw: f64, like: &Value) -> Value {
 }
 
 /// Interpolates between two values of the same type at `progress` (0..=1).
+///
+/// The numeric mixing itself is [`nui_tools::lerp_f64`] — it was a local
+/// `mix` closure here, and the same arithmetic was also spelled out in
+/// `nui-core`'s color and the renderer's scene builder. What is specific
+/// to this function is the *dispatch*: which `Value` variants can be
+/// interpolated at all, and which hold their target.
 fn interpolate(from: &Value, to: &Value, progress: f64) -> Value {
     let mix = |a: f64, b: f64| -> f64 {
-        return a + (b - a) * progress;
+        return nui_tools::lerp_f64(a, b, progress);
     };
     return match (from, to) {
         (Value::Int(a), Value::Int(b)) => Value::Int(mix(*a as f64, *b as f64) as i64),

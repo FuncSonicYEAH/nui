@@ -199,11 +199,16 @@ const fn f(name: &'static str, ty: PropType, default: DefaultValue) -> PropDecl 
 /// Blank `Length` default: the caller's `auto`.
 const AUTO: DefaultValue = DefaultValue::Length(Length::Auto);
 
-/// Four properties every element accepts, whatever else it declares.
+/// The properties every element accepts, whatever else it declares.
 ///
 /// `id` is deliberately absent: it is syntax (a pseudo-property the
 /// compiler resolves into the element's name), not a value slot, and
 /// listing it here would make `id` look assignable in an effect.
+///
+/// `key` is here rather than on `For`/`ListView` because the reconciler
+/// reads it off *any* element when it matches old children against new
+/// (`nui-runtime::keys::KEY_PROPERTY`), so every type has to accept it for
+/// the write to type-check.
 ///
 /// `width` / `height` default to `auto` rather than a number because that
 /// is what the layout reads when nothing is set — this entry documents the
@@ -214,6 +219,7 @@ pub const UNIVERSAL: &[PropDecl] = &[
     f("height", PropType::Length, AUTO),
     f("visible", PropType::Bool, DefaultValue::Bool(true)),
     f("opacity", PropType::Float, DefaultValue::Number(1.0)),
+    f("key", PropType::String, DefaultValue::None),
 ];
 
 /// The layout properties every *box* takes, on top of [`UNIVERSAL`].
@@ -277,7 +283,7 @@ pub const PAINT: &[PropDecl] = &[
 macro_rules! element {
     ($($extra:expr),* $(,)?) => {
         &[
-            UNIVERSAL[0], UNIVERSAL[1], UNIVERSAL[2], UNIVERSAL[3],
+            UNIVERSAL[0], UNIVERSAL[1], UNIVERSAL[2], UNIVERSAL[3], UNIVERSAL[4],
             LAYOUT[0], LAYOUT[1], LAYOUT[2], LAYOUT[3], LAYOUT[4], LAYOUT[5], LAYOUT[6],
             PAINT[0], PAINT[1], PAINT[2], PAINT[3], PAINT[4],
             PAINT[5], PAINT[6], PAINT[7], PAINT[8],
@@ -419,11 +425,18 @@ pub static TABLE: &[TypeProps] = &[
     },
     // A virtualized list. It shares `For`'s binding path and adds the
     // scroll offset the engine advances; the row prototype is the body,
-    // which is why there is no `items` here.
+    // which is why there is no `items` here. `row_height` is the fixed
+    // extent the virtualizer windows against — read by
+    // `nui-runtime::widget::scroll`, and `0.0` means "measure each row".
     TypeProps {
         ty: "ListView",
         props: element!(
             f("scroll_y", PropType::Number, DefaultValue::Number(0.0)),
+            f(
+                "row_height",
+                PropType::Length,
+                DefaultValue::Length(Length::Dp(0.0))
+            ),
             f(
                 "padding",
                 PropType::Length,
@@ -469,10 +482,15 @@ pub static TABLE: &[TypeProps] = &[
     // A polyline and an arc are the two shapes `Path`'s SVG-ish `d` cannot
     // express as directly: a polyline is a point list, an arc is a centre, a
     // radius and a sweep. Both are stroked, so both read the `stroke.*`
-    // family that `PAINT` already provides.
+    // family that `PAINT` already provides — and both name their colour
+    // with `color` rather than `fill`, because `stroke_of` checks `color`
+    // first and there is no fill to fall back to.
     TypeProps {
         ty: "Polyline",
-        props: element!(f("points", PropType::String, DefaultValue::None)),
+        props: element!(
+            f("points", PropType::String, DefaultValue::None),
+            f("color", PropType::Color, DefaultValue::None),
+        ),
     },
     TypeProps {
         ty: "Arc",
@@ -481,6 +499,7 @@ pub static TABLE: &[TypeProps] = &[
             f("cy", PropType::Number, DefaultValue::Number(0.0)),
             f("start", PropType::Number, DefaultValue::Number(0.0)),
             f("end", PropType::Number, DefaultValue::Number(360.0)),
+            f("color", PropType::Color, DefaultValue::None),
         ),
     },
     TypeProps {
@@ -496,10 +515,11 @@ pub static TABLE: &[TypeProps] = &[
         ),
     },
     // A canvas is painted by host code, so its document-facing surface is
-    // only its geometry.
+    // only its geometry — plus `clip`, which the scene builder honours for
+    // every element and a host painter's overdraw makes worth setting.
     TypeProps {
         ty: "Canvas",
-        props: UNIVERSAL,
+        props: element!(),
     },
     // ---------------------------------------------------------------- //
     // Text-bearing types. `Text` and `TextInput` both size and shape
@@ -543,6 +563,11 @@ pub static TABLE: &[TypeProps] = &[
             f("placeholder", PropType::String, DefaultValue::Text("")),
             f("multiline", PropType::Bool, DefaultValue::Bool(false)),
             f("read_only", PropType::Bool, DefaultValue::Bool(false)),
+            // `password` masks the display, `reveal` un-masks it again —
+            // `is_password()` is the conjunction of the two, which is why
+            // they are a pair rather than one three-state flag.
+            f("password", PropType::Bool, DefaultValue::Bool(false)),
+            f("reveal", PropType::Bool, DefaultValue::Bool(false)),
             f("max_length", PropType::Int, DefaultValue::None),
             f("validator", PropType::Enum, DefaultValue::Text("none")),
             f("invalid", PropType::Bool, DefaultValue::Bool(false)),
@@ -812,7 +837,7 @@ mod tests {
             if matches!(entry.ty, "Timer" | "For") {
                 continue;
             }
-            for name in ["width", "height", "visible", "opacity"] {
+            for name in ["width", "height", "visible", "opacity", "key"] {
                 assert!(
                     prop_of(entry.ty, name).is_some(),
                     "{} is missing `{name}`",
@@ -820,6 +845,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn key_is_accepted_wherever_the_reconciler_reads_it() {
+        // The reconciler matches children by `key` on any element, so a
+        // document may write it on a `Rectangle` just as validly as on an
+        // `Item` inside a `For`. Listing it only on the loop types would
+        // have made the write un-type-checkable.
+        assert!(prop_of("Rectangle", "key").is_some());
+        assert!(prop_of("Column", "key").is_some());
+        assert!(prop_of("Text", "key").is_some());
     }
 
     #[test]

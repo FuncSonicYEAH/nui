@@ -4,8 +4,8 @@
 //
 // The page declares `height = 100%`, so it fills the viewport it is given
 // and the trailing `Spacer` has free space to push against.
-Column(id = containers_page, spacing = 14dp, padding = 24dp, height = 100%,
-       clicks = 0) {
+Column(id = containers_page, spacing = 14dp, padding = 24dp, height = 100%) {
+    state clicks: Int = 0
 
     Text(content = "Panel / Card", font.size = 16dp, color = #e8ecf2)
 

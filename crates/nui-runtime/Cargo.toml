@@ -10,6 +10,7 @@ license.workspace = true
 nui-core.workspace = true
 nui-compiler.workspace = true
 nui-syntax.workspace = true
+nui-tools.workspace = true
 slotmap = "1"
 
 [lints]

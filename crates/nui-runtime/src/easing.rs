@@ -85,33 +85,25 @@
 //! - `emphasized` does **not** overshoot. Every control point of it lies
 //!   within its own segment's span, so it reaches 1 from below.
 
-/// One cubic-bezier segment: `(x0, y0, x1, y1, x2, y2, x3, y3)` — the
-/// segment's two endpoints followed by its two control points, in the
-/// order CSS's `cubic-bezier()` takes them.
-pub type BezierSegment = [f64; 8];
+// -- cubic-bezier evaluation (moved to `nui-tools`) ------------------------
+//
+// The numerics live in `nui-tools::curve` and are re-exported here, because
+// this module is the only consumer and the names read as part of its
+// vocabulary. What stayed behind is the part that is about *this* module's
+// subject rather than arithmetic: the [`Easing`] enum, the named [`CURVES`]
+// table, and the name lookup. Those are a design-system opinion;
+// `nui-tools::curve` has none.
+//
+// The module docs above still describe the segment form and the
+// Newton/bisection inversion, because this is where a reader looks for
+// "what is an easing curve". The implementation they describe is one crate
+// down.
 
-/// A piecewise cubic-bezier curve: one or more segments in time order.
-///
-/// Consecutive segments share an endpoint, which is what makes the curve
-/// continuous across the join.
-pub type BezierCurve = &'static [BezierSegment];
+pub use nui_tools::curve::{
+    BezierCurve, BezierSegment, apply_bezier, bezier_axis, bezier_x, bezier_x_slope, bezier_y,
+    solve_segment_x,
+};
 
-/// Newton iterations before falling back to bisection.
-///
-/// Eight is enough for every curve in the table to land well inside a
-/// pixel of progress at UI durations. The bisection fallback is what makes
-/// a degenerate curve terminate: `standard-decelerate` has both control
-/// points at `x = 0`, so `x(u) = u³` has zero slope at `u = 0` and Newton
-/// cannot take a first step.
-const NEWTON_ITERATIONS: usize = 8;
-
-/// Bisection iterations, used once Newton stops making progress.
-///
-/// Each halves the interval, so 24 is past the point where `f64` runs out
-/// of mantissa to tell the endpoints apart.
-const BISECTION_ITERATIONS: usize = 24;
-
-/// Easing curve of a tween.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Easing {
     /// Linear (`x = t`).
@@ -242,117 +234,6 @@ impl Easing {
             Easing::Bezier(curve) => return apply_bezier(curve, clamped),
         };
     }
-}
-
-/// Evaluates a piecewise cubic-bezier curve at progress `t`.
-///
-/// Global progress is mapped onto each segment in proportion to that
-/// segment's share of the timeline, then inverted within the segment. The
-/// segments share endpoints, so the value is continuous across a join even
-/// though each segment is evaluated on its own `0..=1`.
-fn apply_bezier(curve: BezierCurve, t: f64) -> f64 {
-    if curve.is_empty() {
-        return t;
-    }
-    let mut elapsed = 0.0;
-    for (index, segment) in curve.iter().enumerate() {
-        let span = segment[6] - segment[0];
-        let is_last = index + 1 == curve.len();
-        if t <= elapsed + span || is_last {
-            if span <= 0.0 {
-                // A zero-width segment is a pause in the motion. The
-                // endpoints are where the value sits either side of it.
-                return if t < elapsed { segment[1] } else { segment[7] };
-            }
-            let local = ((t - elapsed) / span).clamp(0.0, 1.0);
-            let u = solve_segment_x(segment, local);
-            return bezier_y(segment, u);
-        }
-        elapsed += span;
-    }
-    return 1.0;
-}
-
-/// The `u` at which a segment's x coordinate equals `x`.
-///
-/// Newton–Raphson, with bisection as the fallback. Bisection is not only a
-/// safety net: it is what makes the *initial* step possible on a curve
-/// whose slope is zero at `u = 0`, and what keeps a Newton step that would
-/// leave the bracket from being taken.
-fn solve_segment_x(segment: &BezierSegment, x: f64) -> f64 {
-    let mut low = 0.0;
-    let mut high = 1.0;
-    let mut guess = x;
-    for _ in 0..NEWTON_ITERATIONS {
-        let error = bezier_x(segment, guess) - x;
-        if error.abs() < 1e-9 {
-            return guess;
-        }
-        if error > 0.0 {
-            high = guess;
-        } else {
-            low = guess;
-        }
-        let slope = bezier_x_slope(segment, guess);
-        if slope.abs() > 1e-9 {
-            let next = guess - error / slope;
-            if next > low && next < high {
-                guess = next;
-                continue;
-            }
-        }
-        guess = (low + high) / 2.0;
-    }
-    for _ in 0..BISECTION_ITERATIONS {
-        let value = bezier_x(segment, guess);
-        if (value - x).abs() < 1e-9 {
-            return guess;
-        }
-        if value > x {
-            high = guess;
-        } else {
-            low = guess;
-        }
-        guess = (low + high) / 2.0;
-    }
-    return guess;
-}
-
-/// A segment's x coordinate at `u`: the timeline axis.
-fn bezier_x(segment: &BezierSegment, u: f64) -> f64 {
-    return bezier_axis(segment, 0, u);
-}
-
-/// A segment's y coordinate at `u`: the value axis.
-fn bezier_y(segment: &BezierSegment, u: f64) -> f64 {
-    return bezier_axis(segment, 1, u);
-}
-
-/// One axis of a segment at `u`.
-///
-/// `axis` is 0 for x and 1 for y; the eight numbers interleave as
-/// `x0 y0 x1 y1 x2 y2 x3 y3`, so the four points of the axis are
-/// `segment[axis]`, `segment[2 + axis]`, `segment[4 + axis]`,
-/// `segment[6 + axis]`.
-fn bezier_axis(segment: &BezierSegment, axis: usize, u: f64) -> f64 {
-    let p0 = segment[axis];
-    let p1 = segment[2 + axis];
-    let p2 = segment[4 + axis];
-    let p3 = segment[6 + axis];
-    let inverse = 1.0 - u;
-    return inverse * inverse * inverse * p0
-        + 3.0 * inverse * inverse * u * p1
-        + 3.0 * inverse * u * u * p2
-        + u * u * u * p3;
-}
-
-/// The derivative of [`bezier_x`].
-fn bezier_x_slope(segment: &BezierSegment, u: f64) -> f64 {
-    let (p0, p1, p2, p3) = (segment[0], segment[2], segment[4], segment[6]);
-    let inverse = 1.0 - u;
-    return 3.0 * inverse * inverse * (p1 - p0)
-        + 6.0 * inverse * u * (p2 - p1)
-        + 3.0 * u * u * (p3 - p2);
 }
 
 #[cfg(test)]

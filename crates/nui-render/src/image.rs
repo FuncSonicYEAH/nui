@@ -57,19 +57,13 @@ pub fn decode_file(path: &str) -> Result<DecodedImage, ImageLoadError> {
 
 /// The texture cache key: path plus content hash, so a changed file with
 /// the same path invalidates (plan §6.3 「路径+内容哈希」).
-pub fn cache_key(path: &str, content_hash: u64) -> String {
-    return format!("{path}:{content_hash:016x}");
-}
-
-/// FNV-1a content hash (stable across runs; no crypto needs here).
-pub fn content_hash(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    return hash;
-}
+///
+/// Re-exported rather than defined here: the format is plain string
+/// arithmetic, and it lives in [`nui_tools::hash`] so that a non-render
+/// consumer (a tool computing the same key to look a texture up) cannot
+/// derive it slightly differently. The path below is the one external
+/// callers already use — `nui_render::cache_key` — and it still resolves.
+pub use nui_tools::hash::{cache_key, content_hash};
 
 /// A sub-rectangle of a texture, in **texture pixels**.
 ///

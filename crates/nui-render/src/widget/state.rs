@@ -7,6 +7,7 @@
 
 use nui_core::Color;
 use nui_runtime::Element;
+use nui_tools::blend_u8;
 
 use crate::props::{bool_property, bool_property_or, color_property};
 
@@ -166,9 +167,9 @@ pub fn variant_palette(name: &str, base: Palette) -> Palette {
 pub fn lighten(color: Color, amount: f32) -> Color {
     let amount = amount.clamp(0.0, 1.0);
     return Color::from_rgba8(
-        blend(color.red8(), 255, amount),
-        blend(color.green8(), 255, amount),
-        blend(color.blue8(), 255, amount),
+        blend_u8(color.red8(), 255, amount),
+        blend_u8(color.green8(), 255, amount),
+        blend_u8(color.blue8(), 255, amount),
         color.alpha8(),
     );
 }
@@ -177,16 +178,11 @@ pub fn lighten(color: Color, amount: f32) -> Color {
 pub fn darken(color: Color, amount: f32) -> Color {
     let amount = amount.clamp(0.0, 1.0);
     return Color::from_rgba8(
-        blend(color.red8(), 0, amount),
-        blend(color.green8(), 0, amount),
-        blend(color.blue8(), 0, amount),
+        blend_u8(color.red8(), 0, amount),
+        blend_u8(color.green8(), 0, amount),
+        blend_u8(color.blue8(), 0, amount),
         color.alpha8(),
     );
-}
-
-fn blend(from: u8, to: u8, amount: f32) -> u8 {
-    let value = from as f32 + (to as f32 - from as f32) * amount;
-    return value.round().clamp(0.0, 255.0) as u8;
 }
 
 /// Multiplies a color's alpha.

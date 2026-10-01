@@ -105,6 +105,21 @@ type WhenOverrides = HashMap<(ElementId, String), Vec<WhenOverride>>;
 /// Evaluation depth cap (plan §12 second line of defense).
 const MAX_EVAL_DEPTH: usize = 64;
 
+/// A document-declared function the engine can call.
+///
+/// Cloning a small record per call would be wasteful, so the body is held
+/// behind an `Arc` shared with the compiled document: `DocumentIr` is
+/// immutable once compiled and a reload replaces it wholesale.
+#[derive(Debug, Clone)]
+pub(crate) struct FunctionEntry {
+    /// Parameters in declaration order.
+    pub(crate) parameters: Vec<nui_compiler::ParameterIr>,
+    /// Body statements.
+    pub(crate) body: std::sync::Arc<[nui_compiler::Effect]>,
+    /// Whether the function yields a value.
+    pub(crate) has_value: bool,
+}
+
 thread_local! {
     /// Chain of `element.property` keys currently being evaluated; property
     /// reads append dependency edges against the innermost entry.
@@ -178,6 +193,36 @@ pub struct Engine {
     /// Set by a document asking for the window to close (`root.close()`),
     /// and consumed by the host.
     close_requested: bool,
+    /// Document-declared functions, keyed by name, for `UserCall`
+    /// evaluation. Filled by instantiation from the compiled document; a
+    /// tree built without a document (tests, hand-built scenes) has an
+    /// empty table, so a `UserCall` is an `Unresolved` there.
+    pub(crate) functions: HashMap<String, FunctionEntry>,
+    /// The highest component-instance prefix number handed out so far.
+    ///
+    /// Component instances number themselves (`iN::`) to keep their ids in
+    /// one flat table from colliding, and `For` / `ListView` rows expand
+    /// components *after* instantiation, once per frame. The numbering
+    /// therefore has to outlive the instantiation pass, or a row rebuilt in
+    /// a later frame would reuse a prefix the previous frame's elements may
+    /// still hold — two instances sharing one namespace, one instance's
+    /// bindings writing to the other's elements. Monotonic, so a prefix is
+    /// never reissued even while older elements are still alive.
+    ///
+    /// It is a high-water mark, not a live counter: instantiation numbers
+    /// its instances from `0` and only records its total here when it
+    /// finishes, and row expansion continues from this mark. The
+    /// instantiation range stays exactly `i1..=iN`, which is what keeps
+    /// the instantiation-phase id assertions valid (**D35** in `plan.md`).
+    pub(crate) prefix_high_water: u32,
+    /// The document's instantiable components, by name.
+    ///
+    /// A `For` / `ListView` row is built by the engine per frame, so a
+    /// component reference inside a row prototype has to be resolvable
+    /// here rather than only during the instantiation pass that read the
+    /// document. Shaped after [`Engine::functions`], which is the same
+    /// "document data a later evaluation needs" case.
+    pub(crate) catalog: crate::instantiate::ComponentCatalog,
 }
 
 /// Default duration of a `tween` without an explicit `duration` argument.
@@ -693,6 +738,111 @@ impl Engine {
         return evaluate_tracked(tree, self, element, expr, &mut dependencies, 0);
     }
 
+    /// Calls a document-declared function with already-evaluated arguments.
+    ///
+    /// Arguments arrive positional and in declaration order — the checker
+    /// reordered named arguments and left omitted defaults for the runtime
+    /// to fill from [`FunctionEntry::parameters`].
+    ///
+    /// The function body runs against the *same* `locals` stack as the
+    /// caller, in a scope that is truncated again on the way out, so a
+    /// function's arguments never leak into the caller's frame and a
+    /// nested call cannot see the outer function's parameters. `depth` is
+    /// the evaluator's depth, carried through so a deep call chain hits the
+    /// same [`MAX_EVAL_DEPTH`] guard as a deep expression.
+    pub(crate) fn call_user_function(
+        &mut self,
+        tree: &mut ElementTree,
+        element: ElementId,
+        name: &str,
+        arguments: Vec<Value>,
+        defaulted: &[bool],
+        depth: usize,
+    ) -> Result<Value, EvalError> {
+        let Some(entry) = self.functions.get(name).cloned() else {
+            return Err(EvalError::Unresolved {
+                what: format!("unknown function `{name}`"),
+            });
+        };
+        if depth > MAX_EVAL_DEPTH {
+            return Err(EvalError::DepthExceeded {
+                limit: MAX_EVAL_DEPTH,
+            });
+        }
+        let scope_base = self.locals.len();
+        let mut frame = Vec::with_capacity(entry.parameters.len());
+        for (index, parameter) in entry.parameters.iter().enumerate() {
+            let omitted = defaulted.get(index).copied().unwrap_or(false);
+            let value = if omitted {
+                match &parameter.default {
+                    Some(default) => self.evaluate_free(tree, element, default)?,
+                    None => Value::Int(0),
+                }
+            } else {
+                arguments.get(index).cloned().unwrap_or(Value::Int(0))
+            };
+            frame.push((parameter.name.clone(), value));
+        }
+        self.locals.extend(frame);
+        let outcome = self.run_effect_list(tree, element, &entry.body);
+        self.locals.truncate(scope_base);
+        let value = outcome?;
+        if entry.has_value {
+            return Ok(value.unwrap_or(Value::Int(0)));
+        }
+        return Ok(Value::Int(0));
+    }
+
+    /// Runs a list of effects, returning the value a `return` produced.
+    ///
+    /// This is the function-body half of [`Engine::run_effect`]: the same
+    /// statement semantics, but a `return` ends the list early and carries
+    /// the value back to the caller's frame.
+    ///
+    /// No recursion guard here: the only way into another body is
+    /// `run_effect_one` seeing `Effect::UserCall`, and that goes through
+    /// [`Engine::call_user_function`], which owns the depth counter. This
+    /// method recurses solely through `If` branches, whose nesting the
+    /// parser already bounded.
+    fn run_effect_list(
+        &mut self,
+        tree: &mut ElementTree,
+        element: ElementId,
+        effects: &[nui_compiler::Effect],
+    ) -> Result<Option<Value>, EvalError> {
+        let mut written = Vec::new();
+        for effect in effects {
+            if let nui_compiler::Effect::Return { value } = effect {
+                let returned = match value {
+                    Some(expr) => Some(self.evaluate_free(tree, element, expr)?),
+                    None => None,
+                };
+                return Ok(returned);
+            }
+            // A nested `return` can only appear inside an `if` branch, so
+            // the branch result has to propagate: `run_effect_one`
+            // flattens it by evaluating the branch here instead.
+            if let nui_compiler::Effect::If {
+                condition,
+                then_branch,
+                else_branch,
+            } = effect
+            {
+                let holds = self
+                    .evaluate_free(tree, element, condition)?
+                    .as_bool()
+                    .unwrap_or(false);
+                let branch = if holds { then_branch } else { else_branch };
+                if let Some(returned) = self.run_effect_list(tree, element, branch)? {
+                    return Ok(Some(returned));
+                }
+                continue;
+            }
+            self.run_effect_one(tree, element, effect, &mut written)?;
+        }
+        return Ok(None);
+    }
+
     /// Evaluates every `when` block in the tree and applies/un-applies its
     /// assignments (plan §3.3: `when` blocks compile to conditional
     /// bindings). The pre-override values are captured when a block first
@@ -953,6 +1103,30 @@ impl Engine {
                 self.run_method_call(tree, element, callee, args)?;
                 Ok(())
             }
+            nui_compiler::Effect::UserCall {
+                name,
+                args,
+                defaulted,
+            } => {
+                let mut values = Vec::with_capacity(args.len());
+                for (index, arg) in args.iter().enumerate() {
+                    if defaulted.get(index).copied().unwrap_or(false) {
+                        values.push(Value::Int(0));
+                        continue;
+                    }
+                    values.push(self.evaluate_free(tree, element, arg)?);
+                }
+                // The result of a valued function called as a statement is
+                // discarded; the call's purpose is its side effects.
+                let _ = self.call_user_function(tree, element, name, values, defaulted, 0)?;
+                Ok(())
+            }
+            // Handled by `run_effect_list`, which sees the whole statement
+            // list and stops at the `return`. Reaching here means a `return`
+            // was nested somewhere `run_effect_list` does not descend (it
+            // recurses into `if` branches itself); treating it as a no-op
+            // keeps the function from running statements past it.
+            nui_compiler::Effect::Return { .. } => Ok(()),
         };
     }
 
@@ -1463,6 +1637,31 @@ fn evaluate_expr(
                 )?);
             }
             return engine.call_host_function(name, &values);
+        }
+        TypedExpr::UserCall {
+            name,
+            args,
+            defaulted,
+            ..
+        } => {
+            let mut values = Vec::with_capacity(args.len());
+            for (index, arg) in args.iter().enumerate() {
+                // An omitted argument is marked in the mask; its `args`
+                // slot is a placeholder never meant to be evaluated.
+                if defaulted.get(index).copied().unwrap_or(false) {
+                    values.push(Value::Int(0));
+                    continue;
+                }
+                values.push(evaluate_tracked(
+                    tree,
+                    engine,
+                    element,
+                    arg,
+                    dependencies,
+                    depth + 1,
+                )?);
+            }
+            return engine.call_user_function(tree, element, name, values, defaulted, depth + 1);
         }
         TypedExpr::Interp { parts } => {
             let mut text = String::new();

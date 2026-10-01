@@ -65,6 +65,8 @@ impl<'source> Lexer<'source> {
                 '-' => {
                     if self.advance_if('=') {
                         self.push_punct(Punct::MinusEq, start);
+                    } else if self.advance_if('>') {
+                        self.push_punct(Punct::RArrow, start);
                     } else {
                         self.push_punct(Punct::Minus, start);
                     }

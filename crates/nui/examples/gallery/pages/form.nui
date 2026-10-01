@@ -4,8 +4,10 @@
 //
 // The `when` sits at the page root, next to the element it guards, so the
 // rule reads where the state lives.
-Column(id = form_page, spacing = 12dp, padding = 36dp,
-       userName = "", password = "", submitted = false) {
+Column(id = form_page, spacing = 12dp, padding = 36dp) {
+    state userName: String = ""
+    state password: String = ""
+    state submitted: Bool = false
 
     Rectangle(id = form_panel, width = 360dp, height = 240dp, radius = 10dp,
               fill = #1d222b)

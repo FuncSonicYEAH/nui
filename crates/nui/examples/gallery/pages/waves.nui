@@ -8,7 +8,8 @@
 // screen must not keep ticking: an always-running timer would make the
 // window redraw forever, which is exactly the kind of cost the `visible`
 // switch exists to remove.
-Column(id = waves_page, spacing = 16dp, padding = 24dp, tick = 0.0) {
+Column(id = waves_page, spacing = 16dp, padding = 24dp) {
+    state tick: Float = 0.0
 
     Text(content = "waveline — an infinite timer drives the phase",
          font.size = 14dp, color = #e8ecf2)

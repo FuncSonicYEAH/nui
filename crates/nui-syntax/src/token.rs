@@ -48,6 +48,10 @@ pub enum Keyword {
     Emit,
     /// `in`
     In,
+    /// `fn` (a document-declared function)
+    Fn,
+    /// `return` (a function body's result)
+    Return,
     /// `true`
     True,
     /// `false`
@@ -74,6 +78,8 @@ impl Keyword {
             "else" => Some(Keyword::Else),
             "emit" => Some(Keyword::Emit),
             "in" => Some(Keyword::In),
+            "fn" => Some(Keyword::Fn),
+            "return" => Some(Keyword::Return),
             "true" => Some(Keyword::True),
             "false" => Some(Keyword::False),
             "auto" => Some(Keyword::Auto),
@@ -106,6 +112,8 @@ impl Keyword {
             Keyword::Else => "else",
             Keyword::Emit => "emit",
             Keyword::In => "in",
+            Keyword::Fn => "fn",
+            Keyword::Return => "return",
             Keyword::True => "true",
             Keyword::False => "false",
             Keyword::Auto => "auto",
@@ -140,6 +148,8 @@ pub enum Punct {
     TwoWay,
     /// `=>` (handler arrow)
     Arrow,
+    /// `->` (function return type arrow)
+    RArrow,
     /// `+`
     Plus,
     /// `-`
@@ -198,6 +208,7 @@ impl Punct {
             Punct::Bind => "<-",
             Punct::TwoWay => "<=>",
             Punct::Arrow => "=>",
+            Punct::RArrow => "->",
             Punct::Plus => "+",
             Punct::Minus => "-",
             Punct::Star => "*",

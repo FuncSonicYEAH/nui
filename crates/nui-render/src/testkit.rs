@@ -16,10 +16,7 @@ pub fn build(tree: &ElementTree) -> Scene {
     return SceneBuilder::build_with_context(
         tree,
         &mut nui_text::TextSystem::with_embedded_font(),
-        SceneContext {
-            focused: None,
-            image_keys: &HashMap::new(),
-        },
+        SceneContext::without_engine(None, &HashMap::new()),
     );
 }
 

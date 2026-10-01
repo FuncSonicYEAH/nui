@@ -3,8 +3,10 @@
 //
 // State lives on this page's own root element (`counter_page.count`), so
 // the fragment is self-contained: nothing is hoisted into the gallery
-// component, and no other page can collide with it.
-Column(id = counter_page, spacing = 12dp, padding = 24dp, count = 0) {
+// component, and no other page can collide with it. `count` is not a
+// `Column` property, so the page declares it as element state.
+Column(id = counter_page, spacing = 12dp, padding = 24dp) {
+    state count: Int = 0
     Rectangle(id = counter_panel, width = 300dp, height = 90dp, radius = 12dp,
               fill = #336699, opacity = 0.25)
 

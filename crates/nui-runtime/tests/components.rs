@@ -1220,8 +1220,13 @@ fn close_is_the_only_method_a_component_may_call() {
 }
 
 #[test]
-fn a_component_cannot_be_instantiated_inside_a_for_body() {
-    let rendered = diagnostics_of(
+fn a_component_can_be_instantiated_inside_a_for_body() {
+    // The companion of `tests/for_components.rs`: the shape used to be
+    // rejected here, and the rejection is gone. This case is kept local to
+    // the component suite because what it checks is the checker's *reading*
+    // of a component in a loop body; the runtime half lives in the other
+    // file.
+    let (mut tree, mut engine) = build(
         r#"
         component Chip { Rectangle(id = box) {} }
         component App {
@@ -1230,10 +1235,43 @@ fn a_component_cannot_be_instantiated_inside_a_for_body() {
         }
     "#,
     );
+    // Nothing expands until a model drives the loop: a `For` body is a
+    // prototype, not a child list.
     assert!(
-        rendered.contains("cannot be instantiated inside a `For` body"),
-        "{rendered}"
+        tree.lookup_id("a").is_none(),
+        "no rows before a model exists"
     );
+    let root = tree.lookup_id("root").expect("the entry component exists");
+    let model = engine.add_model(Box::new(nui_runtime::VecModel::from_rows(vec![vec![(
+        "label".to_string(),
+        Value::String("x".to_string()),
+    )]])));
+    engine.set_direct(&mut tree, root, "rows", Value::Model(model.0));
+    engine.propagate(&mut tree);
+    engine.sync_for_nodes(&mut tree);
+    engine.propagate(&mut tree);
+    // The call-site id is namespaced with the instance prefix (D16), the
+    // same as any other component reference; the bare `a` names the
+    // prototype, which has no element of its own.
+    let a = tree
+        .lookup_id("a")
+        .expect("the call-site id resolves to the instance element");
+    assert_eq!(tree.arena[a].component.as_deref(), Some("Chip"));
+    // The *call site's* id is not namespaced — it belongs to the row, which
+    // is the only place it appears. What is namespaced is the component's
+    // own internals (its `Rectangle(id = box)` becomes `i1::box`), so two
+    // rows' instances cannot collide.
+    assert!(
+        tree.lookup_id("i1::box").is_some(),
+        "the component's internal id is namespaced per instance: {:?}",
+        tree.ids.keys().collect::<Vec<_>>()
+    );
+    let row_scope = tree.arena[a]
+        .for_scope
+        .clone()
+        .expect("the instance element carries the row scope");
+    assert_eq!(row_scope.variable, "item");
+    assert_eq!(row_scope.row, 0);
 }
 
 #[test]

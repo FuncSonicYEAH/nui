@@ -12,7 +12,7 @@ use crate::app::hit_test;
 
 mod interaction;
 
-use interaction::PointerGesture;
+use interaction::{PointerGesture, ScrollbarDrag};
 
 use nui_render::{Renderer, SceneBuilder};
 
@@ -52,6 +52,9 @@ pub struct WindowHost {
     /// Surface configuration (reconfigured on resize).
     surface_format: wgpu::TextureFormat,
     click: PointerGesture,
+    /// The scrollbar drag in flight, if any (D36: a scrollbar is not an
+    /// element, so it cannot use `click`'s capture).
+    scrollbar_drag: ScrollbarDrag,
     /// Widget interaction state (hover/press/arm/focus, pointer capture).
     widgets: nui_runtime::WidgetStates,
     /// Timer elapsed accumulators.
@@ -165,6 +168,7 @@ impl WindowHost {
             needs_redraw: true,
             surface_format,
             click: PointerGesture::default(),
+            scrollbar_drag: ScrollbarDrag::default(),
             widgets: nui_runtime::WidgetStates::new(),
             timer_elapsed: std::collections::HashMap::new(),
             last_frame: None,
@@ -215,6 +219,7 @@ impl WindowHost {
             // Handles are generational: the old capture refers to a dead
             // tree, and latched widget state would point at stale ids.
             self.click = PointerGesture::default();
+            self.scrollbar_drag = ScrollbarDrag::default();
             self.widgets.reset();
             self.needs_redraw = true;
         }
@@ -413,13 +418,12 @@ impl WindowHost {
                         // it — the host has none.
                         let limit = nui_runtime::widget::max_scroll_y(&self.engine, &self.tree, id);
                         let next = (scroll_y + dy).clamp(0.0, limit);
-                        self.engine.set_direct(
-                            &mut self.tree,
-                            id,
-                            "scroll_y",
-                            nui_core::Value::Float(next as f64),
-                        );
-                        self.run_frame_pipeline(nui_core::Duration::ZERO);
+                        // A wheel notch moves the offset and nothing else,
+                        // so it takes the scroll-only path (D38): the same
+                        // reason a drag does — `scroll_y` is not a layout
+                        // input, and a relayout per notch is what makes a
+                        // trackpad flick cost a layout each.
+                        self.set_direct_with_scroll_pipeline(id, next);
                         return true;
                     }
                     current = self.tree.arena[id].parent;
@@ -566,6 +570,63 @@ impl WindowHost {
         let _ = self.engine.take_changes();
     }
 
+    /// The frame pipeline for a `scroll_y` write: everything the full one
+    /// does except layout (D38).
+    ///
+    /// `scroll_y` is not a layout input. `nui-layout` never reads it —
+    /// scrolling is a viewport translation applied at draw and hit-test
+    /// time ([`crate::app::element_bounds`] subtracts each ancestor's
+    /// offset, and the scene walk does the same), so a `scroll_y` write
+    /// cannot change any box. Re-running taffy and re-shaping every string
+    /// for it is the single most expensive thing the host does, and a drag
+    /// pays it once per pointer move.
+    ///
+    /// Measured on the gallery's virtual list (10 000 rows of 36 dp in a
+    /// 560 dp viewport, 225 elements): the full pipeline is 6.6 ms/frame
+    /// and `layout_with_text` is 6.1 ms of that — bindings, row reconcile
+    /// and widget state together are under 0.5 ms. At a 144 Hz pointer
+    /// rate that 6.1 ms is why the drag stutters.
+    ///
+    /// Three things are deliberately **kept**:
+    ///
+    /// - **`propagate`** — a document may bind `scroll_y` (a "showing
+    ///   rows N–M" label, say), and that binding has to fill.
+    /// - **`sync_for_nodes`** — a `ListView`'s visible window genuinely
+    ///   moves with the offset, so its rows have to be rebuilt. It is
+    ///   guarded internally by `list_windows`: a pointer move that does
+    ///   not cross a row boundary rebuilds nothing and returns early.
+    /// - **`widgets.update`** — it mirrors hover into element properties,
+    ///   and those are bindings a document reads.
+    ///
+    /// `needs_redraw` is set unconditionally: the caller only takes this
+    /// path when the offset actually moved, and the *draw* is the thing
+    /// that has to happen.
+    ///
+    /// The trade-off is that a document whose `scroll_y` binding writes a
+    /// property that `nui-layout` reads (`width`, `offset_x`, …) will not
+    /// see it re-laid-out until the next full frame. That is a narrower
+    /// contract than the full pipeline, but it is the contract `scroll_y`
+    /// already had: a render-time viewport translation cannot be a layout
+    /// input without a two-pass layout, and the framework has never done
+    /// one. Row geometry comes from `row_height`, which
+    /// [`Engine::sync_for_nodes`] reads directly, so the virtualized list
+    /// — the case that motivated this — is unaffected.
+    fn run_scroll_pipeline(&mut self) {
+        let _ = self.engine.propagate(&mut self.tree);
+        let rebuilt = self.engine.sync_for_nodes(&mut self.tree);
+        if rebuilt > 0 {
+            let _ = self.engine.propagate(&mut self.tree);
+        }
+        let input = nui_runtime::PointerInput {
+            position: self.cursor,
+            inside: true,
+            down: self.click.captured.is_some(),
+        };
+        let _ = self.widgets.update(&mut self.engine, &mut self.tree, input);
+        self.needs_redraw = true;
+        let _ = self.engine.take_changes();
+    }
+
     /// One rendered frame: advances the frame clock, runs the pipeline, and
     /// submits a frame. Called from the run loop on `RedrawRequested`.
     pub fn render_frame(&mut self) {
@@ -621,6 +682,8 @@ impl WindowHost {
             nui_render::SceneContext {
                 focused,
                 image_keys: &self.image_keys,
+                // Scrollbars need the model row counts behind a `ListView`.
+                engine: Some(&self.engine),
             },
         );
         if let Some(message) = self.error_overlay.clone() {

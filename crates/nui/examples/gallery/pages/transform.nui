@@ -5,7 +5,8 @@
 // Rotating about the element's own centre is what makes a click-to-spin
 // control possible at all: the `rotation` property is the transform, and
 // the click handler is the only imperative line on the page.
-Column(id = transform_page, spacing = 16dp, padding = 24dp, spin = 45.0) {
+Column(id = transform_page, spacing = 16dp, padding = 24dp) {
+    state spin: Float = 45.0
 
     Text(content = "rotation + gradient + math builtins", font.size = 14dp,
          color = #e8ecf2)

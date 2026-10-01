@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use nui_core::{Color, Point, Rect, Size};
+use nui_runtime::Engine;
 use nui_runtime::element::{ElementId, ElementTree};
 
 use crate::image::ImageDraw;
@@ -287,6 +288,22 @@ impl Scene {
     }
 }
 
+/// Where a scroll container's scrollbar is drawn, and how far it is through
+/// its range.
+///
+/// A single argument so `push_scrollbar` stays under the argument-count
+/// lint without dropping information: the lane *is* one concept, and the
+/// three fields are used together and nowhere else.
+#[derive(Debug, Clone, Copy)]
+struct ScrollLane {
+    /// The container's own box: the track, and the lane the thumb rides in.
+    bounds: Rect,
+    /// The container's current `scroll_y`, which positions the thumb.
+    scroll_y: f32,
+    /// The container's clip, so the thumb cannot leak past the viewport.
+    clip: Option<ClipDraw>,
+}
+
 /// Per-frame context the scene builder needs beyond the tree.
 #[derive(Debug, Clone, Copy)]
 pub struct SceneContext<'a> {
@@ -294,6 +311,34 @@ pub struct SceneContext<'a> {
     pub focused: Option<ElementId>,
     /// Image path -> texture cache key ("path:content-hash").
     pub image_keys: &'a HashMap<String, String>,
+    /// The engine, for the questions only it can answer.
+    ///
+    /// Currently one: how far a scroll container can travel, which needs
+    /// the model behind a `ListView` to count its rows. `None` means
+    /// "build the scene without it" and suppresses scrollbars — a tree
+    /// built by hand in a test has no models to consult, and a caller that
+    /// genuinely has an engine should pass `Some`.
+    pub engine: Option<&'a Engine>,
+}
+
+impl<'a> SceneContext<'a> {
+    /// A context with no engine: no scrollbars.
+    ///
+    /// The right default for a draw-list assertion that is not about
+    /// scrolling, and the *only* correct shape for a tree built by hand
+    /// with no engine to hand. A test that wants a scrollbar has to say so
+    /// by passing `engine: Some(..)`, which keeps the dependency visible
+    /// rather than accidental.
+    pub fn without_engine(
+        focused: Option<ElementId>,
+        image_keys: &'a HashMap<String, String>,
+    ) -> SceneContext<'a> {
+        return SceneContext {
+            focused,
+            image_keys,
+            engine: None,
+        };
+    }
 }
 
 /// Builds a [`Scene`] from the element tree.
@@ -485,6 +530,23 @@ impl SceneBuilder {
                 bounds,
                 f_property(element, "radius").unwrap_or(0.0),
             );
+            // The scrollbar goes in *before* the children, so scrolling
+            // content paints over it — the thumb is a background affordance,
+            // not a floating overlay. It carries the container's clip, so a
+            // nested scrollbar still cannot leak past an ancestor viewport.
+            // Drawn here rather than as a child element because the geometry
+            // is already known at this point; see `crate::widget::scrollbar`.
+            self.push_scrollbar(
+                tree,
+                element,
+                id,
+                ScrollLane {
+                    bounds,
+                    scroll_y,
+                    clip: child_clip,
+                },
+                context,
+            );
         } else if bool_property(element, "clip") {
             child_clip = push_clip(
                 child_clip,
@@ -495,6 +557,46 @@ impl SceneBuilder {
         for child in element.children.clone() {
             self.walk_element(tree, child, child_offset, child_clip, text, context, false);
         }
+    }
+
+    /// Appends a scroll container's scrollbar, if it has one to show.
+    ///
+    /// Needs the engine for one number — `max_scroll_y`, which counts a
+    /// `ListView`'s model rows and measures a `Scroll`'s children. Without
+    /// an engine there is no scrollbar, which is the honest answer for a
+    /// tree built by hand with no models behind it.
+    fn push_scrollbar(
+        &mut self,
+        tree: &ElementTree,
+        element: &nui_runtime::Element,
+        id: ElementId,
+        lane: ScrollLane,
+        context: &SceneContext<'_>,
+    ) {
+        let Some(engine) = context.engine else {
+            return;
+        };
+        let limit = nui_runtime::widget::max_scroll_y(engine, tree, id);
+        let Some(metrics) = crate::widget::scrollbar_metrics(
+            lane.bounds.origin,
+            lane.bounds.size,
+            lane.scroll_y,
+            limit,
+        ) else {
+            return;
+        };
+        self.rects.push(RectDraw {
+            geometry: metrics.thumb,
+            corner_radius: crate::widget::THUMB_RADIUS,
+            fill: crate::widget::thumb_color(element),
+            shadow: None,
+            // The container's own clip, so a scrollbar in a nested
+            // container is still bounded by every ancestor's viewport.
+            clip: lane.clip,
+            rotation: 0.0,
+            gradient: None,
+        });
+        self.sources.push(id);
     }
 
     /// Paints one built-in control by resolving it to
@@ -2055,6 +2157,7 @@ mod tests {
             SceneContext {
                 focused: None,
                 image_keys: &HashMap::new(),
+                engine: None,
             },
         );
         assert_eq!(scene.rects.len(), 1);
@@ -2085,6 +2188,7 @@ mod tests {
                 SceneContext {
                     focused: None,
                     image_keys: &HashMap::new(),
+                    engine: None,
                 },
             );
         }
@@ -2134,6 +2238,7 @@ mod tests {
                 SceneContext {
                     focused: None,
                     image_keys: &HashMap::new(),
+                    engine: None,
                 },
             );
             assert!(scene.rects.is_empty(), "no fill to draw");
@@ -2193,6 +2298,7 @@ mod tests {
                 SceneContext {
                     focused: None,
                     image_keys: &HashMap::new(),
+                    engine: None,
                 },
             );
             assert!(scene.rects.is_empty());
@@ -2220,6 +2326,7 @@ mod tests {
             SceneContext {
                 focused: None,
                 image_keys: &HashMap::new(),
+                engine: None,
             },
         );
         assert_eq!(scene.rects.len(), 1);
@@ -2246,6 +2353,7 @@ mod tests {
             SceneContext {
                 focused: None,
                 image_keys: &HashMap::new(),
+                engine: None,
             },
         );
         assert!(scene.texts.is_empty(), "no glyph quads: {:?}", scene.texts);
@@ -2268,6 +2376,7 @@ mod tests {
             SceneContext {
                 focused: None,
                 image_keys: &HashMap::new(),
+                engine: None,
             },
         );
         assert_eq!(scene.rects.len(), 1);
@@ -2295,6 +2404,7 @@ mod tests {
             SceneContext {
                 focused: None,
                 image_keys: &HashMap::new(),
+                engine: None,
             },
         );
         assert_eq!(scene.rects.len(), 0);
@@ -2303,6 +2413,7 @@ mod tests {
 
     #[test]
     fn clip_and_scroll_translate_and_clip_children() {
+        let engine = Engine::new();
         let mut tree = ElementTree::new();
         let mut scroll = Element::new("Scroll", None);
         scroll.set("width", Value::Float(100.0));
@@ -2311,9 +2422,14 @@ mod tests {
         scroll.set("fill", Value::Color(Color::from_rgb8(10, 10, 10)));
         let scroll_id = tree.insert(scroll);
         tree.push_root(scroll_id);
+        // A hand-built tree has no layout pass, so the child's `y` stays
+        // unset unless it is written here. `max_scroll_y` measures content
+        // as `child.y + child.height`, so without a `y` the content height
+        // reads as 0 and no thumb is due. Real pipelines always lay out.
         let mut child = Element::new("Rectangle", None);
+        child.set("y", Value::Float(0.0));
         child.set("width", Value::Float(100.0));
-        child.set("height", Value::Float(30.0));
+        child.set("height", Value::Float(90.0));
         child.set("fill", Value::Color(Color::from_rgb8(255, 0, 0)));
         let child_id = tree.insert(child);
         tree.append_child(scroll_id, child_id);
@@ -2324,22 +2440,154 @@ mod tests {
             SceneContext {
                 focused: None,
                 image_keys: &HashMap::new(),
+                engine: Some(&engine),
             },
         );
-        // Scroll background + child rect.
-        assert_eq!(scene.rects.len(), 2);
-        let child_draw = &scene.rects[1];
+        // Scroll background + scrollbar thumb + child rect, in that order:
+        // the thumb goes in before the children walk. The child is 90dp
+        // tall in a 50dp viewport, so 40dp of travel is due. This is the
+        // one scene test driven by a *real* engine — the thumb needs one
+        // to measure its limit.
+        assert_eq!(scene.rects.len(), 3);
+        let scroll_draw = &scene.rects[0];
+        assert!(
+            scroll_draw.clip.is_none(),
+            "the scroll element itself is unclipped"
+        );
+
+        // The thumb hugs the right edge (100 - 2 inset - 4 width = 94),
+        // inside the container's clip. At scroll_y = 20 of 40 it sits
+        // halfway: travel = 50 - 27.78 = 22.22, so top = 11.11.
+        let thumb = &scene.rects[1];
+        assert_eq!(thumb.geometry.origin.x, 94.0);
+        assert_eq!(thumb.geometry.size.width, 4.0);
+        // viewport 50 of content 90 gives thumb = 50 * 50/90.
+        assert!((thumb.geometry.size.height - 50.0 * 50.0 / 90.0).abs() < 0.01);
+        assert!((thumb.geometry.origin.y - 11.111_111).abs() < 0.01);
+        assert_eq!(
+            thumb.clip.expect("thumb must be clipped").bounds,
+            Rect::new(Point::ZERO, Size::new(100.0, 50.0))
+        );
+        assert_eq!(scene.sources[1], scroll_id);
+
+        let child_draw = &scene.rects[2];
         // Child translated up by scroll_y = 20 (child layout y is 0 inside
         // the scroll content).
         assert_eq!(child_draw.geometry.origin.y, -20.0);
         // Child inherits the scroll viewport clip.
         let clip = child_draw.clip.expect("child must be clipped");
         assert_eq!(clip.bounds, Rect::new(Point::ZERO, Size::new(100.0, 50.0)));
-        let scroll_draw = &scene.rects[0];
-        assert!(
-            scroll_draw.clip.is_none(),
-            "the scroll element itself is unclipped"
+    }
+
+    #[test]
+    fn a_scroll_container_with_nothing_to_scroll_gets_no_thumb() {
+        let engine = Engine::new();
+        let mut tree = ElementTree::new();
+        let mut scroll = Element::new("Scroll", None);
+        scroll.set("width", Value::Float(100.0));
+        scroll.set("height", Value::Float(50.0));
+        scroll.set("fill", Value::Color(Color::from_rgb8(10, 10, 10)));
+        let scroll_id = tree.insert(scroll);
+        tree.push_root(scroll_id);
+        // A child that fits exactly: content == viewport, no travel.
+        let mut child = Element::new("Rectangle", None);
+        child.set("width", Value::Float(100.0));
+        child.set("height", Value::Float(50.0));
+        child.set("fill", Value::Color(Color::from_rgb8(255, 0, 0)));
+        let child_id = tree.insert(child);
+        tree.append_child(scroll_id, child_id);
+
+        let scene = SceneBuilder::build_with_context(
+            &tree,
+            &mut nui_text::TextSystem::with_embedded_font(),
+            SceneContext {
+                focused: None,
+                image_keys: &HashMap::new(),
+                engine: Some(&engine),
+            },
         );
+        // Background + child only. Regression guard: not every Scroll
+        // may grow a scrollbar.
+        assert_eq!(scene.rects.len(), 2);
+    }
+
+    #[test]
+    fn a_list_view_draws_a_thumb_from_its_model_rows() {
+        // The other half of the scrollbar contract: a `ListView` measures
+        // its content as `row_count * row_height`, not by walking children
+        // — so it needs the *engine* for the row count. 100 rows of 10dp
+        // in a 50dp viewport means 950dp of travel, so the exact
+        // proportion would be 2.5dp — under `MIN_THUMB`, and clamped to it.
+        // That clamp is the point: a long list must still show a
+        // grabbable-looking thumb rather than a hairline.
+        let mut engine = Engine::new();
+        let model = engine.add_model(Box::new(nui_runtime::model::VecModel::from_rows(
+            (0..100)
+                .map(|index| return vec![("i".to_string(), Value::Int(index as i64))])
+                .collect(),
+        )));
+        let mut tree = ElementTree::new();
+        let mut list = Element::new("ListView", None);
+        list.set("width", Value::Float(100.0));
+        list.set("height", Value::Float(50.0));
+        list.set("row_height", Value::Float(10.0));
+        list.set("scroll_y", Value::Float(0.0));
+        list.set("fill", Value::Color(Color::from_rgb8(10, 10, 10)));
+        list.set(
+            nui_runtime::element::FOR_VALUE_PROPERTY,
+            Value::Model(model.0),
+        );
+        let list_id = tree.insert(list);
+        tree.push_root(list_id);
+
+        let scene = SceneBuilder::build_with_context(
+            &tree,
+            &mut nui_text::TextSystem::with_embedded_font(),
+            SceneContext {
+                focused: None,
+                image_keys: &HashMap::new(),
+                engine: Some(&engine),
+            },
+        );
+        assert_eq!(scene.rects.len(), 2, "background + thumb");
+        let thumb = &scene.rects[1];
+        assert_eq!(thumb.geometry.origin.x, 94.0);
+        assert_eq!(thumb.geometry.size.height, crate::widget::MIN_THUMB);
+        // At the top of the range the thumb's top edge is the lane's.
+        assert_eq!(thumb.geometry.origin.y, 0.0);
+    }
+
+    #[test]
+    fn without_an_engine_a_scroll_container_gets_no_thumb() {
+        let mut tree = ElementTree::new();
+        let mut scroll = Element::new("Scroll", None);
+        scroll.set("width", Value::Float(100.0));
+        scroll.set("height", Value::Float(50.0));
+        scroll.set("scroll_y", Value::Float(20.0));
+        scroll.set("fill", Value::Color(Color::from_rgb8(10, 10, 10)));
+        let scroll_id = tree.insert(scroll);
+        tree.push_root(scroll_id);
+        // A hand-built tree has no layout pass, so the child's `y` stays
+        // unset unless it is written here. `max_scroll_y` measures content
+        // as `child.y + child.height`, so without a `y` the content height
+        // reads as 0 and no thumb is due. Real pipelines always lay out.
+        let mut child = Element::new("Rectangle", None);
+        child.set("y", Value::Float(0.0));
+        child.set("width", Value::Float(100.0));
+        child.set("height", Value::Float(90.0));
+        child.set("fill", Value::Color(Color::from_rgb8(255, 0, 0)));
+        let child_id = tree.insert(child);
+        tree.append_child(scroll_id, child_id);
+
+        // Draw-list-only hosts (the `testkit`) pass no engine, so the
+        // limit is unknowable and no thumb is drawn. Pinned so the
+        // `engine: Option` never becomes silently mandatory.
+        let scene = SceneBuilder::build_with_context(
+            &tree,
+            &mut nui_text::TextSystem::with_embedded_font(),
+            SceneContext::without_engine(None, &HashMap::new()),
+        );
+        assert_eq!(scene.rects.len(), 2);
     }
 
     #[test]
@@ -2360,6 +2608,7 @@ mod tests {
             SceneContext {
                 focused: None,
                 image_keys: &HashMap::new(),
+                engine: None,
             },
         );
         assert_eq!(scene.polylines.len(), 1);
@@ -2424,6 +2673,7 @@ mod tests {
             SceneContext {
                 focused: None,
                 image_keys: &HashMap::new(),
+                engine: None,
             },
         );
         assert_eq!(scene.polylines.len(), 0);
@@ -2478,6 +2728,7 @@ mod tests {
                 SceneContext {
                     focused: None,
                     image_keys: &HashMap::new(),
+                    engine: None,
                 },
             );
         };
@@ -2520,6 +2771,7 @@ mod tests {
             SceneContext {
                 focused: None,
                 image_keys: &HashMap::new(),
+                engine: None,
             },
         );
         assert_eq!(scene.polylines.len(), 0);
@@ -2560,6 +2812,7 @@ mod tests {
             SceneContext {
                 focused: None,
                 image_keys: &HashMap::new(),
+                engine: None,
             },
         );
         // Fill: one closed ring, offset by the origin, opacity folded in.
@@ -2602,6 +2855,7 @@ mod tests {
             SceneContext {
                 focused: None,
                 image_keys: &HashMap::new(),
+                engine: None,
             },
         );
         // No fill anywhere; only the stroke-only path produces a polyline.
@@ -2819,6 +3073,7 @@ mod tests {
             SceneContext {
                 focused: None,
                 image_keys: &HashMap::new(),
+                engine: None,
             },
         );
     }

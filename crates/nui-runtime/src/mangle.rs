@@ -146,6 +146,24 @@ fn mangle_effects(effects: &mut [Effect], prefix: &str, self_id: &str, own: &Own
                     mangle_expr(arg, prefix, self_id, own);
                 }
             }
+            // A document function is shared by every caller, so its name is
+            // not a tree address; only the arguments are walked. An id
+            // *inside* a function body names a document-level element,
+            // which is the same element in every instance and so is
+            // deliberately left unprefixed.
+            Effect::UserCall { args, .. } => {
+                for arg in args {
+                    mangle_expr(arg, prefix, self_id, own);
+                }
+            }
+            // A `return`'s value is an ordinary expression; neither the
+            // statement nor the name of the function it belongs to is a
+            // tree address, so only the value needs walking.
+            Effect::Return { value } => {
+                if let Some(value) = value {
+                    mangle_expr(value, prefix, self_id, own);
+                }
+            }
         }
     }
 }
@@ -217,7 +235,9 @@ fn mangle_expr(expr: &mut TypedExpr, prefix: &str, self_id: &str, own: &OwnIds) 
             mangle_expr(then_expr, prefix, self_id, own);
             mangle_expr(else_expr, prefix, self_id, own);
         }
-        TypedExpr::Call { args, .. } | TypedExpr::HostCall { args, .. } => {
+        TypedExpr::Call { args, .. }
+        | TypedExpr::HostCall { args, .. }
+        | TypedExpr::UserCall { args, .. } => {
             for arg in args {
                 mangle_expr(arg, prefix, self_id, own);
             }

@@ -21,6 +21,9 @@ fn dump(source: &str) -> String {
         output.push('\n');
     }
     output.push_str("ast:\n");
+    for function in &outcome.document.functions {
+        dump_function(function, &mut output, 1);
+    }
     for component in &outcome.document.components {
         dump_component(component, &mut output, 1);
     }
@@ -38,6 +41,28 @@ fn dump(source: &str) -> String {
 
 fn indent(level: usize) -> String {
     return "  ".repeat(level);
+}
+
+fn dump_function(function: &FunctionDecl, output: &mut String, level: usize) {
+    output.push_str(&format!("{}(fn {}", indent(level), function.name.name));
+    output.push_str(" (params");
+    for parameter in &function.parameters {
+        output.push_str(&format!(
+            " {}:{}",
+            parameter.name.name, parameter.declared_type.name
+        ));
+        if let Some(default) = &parameter.default {
+            output.push_str(" = ");
+            dump_expr(default, output, 0);
+        }
+    }
+    output.push(')');
+    if let Some(return_type) = &function.return_type {
+        output.push_str(&format!(" -> {}", return_type.name));
+    }
+    output.push('\n');
+    dump_statements(&function.body, output, level + 1);
+    output.push_str(&format!("{}}}\n", indent(level)));
 }
 
 fn dump_component(component: &ComponentDecl, output: &mut String, level: usize) {
@@ -168,6 +193,16 @@ fn dump_node(node: &NodeDecl, output: &mut String, level: usize) {
                 }
                 output.push_str(&format!("{}  )\n", indent(level)));
             }
+            NodeMember::State(state) => {
+                output.push_str(&format!(
+                    "{}  (state {} : {} ",
+                    indent(level),
+                    state.name.name,
+                    state.declared_type.name
+                ));
+                dump_expr(&state.default, output, level + 2);
+                output.push_str(")\n");
+            }
             NodeMember::Node(child) => dump_node(child, output, level + 1),
         }
     }
@@ -241,6 +276,18 @@ fn dump_statement(statement: &Statement, output: &mut String, level: usize) {
         }
         Statement::Emit { signal, .. } => {
             output.push_str(&format!("{}(emit {})\n", indent(level), signal.name));
+        }
+        Statement::Return { value, .. } => {
+            output.push_str(&format!("{}(return ", indent(level)));
+            if let Some(value) = value {
+                dump_expr(value, output, level);
+            }
+            output.push_str(")\n");
+        }
+        Statement::Expr { value, .. } => {
+            output.push_str(&format!("{}(expr ", indent(level)));
+            dump_expr(value, output, level);
+            output.push_str(")\n");
         }
         Statement::Call { callee, args, .. } => {
             output.push_str(&format!(
@@ -581,6 +628,73 @@ diagnostics:
   (none)
 "#;
     assert_eq!(dump(COUNTER), golden);
+}
+
+const FUNCTIONS: &str = r#"fn clamp01(value: Float) -> Float {
+    if value < 0.0 { return 0.0 }
+    return value
+}
+
+component A {
+    Window(width = 100dp) {}
+}
+"#;
+
+#[test]
+fn snapshot_function_declarations() {
+    let golden = r#"tokens:
+  keyword fn
+  ident clamp01
+  punct (
+  ident value
+  punct :
+  ident Float
+  punct )
+  punct ->
+  ident Float
+  punct {
+  keyword if
+  ident value
+  punct <
+  float 0
+  punct {
+  keyword return
+  float 0
+  punct }
+  keyword return
+  ident value
+  punct }
+  keyword component
+  ident A
+  punct {
+  ident Window
+  punct (
+  ident width
+  punct =
+  int 100dp
+  punct )
+  punct {
+  punct }
+  punct }
+  eof
+ast:
+  (fn clamp01 (params value:Float) -> Float
+    (if
+(< (ident value) (float 0))      (then
+        (return (float 0))
+      )
+    )
+    (return (ident value))
+  }
+  (component A
+    (node Window
+      (assign width = (length 100dp))
+    }
+  }
+diagnostics:
+  (none)
+"#;
+    assert_eq!(dump(FUNCTIONS), golden);
 }
 
 const PLAYER: &str = r#"

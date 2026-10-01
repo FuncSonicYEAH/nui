@@ -44,8 +44,16 @@
 | D30 | 组件 `extends`：编译期摊平 | 派生在 `bind()` 里摊平成「父成员 + 自己成员」，所以运行时的 `own` 集合自动含父的 id，`mangle.rs` / `instantiate.rs` 无需改动。**运行时多一条派生概念**要在命名空间、绑定覆盖、id 解析三处各教它一遍，而摊平让这三处都不用知道派生存在——这正是选摊平的理由。覆盖**就地替换**（`ComponentIr::property` 是线性首次匹配，两条同名条目会递回父的默认值，这是最容易写出的半对版本）；派生体节点**追加进继承树的 `Slot`**（复用调用点填槽的同一机制，不引入第二条组合语义）；派生**不让父成为"被引用"**（`extends_edges` 与 `edges` 分开，否则派生入口组件会带出幽灵根）。`extends` 不作保留字（同 `from`），父可声明在子之后（按 `binding_order` 合并） | 2026-10-01 |
 | D31 | 内建属性表：`nui-core::props` 单一来源 | 内建元素的属性面（名 + 类型 + 默认值）此前只以字符串字面量散落在渲染层与 widget 层（`f_property(element, "radius").unwrap_or(6.0)`）。三件事让它必须被写下来：① `extends Button` 让内建属性成为派生组件的**继承 API**，检查器得知道 `Button` 接受什么、类型是什么、缺省是什么；② 词表就位后拼错才有报错，否则 `Text(contnt = "x")` 永远是静默空操作；③ 检查器与运行时必须对**同一个默认值**取值，两处各写一份就是两处可以漂移。放 `nui-core` 是因为 `nui-compiler` 已经依赖它，而运行时也依赖它。`PropType` 不复用检查器的 `Type`：后者还有 `Unknown` 这类文档专有概念，元素属性不可能是。**只在类型名这一半接上校验**（D32），属性名那一半仍卡在语言决策上（§13） | 2026-10-01 |
 | D32 | 类型名词表校验；属性名**故意不校验** | 节点类型名没有歧义——运行时按名字查元素表，查不到就什么都不画（`Buton(...)` 不报错、不警告、不渲染，布局直接吞掉这一行）。所以「未知元素类型」是编译错误，并附带编辑距离最近的名字建议（短名 1 个字符、长名 2 个字符为上限，超出就不建议——错的建议比没有建议更糟）。属性名**不能**这样查：元素状态与属性**故意共享**同一个名空间（`Column(id = containers_page, clicks = 0)`，读 `containers_page.clicks`），编译器无从区分「拼错的内建属性」与「作者有意挂的状态」。这条不是遗漏而是待决（§13 两条出路）。宿主注册的类型从 `Registry::vocabulary()` 一并上报——缺了这一步，宿主自己的组件会被误报成未知类型，而它们此前恰好因为"什么都不校验"而能过 | 2026-10-01 |
+| D33 | 元素状态必须显式声明：`state` 关键字（§13 方案 a） | §13 的两条出路里选 (a)：`state name: Type = default` 与 `property` 同族，元素自己的状态从「作者有意挂的名字」变成「作者**声明过**的名字」。于是属性名这一半也能校验了——一个不在 `TABLE` 里、也没有 `state` 声明的名字是编译错误（附最近属性名建议，或 `declare it with state ...` 的提示）。**为什么不选 (b) 前缀**：`state.clicks` 会把每处读写都改一遍（`containers_page.clicks` → `containers_page.state.clicks`），而 (a) 只在声明处多一行，读点写法不变；平台的既有惯用法（把每页状态挂在根元素上）也原样保留。声明落成一条 `Static` 赋值，所以运行时看不到新概念——`ElementTree` 的槽位、绑定、`<=>` 通道一律照旧，唯一新增的是编译器在绑定前先登记这张 `node_states` 表。检查器只在**内建类型**上查（组件引用与非内建类型跳过，否则宿主注册属性的组件会被误报），并且只查**单段名**（多段名走既有 id 解析路径，`counter.value` 那类写法不受影响） | 2026-10-01 |
+| D34 | 用户定义函数 `fn`：参数、返回值、前向可见 | 文档级 `fn name(p: Type, q: Type = default) -> Type { ... }`，可在表达式与效果块里调用。三处约束是有意为之：① **只能调用声明在自己之前的函数**（`collect_function_signatures` 顺序建表），于是循环调用在语法上就写不出来，不需要环检测；② **Void 函数不能当值用**（`fn bump(n: Int) { ... }` 用作 `Text(content <- bump(1))` 报错，因为那些写法的类型无法定），但可以作语句调用；③ 具名实参会被重排进形参声明序（`defaulted` 掩码记录哪些是补的默认值），所以 `f(b = 2, a = 1)` 与 `f(a = 1, b = 2)` 等价。新增字节码 `TypedExpr::UserCall` / `Effect::UserCall`（**不复用** `Effect::Call`：宿主函数走 `run_method_call`，而用户函数的实参要按 `defaulted` 补默认值、并且要能 `return`）/ `Effect::Return`；运行时 `Engine::call_user_function` 压一帧 locals、`run_effect_list` 让 `return` 提前收束并把 `If` 分支的返回值透传上来。函数体在绑定期就把形参声明为局部变量，因此 `item.field` 那类行作用域提升天然不适用（函数不在行里）——这是既有限制而非新缺口 | 2026-10-01 |
+| D35 | `For` / `ListView` 体内可以引用组件 | 行（`instantiate_row`）由引擎每帧拉起，而展开组件需要文档里的 `ComponentIr` 表，实例化期那份目录是局部变量、早已销毁。补法不是"传个表进去"，而是三件事一起做：① **目录挂 `Engine`**（`Engine.catalog`，与既有 `Engine.functions` 同形——同样是"求值期需要文档数据"的先例），`instantiate_with` 填好；② **前缀计数器的连续性**：`iN::` 是实例 id 的唯一化手段，行每帧可能重建，若每次重建都从新的计数器开始，第二帧的第 2 行会再拿一次 `i1::`，而第一帧的 `i1::` 元素可能还在树里——两个实例共用一个命名空间，一个实例的绑定写到另一个实例的元素上，**静默错渲染**。用两段式：实例化期从 0 编号（`i1..iN`）、结束时把总数记进 `Engine.prefix_high_water`；行车期从高水位继续，发一个抬高一次、单调不减，于是"发过的前缀永不重发"。**验收标准是 `cargo test -p nui-runtime` 零断言修改**（那 9 处 `i1::` 字面值断言正是实例化段的行为），实测通过；③ **挂载点**：`instantiator` 借用 `catalog`、`body` 借用 `Engine` 其余部分，两处是 `self` 的不相交借用，所以 `Engine::with_instancing(body)` 把目录 `mem::take` 出来、构造 `Instantiator`、再把目录放回。顺带修掉一个既有缺口：`id` 原由 `build_id_index` 在实例化末尾统一扫一遍注册，而行元素是实例化**之后**才插入的，所以行内组件解析不到自己声明的 id——改成**元素入树时即注册**，`build_id_index` 保留为不变量的显式陈述。检查器侧的 `reject_component_in_for` 随之删除（`For` 与 `ListView` 一起，不留不对称，二者共用 `instantiate_row` 与 `binding.prototype`）。**仍在的限制**：行变量在组件体内不可见（组件独立编译，`item` 未声明）——字段须经调用点实参传入。行内的 `Slot` 填空未支持（本次不做） | 2026-10-01 |
+| D36 | 滚动条是**渲染期叠加**，不进元素树 | M10 留下的最深一条 V1 缺口：没有滚动条，用户看不出内容还能滚。思路有两条——**A** 引擎按需生成 `Scrollbar` 元素塞进树，**B** 场景期在容器上直接叠加。**选 B**（详案见 D36 本条，那里记作 A'/渲染期叠加，二者同一方案），因为滚动条的全部输入在 walk 到容器时都已在手：容器盒子（lane）、`scroll_y`（当前进度）、以及唯一需要外求的 `max_scroll_y`。选 A 要付出的代价反而是本质性的：滚轮 / hit_test / 布局 / hit_test 偏移 / `Spacer` 不绘制……每一处都得多一个"这是引擎自己塞的元素"的分支，而它**不是一个可交互的节点**（本版不做拖动），没有 id、没有绑定、没有属性，进树只会污染所有按节点语义工作的代码。**唯一接口问题**：`max_scroll_y(engine, tree, id)` 要 `&Engine`（`ListView` 要数模型行），而 `SceneBuilder` 原本够不到 engine——所以 `SceneContext` 加 `engine: Option<&Engine>`，`None` = 不画滚动条（手工建树、无模型的 draw-list 断言就是这个值，`testkit` 走 `SceneContext::without_engine`）。几何与配色抽到 `nui-render/src/widget/scrollbar.rs`（纯函数，13 例单测）：`content = viewport + max_scroll_y`、`ratio = viewport/content`、`thumb_h = clamp(viewport*ratio, MIN_THUMB, viewport)`、`progress = scroll_y/max_scroll_y`，右手 `THUMB_INSET`+`THUMB_WIDTH`。**绘制顺序**：thumb 紧跟在容器背景之后、子节点之前压入，且带容器的 clip——于是它是"内容之下的背景件"而非浮层，且不会越出嵌套容器的视口。配色默认派生自 `fill` 的亮度（`Rec.601`），无 `fill` 用半透明灰。**不做**：淡入淡出、横向滚动条、`Scrollbar` 元素类型——都不改 `max_scroll_y` 语义。（拖动与 track 点击于 **D37** 补上） | 2026-10-01 |
+| D38 | `scroll_y` 写入走**轻量管线**，不重排 | 用户报"拖动的时候好卡"——功能对，帧开销不对。**先量**：`crates/nui/tests/scroll_perf.rs`（测量非断言）在 gallery 虚拟列表（10 000 行 × 36dp / 560dp 视口）上得到 6.81 ms/帧，其中 `layout_with_text` 独占 6.39 ms（其余三者相加 <0.4 ms）。**根因**：`scroll_y` 不是布局输入——`grep -rn "scroll_y" crates/nui-layout/src/` **零命中**；滚动是在绘制与命中时做的视口平移（`element_bounds` 逐祖先减去 `scroll_y`，场景 walk 同理），写它改变不了任何盒子，这 6.4ms 在数学上就是白跑的。**解法**：加 `WindowHost::run_scroll_pipeline`，保留 `propagate`（文档可能绑定 `scroll_y`，如"正在显示第 N–M 行"）、保留 `sync_for_nodes`（虚拟列表的可见窗口**确实**随 offset 移动，必须重建行；它内部由 `list_windows` 守卫，不跨行边界的移动早返回 0 重建，所以每像素移动几乎免费）、保留 `widgets.update`（悬浮态写回的是文档能读的属性），**只跳掉 `layout_with_text`**。拖动（`set_scroll_y`）与滚轮共用 `set_direct_with_scroll_pipeline` 一个入口，两条路径不可能漂移。**结果**：6.810 → **0.033 ms/帧（208×）**。**代价与理由**：若某 `scroll_y` 绑定写了 `nui-layout` 会读的属性（`width` / `offset_x`…），要等下一帧完整管线才重排——但这个契约 `scroll_y` 一直就是（渲染期平移不能是布局输入，除非两遍布局，框架从未做过），且虚拟列表的行几何来自 `row_height`（`sync_for_nodes` 直接读），正是要救的场景、不受影响。**不做**：增量布局 / 局部重排（taffy 替换是大工程，见 §13）；本版只是**不跑**不需要的那一档 | 2026-10-01 |
+| D39 | 抽出 `nui-tools`：**零领域类型**纯函数下沉 | 与业务无关的算术此前散落在 6 个 crate 里，且**同一表达式被写过多份**——`lerp` 三份（`nui-core::color::lerp_component`、`nui-runtime::animation::interpolate` 内的 `mix` 闭包、`nui-render::rect::linear_rgba` 内的分量换算）、比例映射两份（`nui-render::widget::slider::slider_fraction`、`scrollbar::progress_along`）、step 吸附两份（`nui-runtime::widget::spin::SpinRange::snap`、`nui-render::widget::slider` 拖动）。多份实现不是靠 review 发现的，而是**问出来的**："拖到底部差一像素"和"spin 吸附有浮点噪声"分别是两个 crate 各自修过的 bug。新 crate `nui-tools` **零依赖**（连 `thiserror` 都不要），位于 `nui-core` **之下**，准入规则一句话：**任何签名里都不许出现 nui 领域类型**（`Point` / `Color` / `Value` / `Length`）。按用途分模块（`numeric` / `text` / `hash` / `curve` / `color`），crate 根平铺 `pub use`——与既有 crate 风格一致。**刻意留在原地的**（搬迁会逼出泛型改写，违反"签名与语义不变"）：`Point` 系几何（`nui-core::path` / `earcut`）、`Color` 系调色（`nui-render::widget::state` 的 `lighten`/`darken`/`with_alpha_scale`——`blend` 的 u8 内核下沉了，外壳因收 `Color` 而留守）、`Value` 插值分派（`interpolate` 外壳留守）、dp/百分比解析（`nui-core::length`）。现职色域的 sRGB 传递函数（`rect::linear_rgba`）**未动**：它是 `u8`→线性 `f32` 的闭包，抽出来要么改签名要么只搬走一个闭包，收益不抵风险。**顺带发现的既有问题**：① `byte_to_char` 在**非字符边界**的字节偏移上会 **panic**（`text[..byte]` 切开多字节字符），原注释声称"clamped so a malformed offset cannot panic"只覆盖了"越过末尾"这一种；已记进 `# Panics` 并配 `char_indices().take_while()` 的安全写法；② `inverse_lerp` 的零跨度判据由 `span.abs() < f32::EPSILON` 归并为 `span == 0.0`（可达输入上等价，但严格说是一次判断变更，已注明）；③ 零宽 x 的 bezier 段是**退化**的——`apply_bezier` 在**每个** `t` 都返回 `segment[7]`，不是"停顿"；真正的 hold 要写成"x 跨度非零、y 平坦"的段（已用测试钉住） | 2026-10-01 |
 
 **节点思想**（设计基座）：一切皆节点——可视节点（Rectangle/Text/Column…）、逻辑节点（Timer/State/Model，不绘制但参与树与绑定）、资源节点（Font/Image）。属性绑定构成数据流 DAG，引擎 = 节点树 + 响应式依赖图 + 每帧脏传播管线（绑定 → 布局 → 绘制）。
+
+**最底层**：`nui-tools`（D39）——零依赖、零领域类型的纯函数层，位于 `nui-core` **之下**。准入规则：任何签名里都不许出现 nui 领域类型（`Point` / `Color` / `Value` / `Length`）。存在的理由是**消除重复表达式**，不是"整理目录"：同一段 `lerp`、比例映射、step 吸附曾在多个 crate 各写一份，各自修过各自的边界 bug。
 
 ## 2. 总体架构
 
@@ -205,7 +213,7 @@ component App {
 - **参数二义性**：名字被组件声明过就是它的 API（按声明类型检查），否则是实例根节点的普通元素属性（不检查）。同名时声明优先。
 - **调用点的静态参数会顶掉组件自身的绑定**（与 D10 效果块赋值同一优先级规则）：静态值是终值，组件自己挂的 `<-` 必须一并退役（引擎侧绑定表与元素槽两侧都要清，否则下一次传播会把它写回来）。
 - **自引用是编译错误**（组件引用图上的 DFS 成环检测）。
-- **暂不支持 `For` 体内的组件引用**：行由引擎实例化，而引擎不携带文档，无从展开——以诊断拒绝，而不是运行时静默展开为空。
+- **`For` / `ListView` 体内可以引用组件**（D35）。行由引擎实例化、而引擎不携带文档，所以组件目录随实例化交给引擎一并保存，行展开时接着用；行内的组件实例也要与实例化期**共用一套**前缀编号（`iN::`），否则每帧重建会重复发放同一个前缀。限制仍在：**行变量在组件体内不可见**——`Chip { Text(content <- item.label) }` 报 `unknown name \`item\``，因为组件是独立编译的。字段要经调用点传入（`Chip(label <- item.label)`），组件读自己的 `label` 属性。
 
 ### 3.3c 组件派生（D30）
 
@@ -409,10 +417,11 @@ crate 间路径依赖已在骨架 Cargo.toml 中连好；统一 lints（`unsafe_
 - 项目与语言命名：工作名 `nui` / `nui-lang`，发布前需查 crates.io 占用情况。
 - License 假定 `MIT OR Apache-2.0`（Cargo.toml 已按此填写），如有其他偏好需确认。
 - **可变字体轴（除 `wght` 外）未开放**：nui 向 cosmic-text 要的是「一个 face + 一个 weight」，不是「轴上的一个 location」，所以 `FILL` / `opsz` / `wdth` 这类轴文档现在够不着。要开放需要一条从 `font.*` 到 shaping location 的通路，且字形缓存键要带上 location——即 `Typeface` 要再带一个坐标，而不只是三个标量。设计系统里 `FILL` 很常见（选中态图标），所以这是已知缺口而非取舍
-- **元素属性名没有编译期词表**：`Text(contnt = "x")` 这类拼写错误今天只在运行时表现为「什么都没发生」。看似加一张表就能修，但属性名空间是**故意共享**的——平台惯用法就是把每页状态挂在元素上（`Column(id = containers_page, clicks = 0)`，读 `containers_page.clicks`），而宿主注册的组件又能带自己的属性，所以「这个名字是内建属性，还是这个元素自己的状态」编译器无从判断。两条出路：(a) 自定义状态必须显式声明（`state clicks: Int = 0`，与 `property` 同族），词表只覆盖内建属性；(b) 给状态一个前缀（`state.clicks`），让属性名空间彻底干净。这是一次语言层面的决策，不是补一张表
+- ~~**元素属性名没有编译期词表**~~ **已决（D33，2026-10-01）**：选了方案 (a)，`state name: Type = default` 显式声明元素状态，词表校验随之接通。`Text(contnt = "x")` 现在是编译错误并附 `did you mean content?`；未声明的元素状态（如旧的 `Column(id = p, clicks = 0)`）报 `has no property \`clicks\`` 并提示 `declare it with state clicks: <Type> = <value>`。保留下来的历史说明：
+  - 曾被绕过的原因：属性名空间是**故意共享**的——平台惯用法就是把每页状态挂在元素上（`Column(id = containers_page, clicks = 0)`，读 `containers_page.clicks`），而宿主注册的组件又能带自己的属性，所以「这个名字是内建属性，还是这个元素自己的状态」编译器无从判断。(a) 用一次声明消掉这个歧义，(b) 用前缀消掉；选 (a) 的理由见 D33。
   - 已补的一小块（同一目标里没有歧义的部分）：效果语句里的单名调用现在要对着宿主词表校验，`on click => togle()` 从「运行时静默失败」变成编译期报错；宿主函数与宿主命令也在编译期分开（命令不能当值用）
-  - **类型名已补完**（D31 / D32）：`Buton(...)` 现在是编译错误并附最近名字建议，而 `Column(id = p, clicks = 0)` 照旧通过。这一半之所以能做，是因为类型名**没有**上面那个共享命名空间问题——节点类型由运行时查表，查不到就是静默消失，不存在「作者本来想表达别的」的可能。宿主注册的类型走 `Registry::vocabulary()` 上报（此前漏了这一步，宿主类型会被误报）
-  - 剩下的属性名那一半仍等 (a)/(b) 二选一。词表本身（`nui-core::props::TABLE`，名 + 类型 + 默认值）已经就位，所以一旦方向定了，接上的只是「查表报错」这一步，不需要再补数据
+  - **类型名已补完**（D31 / D32）：`Buton(...)` 是编译错误并附最近名字建议。这一半之所以先做，是因为类型名**没有**共享命名空间问题——节点类型由运行时查表，查不到就是静默消失，不存在「作者本来想表达别的」的可能。宿主注册的类型走 `Registry::vocabulary()` 上报（此前漏了这一步，宿主类型会被误报）
+  - 词表本身 `nui-core::props::TABLE`（名 + 类型 + 默认值）本次一并补齐了此前缺失的真实条目：`key`（进 `UNIVERSAL`，reconciler 在任何元素上读它）、`ListView.row_height`（虚拟化的固定行高）、`Polyline.color` / `Arc.color`（`stroke_of` 优先读这个名字）、`TextInput.password` / `TextInput.reveal`（`is_password()` 是两者的合取）、`Canvas` 的 paint 面（`clip` 等）。补的是**运行时确实会读**的名字——这是这张表作为单一来源应有的样子，同时把 gallery 各页的内联状态迁移到 `state` 声明
 
 ## 14. 当前状态
 
@@ -491,7 +500,7 @@ crate 间路径依赖已在骨架 Cargo.toml 中连好；统一 lints（`unsafe_
   - 行失效适配:`model_set_field` 对 ListView 站点按 `row - first + 1` 定位窗口内行根（窗口外跳过）
   - 场景/输入接入:ListView 与 Scroll 同享场景平移+裁剪、滚轮路由、hit_test 偏移;Spacer 不绘制
   - M10 验收:集成测试——窗口有界（100 行/10dp/50dp 视口 → 7 个子元素）、滚动换窗后行作用域与绑定值正确、窗口内字段写入精确失效、**万行滚动窗口 ≤12 元素、总元素 <30**;`examples/biglist.rs`（10,000 行滚轮浏览）;`cargo fmt` / `clippy --workspace --all-targets -D warnings` / `test`（219 全绿）;D13 grep 通过
-  - 已知 v1 限制:行高均匀（可变行高虚拟化需测量缓存）、无滚动条、滚轮只钳下界（内容总高未知）
+  - 已知 v1 限制:行高均匀（可变行高虚拟化需测量缓存）、~~无滚动条~~ **已于 M15.2 / D36 补上**、滚轮只钳下界（内容总高未知，现已由 `max_scroll_y` 同时提供上界）
 - [x] **M10.5 追加（2026-09-25）**：playground 演示 + 离屏截图模式（`--snap` 写 PNG 到 snapshots/,无显示环境可验证渲染）+ 点击**冒泡**（`Engine::emit_bubble`,按钮文字不再挡点击）。截图审查暴露并修复 **4 个真实渲染 bug**——此前 demo 全是浅嵌套+高饱和色,全部漏检：
   1. **布局坐标父相对**：taffy location 是相对父级的,场景/hit_test 却当绝对坐标——嵌套元素整体错位;layout 回写改为沿树累加绝对坐标
   2. **颜色空间双重编码**：sRGB 颜色被当线性值写入 sRGB target,整体变亮;新增 `linear_rgba`(sRGB→线性→premultiplied)统一用于 rect/text/image 提交;clear 色同理（wgpu::Color 对 sRGB target 是线性）
@@ -507,7 +516,7 @@ crate 间路径依赖已在骨架 Cargo.toml 中连好；统一 lints（`unsafe_
   - **`root.close()`**:引擎置标志、宿主消费;`close` 是组件唯一可对自己调用的方法且跳过 id 查找
   - **双端控件**(`WidgetKind::Range`):一次手势移动值空间里更近的一端,平局取低端;未设的两端按 `min` 读,不除以缺失值
   - M14 验收：`cargo fmt --all -- --check` / `clippy --workspace --all-targets -D warnings` / `test`（**652 全绿**,基线 566）/ `build --release` 全通过;D13 grep 通过;`examples/gallery --snap` 14 页出图与改动前一致(无回归)
-  - 已知限制:组件引用暂不支持出现在 `For` 体内（行由引擎实例化,引擎不携带文档）;缓动曲线名不做编译期校验（`easing` 是 `Enum`,拼错静默降级为默认曲线,与既有行为一致）;`Path` 填充仍无抗锯齿;未做系统调色板跟随（`nui-winit` 无 `QStyleHints::colorScheme` 对应能力）
+  - 已知限制:~~组件引用暂不支持出现在 `For` 体内（行由引擎实例化，引擎不携带文档）~~ **已于 M15.1 / D35 支持**;缓动曲线名不做编译期校验（`easing` 是 `Enum`,拼错静默降级为默认曲线,与既有行为一致）;`Path` 填充仍无抗锯齿;未做系统调色板跟随（`nui-winit` 无 `QStyleHints::colorScheme` 对应能力）
 
 - [x] **M14.2 追加（2026-09-30）**：为组件库落地补齐两块地基，由下游一次完整移植驱动
   - **组件体可读入口组件的元素 id**（D20）：`.nui` 没有 `import`，一个应用的所有组件都在同一文档里，而每个控件都要读窗口上的明暗开关。检查器的名字解析在组件自身 id 之后加一层文档级兜底。两处踩过的坑都留在了代码注释里：兜底集合必须在 `referenced` **之后**收集（否则被实例化组件的 id 也会进来，而那些 id 运行时已改写，裸名解析到哪个实例取决于当次实例化——这类错误编译通过、渲染错）；兜底只作用于 `a.b` 成员访问，裸标识符走 `check_ident` 的枚举字面量分支，不动。5 条新测试写死了「允许的性质」：能读到文档 id、自身 id 优先、**不传递**、拼错仍报错、实例的私有 id 不泄漏
@@ -533,3 +542,70 @@ crate 间路径依赖已在骨架 Cargo.toml 中连好；统一 lints（`unsafe_
   - **D28 是搭这个特性时撞出来的**，而且不是 slot 特有的：环图按名字索引，而名字在三个地方指向不同的槽。`Column(width = width)` 这种最普通的写法被报成 `width <- width`——**这正是 slot 组件的写法**，所以没有它 slot 根本用不了。根节点那一处是真自环，保留原键；两个假的各给一个没人写的哨兵名。两条测试成对：嵌套可以同名，根节点不行
   - 另一处：`collect_node_references` 在组件引用处 `return`，于是 slot 里的组件全都算「未被引用」——而未被引用的组件会被运行时当成**树根**实例化。把整份内容塞进一个带 slot 的容器之后，每个组件都出现两次：一次在该在的位置，一次在左上角、带着声明默认值，**没有任何诊断**（那个多余实例本身是正确的组件的正确的实例，于是所有「看组件」的检查都通过，只有一个多余的形状）。现在引用节点会继续走它的 body
   - 验收：fmt / clippy `-D warnings` / `test`（**685 全绿**，基线 676）/ `build --release`；`examples/gallery --snap` 14 页逐字节不变
+- [x] **M15 追加（2026-10-01）**：`fn` 用户函数（D34）+ 属性名词表校验（D33，§13 收口）
+  - **`fn`（D34）**：文档级 `fn name(p: Type, q: Type = default) -> Type { ... }`，表达式与效果块里都能调。语法侧新增 `FunctionDecl` / `Parameter` / `Statement::Return` / `Statement::Expr` 与 `-> `（`Punct::RArrow`）、`fn`、`return` 三个 token；编译侧 `collect_function_signatures` 按文档序建表（**只能调前面的**，所以循环调写在语法上就不成立，不需要环检测），`bind_function` 在绑定期把形参声明为局部变量；字节码侧 `TypedExpr::UserCall` / `Effect::UserCall` / `Effect::Return`；运行时 `Engine::call_user_function` 压/弹一帧 locals，`run_effect_list` 让 `return` 提前收束并把 `If` 分支的返回值透传上来。两处刻意的类型规则：Void 函数不能当值用（`Text(content <- bump(1))` 报错，但 `bump(1)` 作语句可以），具名实参会被重排进形参声明序（`defaulted` 掩码记录哪些是补的默认值）
+  - **属性名词表校验（D33）**：`state name: Type = default` 与 `property` 同族，元素自己的状态必须**显式声明**；由此属性名这一半也能查了——不在 `TABLE` 里且没有 `state` 声明的单段名是编译错误，附最近属性名建议（`did you mean content?`）或 `declare it with state ...` 的提示。声明落成一条 `Static` 赋值，运行时看不到新概念；检查器只在**内建类型**上查（组件引用与非内建类型跳过），只查**单段名**（多段名走既有 id 解析路径）
+  - **词表补齐**：校验一接通就暴露了 `nui-core::props::TABLE` 的真实缺口——补的是运行时**确实会读**的名字：`key`（进 `UNIVERSAL`）、`ListView.row_height`、`Polyline.color` / `Arc.color`、`TextInput.password` / `TextInput.reveal`、`Canvas` 的 paint 面。`Waveline.color` 是原本就有的显式条目，加进 `PAINT` 会触发「同类型声明两次」的自检，所以 `color` 留在各类型自己的 extras 里（`Text`/`Button`/`CheckBox`/`Slider`/`SpinBox` 也都显式声明它）
+  - **gallery 迁移**：8 个页面的内联状态（`counter.count` / `containers.clicks` / `inherit.clicks` / `widgets_page.*` / `form_page.*` / `text_fields_page.*` / `transform.spin` / `waves.tick`）全部改成 `state` 声明，读点写法一行未动——这正是选 (a) 而非 (b) 前缀的原因
+  - **测试迁移**：运行时集成测试里的探针槽（`Text(x <- ...)` / `Text(id = out, value <- ...)`）改成 `state` 声明 + 保留响应式绑定（静态默认值会冻住探针，而这些测试都是在观察**变化**）
+  - 验收：fmt / clippy `--workspace --all-targets -D warnings`（**零警告**）/ `test`（**804 全绿**，基线 685）；`examples/gallery --snap` 仍出图。四个新增的 vocabulary 测试钉住的是「报错要说什么」：拼错给最近名、远拼错给 `state` 提示且**不**给建议（错的建议比没有更糟）、组件自己的 `property` 不被误报、未声明的元素状态报错而声明后通过
+  - 已知的既有偶发：`nui-render/tests/offscreen_image.rs` 的 atlas 测试会把 PNG 写到 `std::env::temp_dir()`，而该路径只由 region 变体命名——两个测试并发时互相覆盖，本沙箱的 `/tmp` 又是 10MB tmpfs。约 1/6 概率失败，**与本次改动无关**（`crates/nui-render/` 零 diff，干净树上也复现过）
+- [x] **M15.1 追加（2026-10-01）**：`For` / `ListView` 体内的组件引用（D35，第一优先级第 3 项）
+  - **问题**：行由引擎每帧拉起（`instantiate_row`），而展开组件要文档里的 `ComponentIr` 表——实例化期那份目录是局部变量，函数返回即销毁。所以缺的不只是表，还有**前缀计数器的连续性**：`iN::` 每帧从 0 重发就会与上一帧仍在树里的元素撞号
+  - **目录挂 `Engine`**（`Engine.catalog`，与 `Engine.functions` 同形）；**前缀两段式**——实例化期 `i1..iN`，结束时总数记入 `Engine.prefix_high_water`，行车期从高水位续发、单调不减。`Engine::with_instancing(body)` 把目录 `mem::take` 出来给 `Instantiator` 借用、再把目录放回（`self` 的不相交借用）
+  - **顺带修掉的既有缺口**：`id` 原由 `build_id_index` 在实例化末尾统一注册，而行元素是实例化**之后**插入的，因此行内组件解析不到自己声明的 id。改为**元素入树时即注册**
+  - **检查器**：删 `reject_component_in_for`（`For` 与 `ListView` 一起撤，二者共用行路径，不留不对称）。留一条守护测试：`For` 体内**未知类型**仍报错——被删的是"组件引用"这一条规则，不是通配
+  - **两条计划外的发现**（都是写测试才暴露的，都写进了测试注释）：① `find_row_scope` 的向上提升循环在**行内组件**这一形状下是空转——行变量在组件体内不可见（组件独立编译，`item` 未声明），所以 `item.field` 只可能写在调用点，而调用点实参的绑定就挂在实例元素上，实例元素**就是**行根，读者与行根同一，提升无事可做。手工把该循环禁用后相关测试仍全绿，据此把测试的说明改成陈述这个事实，而不是假装它覆盖了那个风险；② 由此得出一条必须记下的语言限制：**行变量在组件体内不可见**，字段须经调用点实参传入
+  - **验证测试的有效性**（而不是只看它绿）：把 `with_instancing` 的起点从高水位改回常量 0，`for_components.rs` 立刻 4 例失败，症状正是 `i1::self` 被两行共用；恢复后 11 例全绿。证明前缀连续性这条机制是**承重**的
+  - 验收：`cargo fmt --all --check` / `clippy --workspace --all-targets -D warnings`（**零警告**）/ 逐 crate `test`（**815 全绿**，基线 804；新增 `tests/for_components.rs` 11 例，`components.rs` 替换 1 例故总数不变）；**`cargo test -p nui-runtime` 零断言修改**——D35 §2.2 的验收标准达成，那 9 处 `i1::` 字面值一字未动
+  - 未做：行内组件的 `Slot` 填空、行级增量复用（keyed diff）、`ComponentIr` 的 `Arc` 优化
+- [x] **M15.2 追加（2026-10-01）**：滚动条（D36，第一优先级第 1 项）
+  - **缺口**：`Scroll` / `ListView` 早已能滚（`max_scroll_y` 9 例单测、滚轮路由、场景平移+裁剪都在），唯独没有滚动条——用户看不出内容还能滚。这是 M10 留下的最深一条 V1 限制
+  - **选址**：滚动条做成**渲染期叠加**（在容器 walk 到时直接 push 一个 rect），而不是引擎生成 `Scrollbar` 元素塞进树。理由是后者要为"引擎自己塞的元素"在滚轮 / hit_test / 布局 / `Spacer` 不绘制等每一处加分支，而它本版并不可交互（无 id、无绑定、无属性），进树只污染按节点语义工作的代码
+  - **几何与配色**：抽成 `crates/nui-render/src/widget/scrollbar.rs` 的纯函数 `scrollbar_metrics` + `thumb_color`（13 例单测）。`content = viewport + max_scroll_y`；`ratio = viewport/content`；`thumb_h = clamp(viewport*ratio, MIN_THUMB(24), viewport)`；`progress = scroll_y/max_scroll_y`；`thumb_left = right - THUMB_INSET(2) - THUMB_WIDTH(4)`。thumb 色默认派生自 `fill` 亮度（`Rec.601`），无 `fill` 用半透明灰
+  - **唯一的接口问题**：`max_scroll_y` 要 `&Engine`（`ListView` 数模型行），而 `SceneBuilder` 原本拿不到。故 `SceneContext` 加 `engine: Option<&Engine>`；`None` = 不画（手工建树 / 无模型的 draw-list 断言就是这个值，`testkit` 走 `SceneContext::without_engine`）。`App::draw()` 传 `Some(&self.engine)`
+  - **绘制顺序**：thumb 紧跟在容器背景之后、子节点遍历之前压入，并带容器自身的 clip —— 于是它是"内容之下的背景件"，不是浮层，且嵌套容器里的滚动条仍被每一层祖先视口裁住
+  - 验收：`cargo fmt --all --check` / `clippy --workspace --all-targets -D warnings`（**零警告**）/ 逐 crate `test`（**828 全绿**）
+  - 端到端测试（`scene.rs`）：能滚的 `Scroll` 有 thumb 且位置/高度/裁剪/来源元素都断言到位；**正好装下**的 `Scroll` 不多出 rect（回归：别让每个 `Scroll` 都长一条）；`ListView` 按模型行数算 thumb（100 行×10dp / 50dp 视口 → 精确比例 2.5dp 被 `MIN_THUMB` 钳到 24）；无 engine 时不画
+  - **写测试暴露的两条事实**（都写进了测试注释）：① 手工建树**没有布局回写**，子元素的 `y` 不设置就是 unset，而 `content_height` 按 `child.y + child.height` 量——于是内容高读数 0、不出 thumb。真实管线永远先跑布局，所以这是测试建树的注意点而非代码缺陷；② `max_scroll_y` 的 `limit` 确实需要 `&Engine`，无法在无 engine 时伪造，`Option` 是诚实的形状
+  - 未做（D36 明列的非目标）：~~拖动 thumb~~（**已于 M15.3 / D37 补上**）、淡入淡出、横向滚动条、`Scrollbar` 元素类型——且都不改 `max_scroll_y` 语义
+- [x] **M15.3 追加（2026-10-01）**：滚动条可鼠标操作（D37）
+  - **做了什么**：拖动 thumb、track 点击跳转、拖出容器仍跟随（指针捕获）。`nui-render/src/widget/scrollbar.rs` 从 13 例单测增到 25 例；新增 `crates/nui/tests/scrollbar_drag.rs` 12 例端到端
+  - **几何正反同源**：私有 `thumb_travel` 被 `scrollbar_metrics`（画）与 `scroll_y_from_thumb_top`（拖）共用。不变量测试 `the_drag_mapping_round_trips_the_painter_placement` 扫了 3 个视口高 × 4 个 limit × 11 个位置，断言"画出 thumb 再读回位置 == 原 offset"
+  - **hit 与画同源**：`scrollbar_hit` 内部调 `scrollbar_metrics`，所以抓取区**永远**包含画出的 thumb；`the_bar_the_user_grabs_is_the_bar_that_is_drawn` 在 9 个滚动位置取样 thumb 的顶/中/底边，全部必须判为 `Thumb`
+  - **host 侧**：`WindowHost.scrollbar_drag`（容器 id + `grab_offset`），与 `PointerGesture` 并列——滚动条不是元素，无法用元素级捕获。按下时 `begin_scrollbar_drag` 抢在元素命中之前；移动时不做命中判定（活拖动拥有指针）；释放时消费掉不触发 `click`
+  - **一个真 bug（写测试时抓到的）**：track 点击原先 `return write_scroll_for_thumb_top(...)`，于是当跳转值**恰好等于**当前 offset 时返回 false → 按下穿透到内容、arm 了滚动条后面的按钮。改成无条件消费。已加 `a_press_on_the_bar_is_always_consumed` 钉住
+  - **变异验证**（不是只看绿）：① 把 `scroll_y_from_thumb_top` 的 progress 反写成 `1-p` → 4 例失败，`the_drag_follows_the_pointer_monotonically` 报"step 1: 300 -> 265 went backwards"；② 把 thumb 命中区缩窄 20dp（模拟"画的与抓的不一致"）→ 3 例失败，`the_bar_the_user_grabs_is_the_bar_that_is_drawn` 报"scroll_y 0: the drawn thumb at y=12.5 is not grabbable"。两次都精准命中
+  - **`travel == 0` 的处理是我改过一次的判断**：最初在 `thumb_travel` 里把 travel==0 当退化情形返回 `None`，**破坏了两个既有单测**（`the_minimum_thumb_never_exceeds_a_short_container`、`a_thumb_is_never_taller_than_its_lane`）。正确语义是：容器比 `MIN_THUMB` 矮时 thumb 就是整条 lane，滚动条**仍该画**（内容确实溢出），只是无路可走、进度恒 0。改为保留 `Some` + `progress_along` 在 travel≤0 时返回 0
+  - 验收：`cargo fmt --all --check` / `clippy --workspace --all-targets -D warnings`（**零警告**）/ 逐 crate `test`（**846 全绿**，M15.2 时 824）
+- [x] **M15.4 追加（2026-10-01）**：滚动帧**不跑布局**——拖动卡顿的根因（D38）
+  - **症状**：M15.3 的拖动功能正常，但"拖动的时候好卡"
+  - **先量再改**：新增 `crates/nui/tests/scroll_perf.rs`（**测量而非断言**，`--nocapture` 打印）。它按 gallery 的方式建文档，再按侧栏的方式把 `root.page` 切到 list 页（否则页面 `visible=false`、布局跳过、`max_scroll_y` 读 0，什么也量不到），扫 60 帧逐个阶段计时。**数字**（gallery 虚拟列表，10 000 行 × 36dp / 560dp 视口，225 元素）：
+
+    | 阶段 | ms/帧 |
+    |---|---|
+    | binding propagate | 0.077 |
+    | ListView 行重建 | 0.265 |
+    | **taffy layout + text** | **6.387** |
+    | widget states | 0.051 |
+    | **合计** | **6.810** |
+
+  - **根因**：`scroll_y` **根本不是布局输入**——`nui-layout` 一次都没读过它（`grep -rn "scroll_y" crates/nui-layout/src/` 零命中）。滚动是**渲染期/命中期的视口平移**（`element_bounds` 减去各祖先的 `scroll_y`，场景 walk 同理），写它改变不了任何盒子。可拖动每移动一次鼠标就付一遍完整的 6.4ms 重排 + 全字符串重排版
+  - **修法**：`WindowHost::run_scroll_pipeline`（D38）——保留 `propagate`（文档可能绑定 `scroll_y`）、保留 `sync_for_nodes`（虚拟列表的可见窗口**确实**随 offset 移动；且它内部由 `list_windows` 守卫，不跨行边界的移动直接早返回重建 0 行）、保留 `widgets.update`（悬浮态是文档能读的绑定），**跳掉 `layout_with_text`**。拖动与滚轮共用 `set_direct_with_scroll_pipeline` 一个入口
+  - **结果**：6.810 ms/帧 → **0.033 ms/帧（208×）**
+  - **代价（写进代码注释）**：若某文档的 `scroll_y` 绑定写了 `nui-layout` 会读的属性（`width` / `offset_x`…），要到下一帧完整管线才会重排。但 `scroll_y` 一直以来就是这个契约——渲染期平移无法成为布局输入（除非两遍布局，框架从未做过）；虚拟列表的行几何来自 `row_height`（`sync_for_nodes` 直接读），正是本优化要救的场景，不受影响
+  - 验收：`cargo fmt --all --check` 干净 / `clippy --workspace --all-targets`（**零警告**）/ 逐 crate `test`（**846 全绿**）
+  - 未做：逐帧动画翻页、拖动中的高亮态（原生工具条有，本版不做）、横向滚动条
+- [x] **M15.5 追加（2026-10-01）**：抽出 `nui-tools`——零领域类型纯函数下沉（D39）
+  - **新增 crate**：`crates/nui-tools/`，零依赖，位于 `nui-core` 之下；`Cargo.toml` 保留空 `[dependencies]` 段（与既有 crate 风格一致，且空段本身就是"零依赖"的显式声明）
+  - **模块划分**（按用途，5 个文件 1119 行）：
+    - `numeric.rs`（295）`lerp_f64` / `lerp_f32` / `inverse_lerp` / `progress` / `step_grid` / `decimal_places` / `round_to_grid`
+    - `text.rs`（282）`edit_distance` / `is_integer` / `is_float` / `is_email` / `char_to_byte` / `byte_to_char`
+    - `curve.rs`（294）`BezierSegment` / `BezierCurve` / `apply_bezier` / `solve_segment_x` / `bezier_x` / `bezier_y` / `bezier_axis` / `bezier_x_slope`
+    - `color.rs`（138）`hex_value` / `component_to_u8` / `blend_u8`
+    - `hash.rs`（72）`content_hash`（FNV-1a）/ `cache_key`
+  - **搬迁的 12 处调用点**：`nui-core::color`（3 个本地 helper 删除，`Color::lerp` 4 处改调 `lerp_f32`）· `nui-runtime::easing`（6 个 bezier 函数 + 两个类型定义下沉，原地留 `pub use` 转口，`Easing`/`CURVES` 不动）· `nui-runtime::animation`（`mix` 闭包改调 `lerp_f64`，`Value` 分派留守）· `nui-runtime::text_input`（4 个校验函数下沉，`validates` 留守）· `nui-runtime::widget::spin`（`snap` 改调 `step_grid` + `round_to_grid`，`format_value` 改调 `decimal_places`）· `nui-compiler::check`（`edit_distance` 下沉，顶层 + 两个测试模块各加一行显式 import）· `nui-render::image`（`cache_key`/`content_hash` 换成 `pub use`，`nui_render::cache_key` 路径对 gallery/host/offscreen 三处调用方仍然解析）· `nui-render::widget::slider`（`slider_fraction` 外壳留守，体改调 `inverse_lerp`）· `nui-render::widget::scrollbar`（`progress_along` 删除，改调 `progress`）· `nui-render::widget::state`（`blend` 删除，`lighten`/`darken` 改调 `blend_u8`）· `nui-text::system`（`byte_to_char` 下沉）
+  - **合并的三处重复**（用户明确选择接受此处的行为风险）：`lerp` 三份 → `lerp_f64`/`lerp_f32`；比例映射两份 → `inverse_lerp`（`slider_fraction` 原用 `span.abs() < f32::EPSILON` 判零跨度，归并为 `span == 0.0`，可达输入上等价，已注明）；step 吸附两份 → `step_grid`
+  - **刻意留守的边界**（搬迁会逼出泛型改写，违反"签名与语义不变"）：`Point` 系几何（`nui-core::path` / `earcut`）· `Color` 系调色（`state::lighten`/`darken`/`with_alpha_scale`）· `Value` 插值分派（`interpolate` 外壳）· dp/百分比解析（`nui-core::length`）· sRGB 传递函数（`rect::linear_rgba`，收益不抵风险）
+  - **顺带指出并钉住的三条既有问题**：`byte_to_char` 在**非字符边界**的字节偏移上 panic（原注释只覆盖"越过末尾"；已记 `# Panics` + `catch_unwind` 测试 + 安全写法）· `inverse_lerp` 零跨度判据变更 · 零宽 x 的 bezier 段是退化的（每个 `t` 返回 `segment[7]`，不是停顿；真正的 hold 由 `a_flat_y_segment_is_a_real_hold` 钉住）
+  - 验收：`cargo fmt --all` 干净 / `clippy --workspace --all-targets`（**零警告**）/ 逐 crate `test --release`（**899 全绿，0 失败**；基线 846，净增 53 = `nui-tools` 42 例 + `nui-compiler` 新增 2 例 − 替换 1 例 + 其余既有例数不变）

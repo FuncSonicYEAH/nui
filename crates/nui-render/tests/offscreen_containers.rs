@@ -35,6 +35,7 @@ fn render_pixels_on(
         SceneContext {
             focused: None,
             image_keys: &HashMap::new(),
+            engine: None,
         },
     );
 

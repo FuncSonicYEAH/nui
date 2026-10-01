@@ -4,11 +4,47 @@
 use crate::bytecode::{AssignOp, Effect, PropertyTarget, TypedExpr};
 use crate::types::Type;
 
-/// A compiled document: all components, in source order.
+/// A compiled document: all document-level functions and components, in
+/// source order.
 #[derive(Debug, Clone, Default)]
 pub struct DocumentIr {
+    /// Compiled document-level functions.
+    ///
+    /// Declared at the top level with `fn`, before any component. Every
+    /// component may call them; a function may call another function
+    /// declared earlier (recursion is rejected by the checker).
+    pub functions: Vec<FunctionIr>,
     /// Compiled components.
     pub components: Vec<ComponentIr>,
+}
+
+/// A compiled function declaration.
+#[derive(Debug, Clone)]
+pub struct FunctionIr {
+    /// Function name (the callable identifier).
+    pub name: String,
+    /// Parameters in declaration order.
+    pub parameters: Vec<ParameterIr>,
+    /// Result type; `Type::Unknown` marks a `Void` function whose value is
+    /// not usable in an expression.
+    pub return_type: Type,
+    /// Body statements. The runtime evaluates them against a fresh local
+    /// frame seeded with the arguments (see `nui_runtime::binding`).
+    pub body: Vec<Effect>,
+    /// Whether the function has a value (`-> Type`); a `Void` function may
+    /// only be called in statement position.
+    pub has_value: bool,
+}
+
+/// A compiled function parameter.
+#[derive(Debug, Clone)]
+pub struct ParameterIr {
+    /// Parameter name.
+    pub name: String,
+    /// Declared type.
+    pub ty: Type,
+    /// Default value used when the argument is omitted at the call site.
+    pub default: Option<TypedExpr>,
 }
 
 /// A compiled component.

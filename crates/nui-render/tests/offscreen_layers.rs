@@ -20,6 +20,7 @@ fn render_pixels(tree: &mut ElementTree, viewport: nui_core::Size) -> (Vec<u8>, 
         SceneContext {
             focused: None,
             image_keys: &HashMap::new(),
+            engine: None,
         },
     );
 

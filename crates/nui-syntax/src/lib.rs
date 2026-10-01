@@ -29,9 +29,9 @@ pub mod token;
 
 pub use ast::{
     AssignOp, BinaryOp, CallArg, ComponentDecl, ComponentMember, Document, Expr, ForBinding,
-    Handler, Ident, InitOp, MachineDecl, NodeArg, NodeDecl, NodeMember, PropertyAssignment,
-    PropertyDecl, PropertyInit, PropertyPath, SignalDecl, StateDecl, Statement, StrPart,
-    TransitionDecl, UnaryOp, WhenBlock,
+    FunctionDecl, Handler, Ident, InitOp, MachineDecl, NodeArg, NodeDecl, NodeMember, Parameter,
+    PropertyAssignment, PropertyDecl, PropertyInit, PropertyPath, SignalDecl, StateDecl,
+    StateFieldDecl, Statement, StrPart, TransitionDecl, UnaryOp, WhenBlock,
 };
 pub use diagnostics::{Diagnostic, Severity, render_diagnostic};
 pub use lexer::{LexOutcome, lex};

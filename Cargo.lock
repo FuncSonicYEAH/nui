@@ -1210,12 +1210,14 @@ version = "0.1.0"
 dependencies = [
  "nui-core",
  "nui-syntax",
+ "nui-tools",
 ]
 
 [[package]]
 name = "nui-core"
 version = "0.1.0"
 dependencies = [
+ "nui-tools",
  "thiserror 2.0.20",
 ]
 
@@ -1256,6 +1258,7 @@ dependencies = [
  "nui-layout",
  "nui-runtime",
  "nui-text",
+ "nui-tools",
  "pollster",
  "wgpu",
 ]
@@ -1267,6 +1270,7 @@ dependencies = [
  "nui-compiler",
  "nui-core",
  "nui-syntax",
+ "nui-tools",
  "slotmap",
 ]
 
@@ -1285,8 +1289,13 @@ dependencies = [
  "etagere",
  "fontdb",
  "nui-core",
+ "nui-tools",
  "swash",
 ]
+
+[[package]]
+name = "nui-tools"
+version = "0.1.0"
 
 [[package]]
 name = "nui-winit"

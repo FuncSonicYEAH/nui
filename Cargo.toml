@@ -18,6 +18,7 @@ nui-text = { path = "crates/nui-text" }
 nui-render = { path = "crates/nui-render" }
 nui-winit = { path = "crates/nui-winit" }
 nui-macros = { path = "crates/nui-macros" }
+nui-tools = { path = "crates/nui-tools" }
 thiserror = "2"
 
 [workspace.lints.rust]

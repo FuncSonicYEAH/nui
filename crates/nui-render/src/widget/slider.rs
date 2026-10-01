@@ -68,12 +68,13 @@ pub fn parts(
 /// The normalized position of `value` in `[minimum, maximum]`. A
 /// zero-width range (bad input, or a step still being resolved) pins to 0
 /// rather than producing NaN.
+///
+/// The arithmetic is [`nui_tools::inverse_lerp`], which the scrollbar's
+/// progress reads through the same module — the two were separate
+/// spellings of this expression before, which is how the zero-span cases
+/// came to be decided twice.
 fn slider_fraction(value: f32, minimum: f32, maximum: f32) -> f32 {
-    let span = maximum - minimum;
-    if span.abs() < f32::EPSILON {
-        return 0.0;
-    }
-    return ((value - minimum) / span).clamp(0.0, 1.0);
+    return nui_tools::inverse_lerp(value, minimum, maximum);
 }
 
 #[cfg(test)]

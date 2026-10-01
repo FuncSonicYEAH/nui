@@ -180,6 +180,7 @@ fn an_unselected_page_paints_nothing() {
         nui_render::SceneContext {
             focused: engine.focused(),
             image_keys: &std::collections::HashMap::new(),
+            engine: Some(&engine),
         },
     );
     assert!(
@@ -270,6 +271,7 @@ fn scene_of(tree: &ElementTree, engine: &Engine) -> nui_render::Scene {
         nui_render::SceneContext {
             focused: engine.focused(),
             image_keys: &std::collections::HashMap::new(),
+            engine: Some(engine),
         },
     );
 }

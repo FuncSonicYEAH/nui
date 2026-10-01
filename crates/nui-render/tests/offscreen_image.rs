@@ -1,9 +1,30 @@
 //! Offscreen image-pipeline test (M8): decode a generated PNG, upload it
 //! through the renderer, and assert tinted + nine-sliced pixels land.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use nui_core::Value;
 use nui_render::{Renderer, SceneBuilder, SceneContext, cache_key, decode_file};
 use nui_runtime::Element;
+
+/// Hands out a distinct file name to every call, within one process.
+///
+/// A temp file's name has to be unique per *call*, not per logical test.
+/// The earlier version keyed it on a caller-supplied label, which is
+/// unique only if every caller picks a different one — and two tests both
+/// rendered the `top-left` atlas cell, so both wrote
+/// `nui-atlas-test-top-left.png` and the pair raced. The failure was
+/// `unexpected end of file` from `decode_file`, i.e. a half-written file
+/// read by the other thread, which reads exactly like an image-pipeline
+/// regression and is not one.
+///
+/// A counter is what makes it per-call, and it costs nothing: the label
+/// stays for legibility, the number does the work.
+fn unique_temp_file(label: &str) -> std::path::PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
+    return std::env::temp_dir().join(format!("nui-test-{label}-{serial}.png"));
+}
 
 /// Writes an 8x8 PNG: left half opaque red, right half transparent.
 fn write_test_png(path: &std::path::Path) {
@@ -24,17 +45,14 @@ fn write_test_png(path: &std::path::Path) {
 /// Offscreen render helper: builds a tree with one Image element, renders
 /// it, returns the pixels plus the readback stride.
 ///
-/// `name` picks the temp file. The two tests in this file run in parallel
-/// threads by default, so a shared path meant one test writing the PNG
-/// while the other was reading it — `decode_file` then saw a half-written
-/// file and failed with "unexpected end of file", which reads exactly like
-/// an image-pipeline regression and is not one.
+/// `name` only labels the temp file; uniqueness comes from
+/// [`unique_temp_file`].
 fn render_image(name: &str, slice: f32) -> (Vec<u8>, usize, u32, u32) {
     let width = 64u32;
     let height = 64u32;
     let viewport = nui_core::Size::new(width as f32, height as f32);
 
-    let png_path = std::env::temp_dir().join(format!("nui-image-test-{name}.png"));
+    let png_path = unique_temp_file(&format!("image-{name}"));
     write_test_png(&png_path);
     let source = png_path.display().to_string();
 
@@ -62,6 +80,7 @@ fn render_image(name: &str, slice: f32) -> (Vec<u8>, usize, u32, u32) {
         SceneContext {
             focused: None,
             image_keys: &image_keys,
+            engine: None,
         },
     );
     assert_eq!(scene.images.len(), 1, "the image draw reached the scene");
@@ -230,12 +249,15 @@ fn write_atlas_png(path: &std::path::Path) {
 
 /// Renders one 64x64 `Image` of the four-cell atlas through `region` and
 /// returns the pixels plus the stride.
+///
+/// `name` only labels the temp file; uniqueness comes from
+/// [`unique_temp_file`].
 fn render_region(name: &str, region: Option<[f32; 4]>) -> (Vec<u8>, usize) {
     let width = 64u32;
     let height = 64u32;
     let viewport = nui_core::Size::new(width as f32, height as f32);
 
-    let png_path = std::env::temp_dir().join(format!("nui-atlas-test-{name}.png"));
+    let png_path = unique_temp_file(&format!("atlas-{name}"));
     write_atlas_png(&png_path);
     let source = png_path.display().to_string();
     let bytes = std::fs::read(&source).expect("png exists");
@@ -265,6 +287,7 @@ fn render_region(name: &str, region: Option<[f32; 4]>) -> (Vec<u8>, usize) {
         SceneContext {
             focused: None,
             image_keys: &image_keys,
+            engine: None,
         },
     );
     assert_eq!(scene.images.len(), 1, "the image draw reached the scene");

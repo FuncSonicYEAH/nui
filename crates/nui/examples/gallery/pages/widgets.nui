@@ -4,9 +4,17 @@
 // The page's state lives on its root element (`widgets_page.volume` and
 // friends), not in a component property: `Slider`'s `<=>` writes back
 // through it and the readout at the bottom picks the value up next frame.
-Column(id = widgets_page, spacing = 16dp, padding = 28dp,
-       volume = 40.0, notifications = true, wifi = false, plan = "pro",
-       sheetOpen = false, confirms = 0) {
+//
+// None of those names is a `Column` property, so each one is *declared*
+// as element state — that is what separates page state from a property
+// spelling mistake now that the checker validates the vocabulary.
+Column(id = widgets_page, spacing = 16dp, padding = 28dp) {
+    state volume: Float = 40.0
+    state notifications: Bool = true
+    state wifi: Bool = false
+    state plan: String = "pro"
+    state sheetOpen: Bool = false
+    state confirms: Int = 0
 
     Text(content = "Buttons", font.size = 18dp, color = #e8ecf2)
 

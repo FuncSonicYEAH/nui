@@ -234,15 +234,20 @@ impl Engine {
                 tree.remove_subtree(child);
             }
             for row in 0..desired {
-                let _ = instantiate_row(
-                    tree,
-                    self,
-                    id,
-                    &binding.variable,
-                    model,
-                    row,
-                    &binding.prototype,
-                );
+                let _ = self.with_instancing(|engine, instantiator| {
+                    return instantiate_row(
+                        tree,
+                        engine,
+                        instantiator,
+                        id,
+                        crate::element::RowScope {
+                            variable: binding.variable.clone(),
+                            model,
+                            row,
+                        },
+                        &binding.prototype,
+                    );
+                });
                 rebuilt += 1;
             }
         }
@@ -346,15 +351,21 @@ impl Engine {
             if row >= total {
                 break;
             }
-            let Some(row_root) = instantiate_row(
-                tree,
-                self,
-                id,
-                &binding.variable,
-                model,
-                row,
-                &binding.prototype,
-            ) else {
+            let row_root = self.with_instancing(|engine, instantiator| {
+                return instantiate_row(
+                    tree,
+                    engine,
+                    instantiator,
+                    id,
+                    crate::element::RowScope {
+                        variable: binding.variable.clone(),
+                        model,
+                        row,
+                    },
+                    &binding.prototype,
+                );
+            });
+            let Some(row_root) = row_root else {
                 continue;
             };
             fit_row_to_slot(tree, row_root, row_height);
@@ -419,29 +430,31 @@ fn collect_subtree(tree: &ElementTree, id: ElementId, out: &mut Vec<ElementId>) 
 }
 
 /// Clones one row's prototype children under `for_element`, tagging every
-/// element of the row subtree with the row's scope.
+/// element of the row subtree with `scope`.
 ///
 /// Returns the row's root element (the first prototype node's instance),
 /// which the `ListView` path sizes to its slot; `None` for a prototype
 /// with no nodes.
+///
+/// The instantiator is threaded in from the caller so that one row's
+/// component numbering continues into the next, and into the next rebuild.
 pub(crate) fn instantiate_row(
     tree: &mut ElementTree,
     engine: &mut Engine,
+    instantiator: &mut crate::instantiate::Instantiator<'_>,
     for_element: ElementId,
-    variable: &str,
-    model: ModelId,
-    row: usize,
+    scope: crate::element::RowScope,
     prototype: &[nui_compiler::NodeIr],
 ) -> Option<ElementId> {
-    let scope = crate::element::RowScope {
-        variable: variable.to_string(),
-        model,
-        row,
-    };
     let mut root = None;
     for node in prototype {
-        let child =
-            crate::instantiate::instantiate_prototype_node(tree, engine, node, Some(scope.clone()));
+        let child = crate::instantiate::instantiate_prototype_node(
+            tree,
+            engine,
+            node,
+            Some(scope.clone()),
+            instantiator,
+        );
         tree.append_child(for_element, child);
         root.get_or_insert(child);
     }

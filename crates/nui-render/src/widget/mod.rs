@@ -44,6 +44,7 @@ mod dialog;
 mod panel;
 mod part;
 mod radio;
+mod scrollbar;
 mod separator;
 mod slider;
 mod spinbox;
@@ -55,6 +56,10 @@ mod switch;
 mod tests;
 
 pub use part::{DropShadow, WidgetPart, surface};
+pub use scrollbar::{
+    HIT_SLOP, MIN_THUMB, ScrollbarHit, ScrollbarMetrics, THUMB_INSET, THUMB_RADIUS, THUMB_WIDTH,
+    scroll_y_from_thumb_top, scrollbar_hit, scrollbar_metrics, thumb_color,
+};
 pub use state::{Palette, VisualState, darken, lighten, variant_palette, with_alpha_scale};
 
 use nui_core::{Rect, Size};

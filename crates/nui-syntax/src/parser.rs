@@ -3,9 +3,10 @@
 mod expr;
 
 use crate::ast::{
-    AssignOp, ComponentDecl, ComponentMember, Document, ForBinding, Handler, Ident, InitOp,
-    MachineDecl, NodeArg, NodeDecl, NodeMember, PropertyAssignment, PropertyDecl, PropertyInit,
-    PropertyPath, SignalDecl, StateDecl, Statement, TransitionDecl, WhenBlock,
+    AssignOp, ComponentDecl, ComponentMember, Document, ForBinding, FunctionDecl, Handler, Ident,
+    InitOp, MachineDecl, NodeArg, NodeDecl, NodeMember, Parameter, PropertyAssignment,
+    PropertyDecl, PropertyInit, PropertyPath, SignalDecl, StateDecl, StateFieldDecl, Statement,
+    TransitionDecl, WhenBlock,
 };
 use crate::diagnostics::Diagnostic;
 use crate::lexer::{LexOutcome, lex};
@@ -35,9 +36,14 @@ pub fn parse(source: &str) -> ParseOutcome {
         diagnostics: Vec::new(),
     };
     let mut components = Vec::new();
+    let mut functions = Vec::new();
     while !parser.at_eof() {
         let before = parser.pos;
-        if let Some(component) = parser.parse_component() {
+        if parser.at_keyword(Keyword::Fn) {
+            if let Some(function) = parser.parse_function() {
+                functions.push(function);
+            }
+        } else if let Some(component) = parser.parse_component() {
             components.push(component);
         }
         parser.recover_top_level(before);
@@ -45,7 +51,10 @@ pub fn parse(source: &str) -> ParseOutcome {
     let mut diagnostics = lexer_diagnostics;
     diagnostics.append(&mut parser.diagnostics);
     return ParseOutcome {
-        document: Document { components },
+        document: Document {
+            functions,
+            components,
+        },
         diagnostics,
     };
 }
@@ -80,6 +89,81 @@ impl Parser {
             extends,
             members,
         });
+    }
+
+    /// `fn name(a: Int, b: Int = 0) -> Int { ... }`
+    fn parse_function(&mut self) -> Option<FunctionDecl> {
+        let start_index = self.pos;
+        if !self.expect_keyword(Keyword::Fn) {
+            return None;
+        }
+        let name = self.expect_ident()?;
+        if !self.expect_punct(Punct::LParen) {
+            return None;
+        }
+        let parameters = self.parse_parameters();
+        self.expect_punct(Punct::RParen);
+        let return_type = if self.eat_punct(Punct::RArrow) {
+            self.expect_ident()
+        } else {
+            None
+        };
+        if !self.expect_punct(Punct::LBrace) {
+            return None;
+        }
+        let body = self.parse_statement_block();
+        self.close_body();
+        return Some(FunctionDecl {
+            span: self.span_from(start_index),
+            name,
+            parameters,
+            return_type,
+            body,
+        });
+    }
+
+    fn parse_parameters(&mut self) -> Vec<Parameter> {
+        let mut parameters = Vec::new();
+        loop {
+            match self.peek().clone() {
+                TokenKind::Punct(Punct::RParen) | TokenKind::Eof => break,
+                TokenKind::Ident(_) => {
+                    let start_index = self.pos;
+                    let Some(name) = self.expect_ident() else {
+                        self.recover_arg();
+                        break;
+                    };
+                    if !self.expect_punct(Punct::Colon) {
+                        self.recover_arg();
+                        break;
+                    }
+                    let Some(declared_type) = self.expect_ident() else {
+                        self.recover_arg();
+                        break;
+                    };
+                    let default = if self.eat_punct(Punct::Assign) {
+                        Some(self.parse_expression())
+                    } else {
+                        None
+                    };
+                    parameters.push(Parameter {
+                        span: self.span_from(start_index),
+                        name,
+                        declared_type,
+                        default,
+                    });
+                }
+                other => {
+                    self.error(format!("expected a parameter, found {other}"));
+                    self.recover_arg();
+                    break;
+                }
+            }
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        return parameters;
     }
 
     fn parse_component_members(&mut self) -> Vec<ComponentMember> {
@@ -386,6 +470,10 @@ impl Parser {
                     Some(when) => members.push(NodeMember::When(when)),
                     None => self.recover_member(),
                 },
+                TokenKind::Keyword(Keyword::State) => match self.parse_state_field() {
+                    Some(state) => members.push(NodeMember::State(state)),
+                    None => self.recover_member(),
+                },
                 TokenKind::Keyword(Keyword::On) => match self.parse_handler() {
                     Some(handler) => members.push(NodeMember::Handler(handler)),
                     None => self.recover_member(),
@@ -446,6 +534,33 @@ impl Parser {
             span: self.span_from(start_index),
             condition,
             assignments,
+        });
+    }
+
+    /// `state name: Type = default` — a node-scoped value declaration.
+    ///
+    /// The same keyword as a machine's `state`, distinguished by context:
+    /// inside a `machine` it names a state, inside a node body it declares
+    /// an element state field. A machine state is a bare identifier with no
+    /// `:`/`=`; a state field always carries both.
+    fn parse_state_field(&mut self) -> Option<StateFieldDecl> {
+        let start_index = self.pos;
+        self.bump(); // `state`
+        let name = self.expect_ident()?;
+        if !self.expect_punct(Punct::Colon) {
+            return None;
+        }
+        let declared_type = self.expect_ident()?;
+        if !self.expect_punct(Punct::Assign) {
+            return None;
+        }
+        let default = self.parse_expression();
+        self.eat_punct(Punct::Semi);
+        return Some(StateFieldDecl {
+            span: self.span_from(start_index),
+            name,
+            declared_type,
+            default,
         });
     }
 
@@ -535,6 +650,24 @@ impl Parser {
                     condition,
                     then_branch,
                     else_branch,
+                });
+            }
+            TokenKind::Keyword(Keyword::Return) => {
+                let start_index = self.pos;
+                self.bump();
+                // `return` with no value is only meaningful for Void functions.
+                let value = if self.at_punct(Punct::Semi)
+                    || self.at_punct(Punct::RBrace)
+                    || self.at_eof()
+                {
+                    None
+                } else {
+                    Some(self.parse_expression())
+                };
+                self.eat_punct(Punct::Semi);
+                return Some(Statement::Return {
+                    span: self.span_from(start_index),
+                    value,
                 });
             }
             TokenKind::Keyword(Keyword::Emit) => {
@@ -794,20 +927,24 @@ impl Parser {
                     | Keyword::Let
                     | Keyword::If
                     | Keyword::Emit
+                    | Keyword::Fn
+                    | Keyword::Return
             )
         );
         return matches!(self.peek(), TokenKind::Ident(_)) || is_keyword;
     }
 
-    /// Recovers at the top level: skips to the next `component` keyword or
-    /// EOF, guaranteeing progress relative to `before`.
+    /// Recovers at the top level: skips to the next `component`/`fn` keyword
+    /// or EOF, guaranteeing progress relative to `before`.
     fn recover_top_level(&mut self, before: usize) {
         if self.pos == before && !self.at_eof() {
             self.bump();
         }
         while !matches!(
             self.peek(),
-            TokenKind::Eof | TokenKind::Keyword(Keyword::Component)
+            TokenKind::Eof
+                | TokenKind::Keyword(Keyword::Component)
+                | TokenKind::Keyword(Keyword::Fn)
         ) {
             self.bump();
         }
@@ -1027,6 +1164,46 @@ mod tests {
             panic!("expected a for binding");
         };
         assert_eq!(binding.variable.name, "item");
+    }
+
+    #[test]
+    fn parses_function_declarations() {
+        let source = r#"
+            fn clamp01(value: Float) -> Float {
+                if value < 0.0 { return 0.0 }
+                if value > 1.0 { return 1.0 }
+                return value
+            }
+            fn tag(label: String, count: Int = 0) -> String {
+                return "{label}: {count}"
+            }
+            component A {
+                Window(width = 100dp) {}
+            }
+        "#;
+        let document = parse_ok(source);
+        assert_eq!(document.functions.len(), 2);
+        assert_eq!(document.components.len(), 1);
+
+        let clamp01 = &document.functions[0];
+        assert_eq!(clamp01.name.name, "clamp01");
+        assert_eq!(clamp01.parameters.len(), 1);
+        assert_eq!(clamp01.parameters[0].name.name, "value");
+        assert_eq!(clamp01.parameters[0].declared_type.name, "Float");
+        assert_eq!(
+            clamp01.return_type.as_ref().expect("a return type").name,
+            "Float"
+        );
+        assert_eq!(clamp01.body.len(), 3);
+        assert!(matches!(
+            clamp01.body[2],
+            Statement::Return { value: Some(_), .. }
+        ));
+
+        let tag = &document.functions[1];
+        assert_eq!(tag.parameters.len(), 2);
+        assert!(tag.parameters[0].default.is_none());
+        assert!(tag.parameters[1].default.is_some(), "count defaults to 0");
     }
 
     #[test]

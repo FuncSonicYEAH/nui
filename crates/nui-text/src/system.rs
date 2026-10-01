@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use cosmic_text::{Buffer, FontSystem, Metrics, Shaping, SwashCache, SwashContent};
+use nui_tools::text::byte_to_char;
 
 use crate::atlas::{GlyphAtlas, GlyphMask, GlyphQuad};
 use crate::typeface::Typeface;
@@ -468,13 +469,6 @@ fn cluster_char_range(
         paragraph_start + byte_to_char(paragraph, start_byte),
         paragraph_start + byte_to_char(paragraph, end),
     );
-}
-
-/// Char index of a byte offset that cosmic-text reported (always on a char
-/// boundary, but clamped so a malformed offset cannot panic).
-fn byte_to_char(text: &str, byte: usize) -> usize {
-    let byte = byte.min(text.len());
-    return text[..byte].chars().count();
 }
 
 /// Makes the visual line ranges a contiguous partition of the text.

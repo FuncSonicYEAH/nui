@@ -4,6 +4,13 @@ use std::fmt;
 
 use crate::error::{Error, Result};
 
+/// Byte <-> float conversion and the hex-digit reader live in `nui-tools`:
+/// they are arithmetic on plain numbers with no opinion about what a color
+/// is, and `nui-tools` is where the copy shared with the renderer's palette
+/// work now is. What stays here is everything that *is* about a color —
+/// the type, its grammar, and its error type.
+use nui_tools::{component_to_u8, hex_value, lerp_f32};
+
 /// Full-scale f32 value of a u8 component (255.0), for byte/float conversion.
 const U8_MAX_AS_F32: f32 = 255.0;
 /// Radix of hexadecimal numbers.
@@ -218,22 +225,12 @@ impl Color {
     pub fn lerp(self, target: Color, factor: f32) -> Color {
         let t = factor.clamp(0.0, 1.0);
         return Color::from_rgba(
-            lerp_component(self.red, target.red, t),
-            lerp_component(self.green, target.green, t),
-            lerp_component(self.blue, target.blue, t),
-            lerp_component(self.alpha, target.alpha, t),
+            lerp_f32(self.red, target.red, t),
+            lerp_f32(self.green, target.green, t),
+            lerp_f32(self.blue, target.blue, t),
+            lerp_f32(self.alpha, target.alpha, t),
         );
     }
-}
-
-/// Single hex digit -> 0..=15.
-fn hex_value(digit: char) -> Option<u8> {
-    return match digit {
-        '0'..='9' => Some(digit as u8 - b'0'),
-        'a'..='f' => Some(digit as u8 - b'a' + 10),
-        'A'..='F' => Some(digit as u8 - b'A' + 10),
-        _ => None,
-    };
 }
 
 /// Short-form component: a single digit expanded to two digits (`#3` -> 0x33).
@@ -256,16 +253,6 @@ fn byte_component(literal: &str, high: char, low: char) -> Result<u8> {
         });
     };
     return Ok(high_value * HEX_RADIX + low_value);
-}
-
-/// Float component -> byte (clamp + round).
-fn component_to_u8(component: f32) -> u8 {
-    return (component.clamp(0.0, 1.0) * U8_MAX_AS_F32).round() as u8;
-}
-
-/// Float linear interpolation.
-fn lerp_component(from: f32, to: f32, t: f32) -> f32 {
-    return from + (to - from) * t;
 }
 
 impl fmt::Display for Color {

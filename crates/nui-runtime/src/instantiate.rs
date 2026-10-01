@@ -49,108 +49,183 @@ pub fn instantiate_with(document: &DocumentIr, registry: Registry) -> Instance {
     let mut tree = ElementTree::new();
     let mut engine = Engine::new();
     engine.registry = registry;
-    let catalog = ComponentCatalog::new(&document.components);
-    let mut instantiator = Instantiator::new(catalog);
-    for component in &document.components {
-        if component.referenced {
-            continue;
-        }
-        // An entry component is an instance of itself, and needs the same
-        // rewrite an instance gets -- but for a different reason. `mangle_node`
-        // sends `PropertyTarget::Component(name)` to the instance element, and
-        // without it an entry component's own properties resolve to *the
-        // document's first root*: which is a different element as soon as the
-        // document has more than one entry component, and is that element's
-        // property, or nothing at all.
-        //
-        // It shows up as a component reading `0` where it declared `""`, with
-        // no diagnostic -- the property is simply a different element's.
-        let self_id = format!("entry{}::self", component.name);
-        let own: crate::mangle::OwnIds = component
-            .ids
-            .iter()
-            .map(|(id, _)| return id.clone())
-            .collect();
-        for node in &component.roots {
-            let mut node = node.clone();
-            crate::mangle::mangle_node(&mut node, "", &self_id, &own);
-            let root = instantiate_scoped_node(
-                &mut tree,
-                &mut engine,
-                &node,
-                None,
-                &mut instantiator,
-                None,
-            );
-            tree.push_root(root);
-            tree.register_id(&self_id, root);
-            attach_machines(&mut tree, root, &component.machines);
-            apply_component_properties(&mut tree, &mut engine, root, &component.properties);
-        }
+    // The document's functions become callable from any binding or effect
+    // in the tree. Sharing the body behind an `Arc` avoids a deep clone of
+    // every function on each instantiation (and each hot reload).
+    for function in &document.functions {
+        engine.functions.insert(
+            function.name.clone(),
+            crate::binding::FunctionEntry {
+                parameters: function.parameters.clone(),
+                body: function.body.clone().into(),
+                has_value: function.has_value,
+            },
+        );
     }
-    build_id_index(&mut tree);
+    let catalog = ComponentCatalog::new(&document.components);
+    // The instantiator borrows the catalog, so its scope has to close before
+    // the catalog can move into the engine below. A block is the honest way
+    // to say that: the borrow ends where the block does.
+    let instance_count = {
+        let mut instantiator = Instantiator::new(&catalog);
+        for component in &document.components {
+            if component.referenced {
+                continue;
+            }
+            // An entry component is an instance of itself, and needs the same
+            // rewrite an instance gets -- but for a different reason. `mangle_node`
+            // sends `PropertyTarget::Component(name)` to the instance element, and
+            // without it an entry component's own properties resolve to *the
+            // document's first root*: which is a different element as soon as the
+            // document has more than one entry component, and is that element's
+            // property, or nothing at all.
+            //
+            // It shows up as a component reading `0` where it declared `""`, with
+            // no diagnostic -- the property is simply a different element's.
+            let self_id = format!("entry{}::self", component.name);
+            let own: crate::mangle::OwnIds = component
+                .ids
+                .iter()
+                .map(|(id, _)| return id.clone())
+                .collect();
+            for node in &component.roots {
+                let mut node = node.clone();
+                crate::mangle::mangle_node(&mut node, "", &self_id, &own);
+                let root = instantiate_scoped_node(
+                    &mut tree,
+                    &mut engine,
+                    &node,
+                    None,
+                    &mut instantiator,
+                    None,
+                );
+                tree.push_root(root);
+                tree.register_id(&self_id, root);
+                attach_machines(&mut tree, root, &component.machines);
+                apply_component_properties(&mut tree, &mut engine, root, &component.properties);
+            }
+        }
+        instantiator.instances
+    };
     let two_way = link_two_way_pairs(&mut tree);
     engine.index_two_way_links(two_way);
+    // Hand the instance numbering over to the engine: `For` / `ListView` rows
+    // expand their components later, and must continue where this pass
+    // stopped rather than restart at `i1::` and collide with live elements.
+    debug_assert_eq!(
+        engine.prefix_high_water, 0,
+        "a fresh engine starts its prefix numbering at zero"
+    );
+    engine.prefix_high_water = instance_count;
+    // The catalog outlives the pass that built it: rows instantiate their
+    // own components later, once per frame, and have no other way to reach
+    // the document.
+    engine.catalog = catalog;
     return Instance { tree, engine };
 }
 
 /// The instantiable components of one document, by name.
 ///
-/// A component reference is resolved through this rather than through a
-/// field on the engine, so the engine stays reactive state and never
-/// carries the program. The consequence is that a `For` row — which the
-/// engine instantiates on its own, with no catalog in hand — cannot expand
-/// a component reference today; the checker rejects that shape instead of
-/// letting it fail at runtime.
-struct ComponentCatalog<'doc> {
-    components: HashMap<&'doc str, &'doc ComponentIr>,
+/// Component references are resolved through one of these. Instantiation
+/// builds it from the document and hands it to the engine, because the
+/// engine needs it too: a `For` / `ListView` row is instantiated by
+/// [`Engine::sync_for_nodes`](crate::binding::Engine::sync_for_nodes), per
+/// frame, long after the instantiation pass has returned.
+#[derive(Debug, Default)]
+pub(crate) struct ComponentCatalog {
+    components: HashMap<String, ComponentIr>,
 }
 
-impl<'doc> ComponentCatalog<'doc> {
-    fn new(components: &'doc [ComponentIr]) -> ComponentCatalog<'doc> {
+impl ComponentCatalog {
+    fn new(components: &[ComponentIr]) -> ComponentCatalog {
         return ComponentCatalog {
             components: components
                 .iter()
-                .map(|component| return (component.name.as_str(), component))
+                .map(|component| return (component.name.clone(), component.clone()))
                 .collect(),
         };
     }
 
-    fn get(&self, name: &str) -> Option<&'doc ComponentIr> {
-        return self.components.get(name).copied();
+    fn get(&self, name: &str) -> Option<&ComponentIr> {
+        return self.components.get(name);
     }
 }
 
 /// The state one instantiation run threads through the recursion: the
 /// catalog to expand against and the counter that keeps every instance's id
 /// namespace distinct.
-pub(crate) struct Instantiator<'doc> {
-    catalog: ComponentCatalog<'doc>,
+pub(crate) struct Instantiator<'a> {
+    catalog: &'a ComponentCatalog,
     /// How many component instances have been expanded so far. Each one
     /// takes the next number as its id prefix.
     instances: u32,
 }
 
-impl<'doc> Instantiator<'doc> {
-    fn new(catalog: ComponentCatalog<'doc>) -> Instantiator<'doc> {
+impl<'a> Instantiator<'a> {
+    fn new(catalog: &'a ComponentCatalog) -> Instantiator<'a> {
+        return Instantiator::starting_at(catalog, 0);
+    }
+
+    /// An instantiator whose first instance takes prefix `start + 1`.
+    ///
+    /// The instantiation pass starts at `0`, which is what makes its
+    /// instance prefixes read `i1::`, `i2::`, … The row-expansion pass
+    /// starts at the engine's high-water mark instead, so a `For` row built
+    /// in a later frame resumes the numbering that the instantiation pass
+    /// left off at. Neither pass ever revisits a number the other issued.
+    fn starting_at(catalog: &'a ComponentCatalog, start: u32) -> Instantiator<'a> {
         return Instantiator {
             catalog,
-            instances: 0,
+            instances: start,
         };
     }
 
-    /// The next instance's id prefix.
+    /// Ensures the next prefix does not overflow the counter, so a wrap
+    /// cannot silently merge two instances' namespaces.
     ///
-    /// A monotonic counter rather than a path built from the call site,
-    /// because the same call site can be reached from inside a `For` row
-    /// and the prefix only has to be *unique*, not pretty. Debug-asserting
-    /// the wrap keeps a u32 rollover from silently merging two instances'
-    /// namespaces.
+    /// Overflow here means the document is unrealistically large or has run
+    /// for an implausible number of frames -- not a condition with a
+    /// sensible degraded rendering, hence the panic (unchanged from before
+    /// the counter moved to the engine).
     fn next_prefix(&mut self) -> String {
         self.instances = self.instances.checked_add(1).unwrap_or_else(|| {
             panic!("component instance counter overflowed; the document is too large")
         });
         return format!("i{}::", self.instances);
+    }
+}
+
+impl Engine {
+    /// Runs `body` with the engine and an instantiator that resumes its
+    /// instance numbering, then records how far the numbering advanced.
+    ///
+    /// The counterpart of the high-water write in `instantiate_with`. Rows
+    /// are rebuilt per frame and each rebuild issues fresh prefixes, so the
+    /// mark has to move forward every time — otherwise the next rebuild
+    /// would reuse the previous one's numbers while those elements are
+    /// still in the tree, and two instances would share one id namespace.
+    ///
+    /// `body` gets the engine back because instantiating a row registers
+    /// bindings and evaluates iterables, which is engine work; it gets the
+    /// instantiator because a component in the row needs a fresh prefix.
+    /// The two are disjoint borrows of `self` (the instantiator borrows the
+    /// catalog, the body borrows everything else), which is why the catalog
+    /// is moved out for the duration rather than borrowed in place.
+    pub(crate) fn with_instancing<T>(
+        &mut self,
+        body: impl FnOnce(&mut Engine, &mut Instantiator<'_>) -> T,
+    ) -> T {
+        let catalog = std::mem::take(&mut self.catalog);
+        // Scoped so the instantiator's borrow of `catalog` ends before the
+        // catalog moves back into `self`.
+        let (outcome, instance_count) = {
+            let mut instantiator = Instantiator::starting_at(&catalog, self.prefix_high_water);
+            let outcome = body(self, &mut instantiator);
+            (outcome, instantiator.instances)
+        };
+        self.prefix_high_water = instance_count;
+        self.catalog = catalog;
+        return outcome;
     }
 }
 
@@ -263,6 +338,14 @@ pub(crate) fn instantiate_scoped_node(
         });
     }
     let id = tree.insert(element);
+    // Register the node's `id` as it enters the tree rather than in a final
+    // pass over the finished tree. A `For` / `ListView` row is inserted
+    // *after* instantiation, once per frame, so a sweep that runs at the end
+    // of instantiation would never see the row's elements — and a component
+    // inside a row resolves its own internal ids through this table.
+    if let Some(name) = tree.arena[id].id.clone() {
+        tree.register_id(&name, id);
+    }
     // Before the children: a child's static initialiser may read this node's
     // properties, and this element only has them because the caller passed
     // them. See `InstanceSeed`.
@@ -442,32 +525,31 @@ fn instantiate_component_instance(
 
 /// Instantiates one node of a `For` / `ListView` row prototype.
 ///
-/// Same walk as [`instantiate_scoped_node`], minus the component catalog:
-/// the engine instantiates rows on its own and does not carry the
-/// document, so it cannot expand a component reference. The checker
-/// rejects that combination, which is what keeps this from being a silent
-/// no-op — a row that quietly rendered as an empty element would be far
-/// harder to diagnose than a compile error.
+/// Same walk as [`instantiate_scoped_node`], against the engine's catalog.
+/// The catalog is reachable here because instantiation handed it to the
+/// engine: rows are built per frame, long after the pass that read the
+/// document has returned.
+///
+/// The instantiator is passed in rather than made here so that one row's
+/// numbering continues into the next: a rebuild that restarted at `i1::`
+/// would collide with the elements the previous frame left in the tree.
 pub(crate) fn instantiate_prototype_node(
     tree: &mut ElementTree,
     engine: &mut Engine,
     node: &NodeIr,
     scope: Option<crate::element::RowScope>,
+    instantiator: &mut Instantiator<'_>,
 ) -> ElementId {
-    if let Some(name) = &node.component {
-        panic!(
-            "component `{name}` cannot be instantiated inside a For row: \
-             the engine has no document to expand it from"
-        );
-    }
     return instantiate_scoped_node(
         tree,
         engine,
         node,
         scope,
-        &mut Instantiator::new(ComponentCatalog::new(&[])),
-        // A `For` row cannot contain a component reference (it would have no
-        // document to expand), so there is never an instance to seed here.
+        instantiator,
+        // The prototype's own root is not a component instance, so there is
+        // no call-site argument to seed it with. A component *inside* the
+        // row reaches `instantiate_component_instance` through the
+        // `node.component` branch above and seeds itself there.
         None,
     );
 }
@@ -712,6 +794,14 @@ pub(crate) fn zero_value_for(ty: nui_compiler::Type) -> Value {
 
 /// Builds the `id -> element` index after the whole tree exists (plan §5:
 /// ids resolve after construction, before binding evaluation).
+///
+/// Superseded by registering each id as its element enters the tree
+/// ([`instantiate_scoped_node`]): a `For` / `ListView` row is inserted after
+/// this function would have run, so a single final sweep cannot be the only
+/// registration point. Kept as the explicit statement of the invariant for
+/// hand-built trees, and as the re-index a caller can run after mutating
+/// `element.id` directly.
+#[allow(dead_code)]
 fn build_id_index(tree: &mut ElementTree) {
     let mut entries = Vec::new();
     tree.visit_pre_order(|id, element| {

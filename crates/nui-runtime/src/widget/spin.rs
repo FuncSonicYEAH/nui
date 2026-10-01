@@ -18,6 +18,10 @@
 
 use crate::binding::Engine;
 use crate::element::{Element, ElementId, ElementTree};
+// Grid snapping and the display rounding are shared arithmetic with no nui
+// types involved; the slider drag in `nui-render` snaps with the same
+// function, which is the point of it living outside both.
+use nui_tools::{round_to_grid, step_grid};
 
 use super::props::number64;
 
@@ -88,9 +92,13 @@ impl SpinRange {
     }
 
     /// The value snapped to `[min, max]` and onto the step grid.
+    ///
+    /// The grid arithmetic is [`nui_tools::step_grid`], which is also what
+    /// the renderer's slider drag uses — the two would otherwise be the
+    /// same expression written twice, which is how they drift.
     pub fn snap(&self, value: f64) -> f64 {
-        let snapped = self.min + ((value - self.min) / self.step).round() * self.step;
-        return round_to_grid(snapped.clamp(self.min, self.max), self.step);
+        let snapped = step_grid(value, self.min, self.step).clamp(self.min, self.max);
+        return round_to_grid(snapped, self.step);
     }
 
     /// `value` advanced by `steps` steps from the grid.
@@ -165,7 +173,7 @@ pub fn step_focused(engine: &mut Engine, tree: &mut ElementTree, steps: f64) -> 
 /// turned into text — a control whose displayed value disagrees with the
 /// value it steps to is worse than no display at all.
 pub fn format_value(value: f64, step: f64) -> String {
-    let places = decimal_places(step).max(decimal_places(value)) as usize;
+    let places = nui_tools::decimal_places(step).max(nui_tools::decimal_places(value)) as usize;
     if places == 0 {
         return format!("{}", value.round() as i64);
     }
@@ -178,33 +186,6 @@ pub fn display_value(element: &Element) -> String {
     let range = SpinRange::of(element);
     let value = number64(element, "value").unwrap_or(range.min);
     return format_value(value, range.step);
-}
-
-/// Rounds to the step's own decimal precision, dropping the noise a
-/// fraction accumulates.
-fn round_to_grid(value: f64, step: f64) -> f64 {
-    let places = decimal_places(step);
-    if places == 0 {
-        return value.round();
-    }
-    let factor = 10f64.powi(places as i32);
-    return (value * factor).round() / factor;
-}
-
-/// How many decimals a number needs before it is an integer, capped at 9 so
-/// a pathological value cannot ask for an unbounded string. The tolerance
-/// is what absorbs the representation error of the scaled value.
-fn decimal_places(value: f64) -> u32 {
-    if !value.is_finite() || value == 0.0 {
-        return 0;
-    }
-    for places in 0..=9u32 {
-        let scaled = value * 10f64.powi(places as i32);
-        if (scaled - scaled.round()).abs() < 1e-6 {
-            return places;
-        }
-    }
-    return 9;
 }
 
 #[cfg(test)]

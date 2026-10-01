@@ -204,6 +204,7 @@ fn snapshots() {
             nui_render::SceneContext {
                 focused: engine.focused(),
                 image_keys: &image_keys,
+                engine: Some(&engine),
             },
         );
         renderer.render_to_view(

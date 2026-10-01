@@ -8,9 +8,14 @@
 // is the validator's write-back — the host recomputes it whenever the text
 // changes, and the `fill` binding above it reads it like any other
 // property.
-Column(id = text_fields_page, spacing = 10dp, padding = 24dp,
-       name = "", secret = "", bio = "", email = "ada@",
-       count = 3.0, fine = 0.5, saved = false) {
+Column(id = text_fields_page, spacing = 10dp, padding = 24dp) {
+    state name: String = ""
+    state secret: String = ""
+    state bio: String = ""
+    state email: String = "ada@"
+    state count: Float = 3.0
+    state fine: Float = 0.5
+    state saved: Bool = false
 
     Text(content = "Text fields", font.size = 18dp, color = #e8ecf2)
 

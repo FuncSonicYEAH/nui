@@ -4,16 +4,22 @@
 use std::collections::{HashMap, HashSet};
 
 use nui_core::{Length, Value};
+// The distance metric behind the "did you mean" suggestions is plain
+// character arithmetic with no nui types in it, so it lives with the other
+// shared helpers. The *ceiling* and the candidate source stay here — see
+// `closest_property_name` — because both are this checker's judgement.
 use nui_syntax::{
     AssignOp as AstAssignOp, BinaryOp, ComponentDecl, ComponentMember, Document, Expr, Handler,
     Ident, InitOp, NodeArg, NodeDecl, NodeMember, PropertyAssignment, PropertyDecl, Span,
     Statement, UnaryOp, WhenBlock,
 };
+use nui_tools::edit_distance;
 
 use crate::bytecode::{AssignOp, Builtin, Effect, InterpPart, PropertyTarget, TypedExpr};
 use crate::document::{
-    AssignmentIr, ComponentIr, DocumentIr, ForIr, HandlerIr, InitKind, MachineIr, NodeIr,
-    PropertyDefaultIr, PropertyIr, StateIr, TransitionIr, WhenIr, assign_op_name,
+    AssignmentIr, ComponentIr, DocumentIr, ForIr, FunctionIr, HandlerIr, InitKind, MachineIr,
+    NodeIr, ParameterIr, PropertyDefaultIr, PropertyIr, StateIr, TransitionIr, WhenIr,
+    assign_op_name,
 };
 use crate::types::{Type, unify};
 
@@ -30,6 +36,124 @@ const COLOR_DIGIT_COUNTS: [usize; 4] = [3, 4, 6, 8];
 /// element" needs an element type table the checker does not have.
 const HOST_ELEMENT_METHODS: &[&str] = &["close"];
 
+/// Shared empty function table, for the binders and helpers that run
+/// without a document-level function list (unit tests, single-expression
+/// checks). A `&'static` reference keeps the [`ComponentBinder`] field a
+/// plain borrow rather than an `Option`.
+fn empty_functions() -> &'static HashMap<String, FunctionSignature> {
+    static EMPTY: std::sync::OnceLock<HashMap<String, FunctionSignature>> =
+        std::sync::OnceLock::new();
+    return EMPTY.get_or_init(HashMap::new);
+}
+
+/// A document-level function's declared API, read syntactically before
+/// anything is bound — the same reason [`ComponentSignature`] exists: a call
+/// may appear before the declaration it names, and inside a component that
+/// binds earlier in the file.
+#[derive(Debug, Clone)]
+struct FunctionSignature {
+    /// Function name (for diagnostics).
+    name: String,
+    /// Parameters in declaration order.
+    parameters: Vec<ParameterSignature>,
+    /// Declared result type; `None` means `Void`.
+    return_type: Option<Type>,
+}
+
+/// One declared parameter.
+#[derive(Debug, Clone)]
+struct ParameterSignature {
+    /// Parameter name.
+    name: String,
+    /// Declared type (`Unknown` when the name is not a known type).
+    ty: Type,
+    /// Whether the parameter has a default and may be omitted.
+    has_default: bool,
+}
+
+/// Collects document-level function signatures and reports duplicates and
+/// name clashes with builtins.
+///
+/// A function may not shadow a builtin (`min`, `tween`, ...): the call
+/// syntax is identical, so the builtin would become unreachable, silently.
+fn collect_function_signatures(
+    document: &Document,
+    diagnostics: &mut Vec<nui_syntax::Diagnostic>,
+) -> HashMap<String, FunctionSignature> {
+    let mut signatures = HashMap::new();
+    for declaration in &document.functions {
+        let name = declaration.name.name.clone();
+        if Builtin::from_name(&name).is_some() {
+            diagnostics.push(nui_syntax::Diagnostic::error(
+                declaration.name.span,
+                format!("`{name}` is a builtin function and cannot be redeclared"),
+            ));
+            continue;
+        }
+        if signatures.contains_key(&name) {
+            diagnostics.push(nui_syntax::Diagnostic::error(
+                declaration.name.span,
+                format!("`{name}` is declared more than once"),
+            ));
+            continue;
+        }
+        let mut parameters: Vec<ParameterSignature> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut saw_default = false;
+        for parameter in &declaration.parameters {
+            let parameter_name = parameter.name.name.clone();
+            if !seen.insert(parameter_name.clone()) {
+                diagnostics.push(nui_syntax::Diagnostic::error(
+                    parameter.name.span,
+                    format!("`{parameter_name}` is declared more than once"),
+                ));
+                continue;
+            }
+            // A parameter without a default may not follow one with a
+            // default: the call site could not tell which it meant.
+            let has_default = parameter.default.is_some();
+            if saw_default && !has_default {
+                diagnostics.push(nui_syntax::Diagnostic::error(
+                    parameter.span,
+                    format!("`{parameter_name}` has no default but follows a parameter that does"),
+                ));
+            }
+            saw_default = saw_default || has_default;
+            let ty = Type::from_name(&parameter.declared_type.name).unwrap_or(Type::Unknown);
+            if ty == Type::Unknown {
+                diagnostics.push(nui_syntax::Diagnostic::error(
+                    parameter.declared_type.span,
+                    format!("unknown type `{}`", parameter.declared_type.name),
+                ));
+            }
+            parameters.push(ParameterSignature {
+                name: parameter_name,
+                ty,
+                has_default,
+            });
+        }
+        let return_type = declaration.return_type.as_ref().map(|ident| {
+            let ty = Type::from_name(&ident.name).unwrap_or(Type::Unknown);
+            if ty == Type::Unknown {
+                diagnostics.push(nui_syntax::Diagnostic::error(
+                    ident.span,
+                    format!("unknown type `{}`", ident.name),
+                ));
+            }
+            return ty;
+        });
+        signatures.insert(
+            name.clone(),
+            FunctionSignature {
+                name,
+                parameters,
+                return_type,
+            },
+        );
+    }
+    return signatures;
+}
+
 /// Outcome of checking: the compiled document plus diagnostics.
 pub struct CheckOutcome {
     /// Compiled document (best effort; erroneous parts become `Error`
@@ -44,8 +168,7 @@ pub fn check(document: &Document) -> CheckOutcome {
     return check_with(document, &[]);
 }
 
-/// A component's declared API, read syntactically before anything is bound.
-///
+/// A component's declared API, read syntactically before anything is bound.///
 /// A call site may appear before the component it names (or after it), so
 /// every signature has to be known before the first component is bound.
 /// This is deliberately a *syntactic* pre-pass rather than a lookup into
@@ -797,25 +920,33 @@ fn merge_signatures(
 /// but a host may register one that is not, and slicing a `&str` by byte
 /// index would then panic on a multi-byte boundary. Two rows rather than a
 /// full matrix -- only the previous row is ever read.
-fn edit_distance(left: &str, right: &str) -> usize {
-    let left: Vec<char> = left.chars().collect();
-    let right: Vec<char> = right.chars().collect();
-    if left.is_empty() {
-        return right.len();
-    }
-    let mut previous: Vec<usize> = (0..=right.len()).collect();
-    let mut current: Vec<usize> = vec![0; right.len() + 1];
-    for (row, &left_char) in left.iter().enumerate() {
-        current[0] = row + 1;
-        for (column, &right_char) in right.iter().enumerate() {
-            let substitute = previous[column] + usize::from(left_char != right_char);
-            current[column + 1] = substitute
-                .min(previous[column + 1] + 1)
-                .min(current[column] + 1);
+/// The nearest built-in property name of `ty`, or `None` when nothing is
+/// close enough to suggest.
+///
+/// Same distance ceiling and tie-break as [`ComponentBinder::closest_type_name`]:
+/// a wrong suggestion is worse than no suggestion, so a name more than two
+/// edits away is left alone.
+fn closest_property_name(ty: &str, name: &str) -> Option<String> {
+    let ceiling = if name.chars().count() <= 4 { 1 } else { 2 };
+    let props = nui_core::props::props_of(ty)?;
+    let mut best: Option<(usize, String)> = None;
+    for candidate in props {
+        let distance = edit_distance(name, candidate.name);
+        if distance == 0 || distance > ceiling {
+            continue;
         }
-        std::mem::swap(&mut previous, &mut current);
+        let better = match &best {
+            None => true,
+            Some((best_distance, best_name)) => {
+                (distance, candidate.name.len(), candidate.name)
+                    < (*best_distance, best_name.len(), best_name.as_str())
+            }
+        };
+        if better {
+            best = Some((distance, candidate.name.to_string()));
+        }
     }
-    return previous[right.len()];
+    return best.map(|(_, name)| return name);
 }
 
 /// The compiler's type for a built-in property's declared type.
@@ -890,6 +1021,34 @@ pub fn check_with_vocabulary(
 ) -> CheckOutcome {
     let mut diagnostics = Vec::new();
     let index = DocumentIndex::build(document, extern_components, &mut diagnostics);
+    // Function signatures are read first: a component may call a function
+    // declared after it, and a function may call a function declared after
+    // it too, so every signature has to exist before any body is bound.
+    let functions = collect_function_signatures(document, &mut diagnostics);
+
+    // Bind the functions themselves. Each is checked with `current_function`
+    // set so `return` is legal and its value is checked against the declared
+    // result. A function may only call functions declared *earlier*, which
+    // makes a call cycle impossible to express and so needs no check.
+    let mut bound_functions: Vec<FunctionIr> = Vec::new();
+    let mut available: HashSet<String> = HashSet::new();
+    for declaration in &document.functions {
+        if !functions.contains_key(&declaration.name.name) {
+            continue;
+        }
+        let mut binder = ComponentBinder::for_function(
+            extern_functions,
+            extern_commands,
+            &index,
+            &functions,
+            &available,
+        );
+        let function = binder.bind_function(declaration);
+        diagnostics.append(&mut binder.diagnostics);
+        available.insert(function.name.clone());
+        bound_functions.push(function);
+    }
+
     // Bound in inheritance order, parents first, because a child folds its
     // parent's *bound* IR into its own. A derived component's inherited
     // properties, ids and body are the parent's, already checked and already
@@ -935,6 +1094,10 @@ pub fn check_with_vocabulary(
             parent.as_ref(),
             builtin_parent,
         );
+        // Every declared function is callable from inside a component,
+        // wherever the component sits in the file.
+        binder.functions = &functions;
+        binder.available_functions = None;
         let component = binder.bind();
         diagnostics.append(&mut binder.diagnostics);
         bound.insert(name.clone(), component);
@@ -951,7 +1114,10 @@ pub fn check_with_vocabulary(
         component.referenced = index.referenced.contains(&component.name);
     }
     return CheckOutcome {
-        document: DocumentIr { components },
+        document: DocumentIr {
+            functions: bound_functions,
+            components,
+        },
         diagnostics,
     };
 }
@@ -1020,6 +1186,15 @@ struct ComponentBinder<'source> {
     machine_states: HashMap<String, HashSet<String>>,
     /// Ids declared by nodes (`id` -> node type name).
     ids: HashMap<String, String>,
+    /// Node-scoped state declarations, keyed by `id.state` (or
+    /// `<self>.state` when the node carries no `id`).
+    ///
+    /// Written by `bind_node_members` as it walks a node, and read when an
+    /// assignment targets a single-part name: a name that is not a
+    /// component property, not a local, and not a registered state has to
+    /// be a built-in element property, or it is a typo. See `plan.md` §13
+    /// option (a).
+    node_states: HashMap<String, Type>,
     /// Ids seen so far, for duplicate detection.
     seen_ids: HashSet<String>,
     /// Lexical scopes of `let` locals and `For` variables; the last frame
@@ -1038,9 +1213,32 @@ struct ComponentBinder<'source> {
     /// that acts rather than returns. A command is legal in statement
     /// position only; see [`ComponentBinder::check_call`].
     extern_commands: HashSet<String>,
+    /// Document-level function signatures, shared by every binder. A call
+    /// to a name in here lowers to [`TypedExpr::UserCall`].
+    functions: &'source HashMap<String, FunctionSignature>,
+    /// Which of those functions are callable at the point being checked.
+    ///
+    /// `None` means "all of them", which is the case inside a component.
+    /// `Some(set)` is used while binding a function body, where only the
+    /// functions declared *before* it are in scope — which is what makes a
+    /// call cycle impossible to write, so no cycle check is needed.
+    available_functions: Option<&'source HashSet<String>>,
+    /// The function currently being bound, when the binder is inside one.
+    /// `return` is only legal here, and its value is checked against the
+    /// declared result. Owned rather than borrowed: the signature is
+    /// cloned out of the table once per function, which is cheaper than
+    /// threading a second lifetime through the binder.
+    current_function: Option<FunctionSignature>,
     /// The document-wide component index (shared by every binder).
     index: &'source DocumentIndex,
-    component: &'source ComponentDecl,
+    /// The component whose body is being bound.
+    ///
+    /// `None` while binding a document-level function: a function is not a
+    /// component and has no ids, signals or machines to resolve against, so
+    /// the component-shaped entry points of this binder are simply never
+    /// reached. Keeping it optional rather than writing a second binder is
+    /// what keeps expression checking single-implementation.
+    component: Option<&'source ComponentDecl>,
     /// The bound IR of the component this one `extends`, when the parent is
     /// declared in this document. Its properties, signals, machines, ids and
     /// (when this body declares no root of its own) its roots are folded in
@@ -1075,23 +1273,71 @@ impl<'source> ComponentBinder<'source> {
             signals: HashSet::new(),
             machine_states: HashMap::new(),
             ids: HashMap::new(),
+            node_states: HashMap::new(),
             seen_ids: HashSet::new(),
             scopes: Vec::new(),
             local_count: 0,
             binding_edges: Vec::new(),
             extern_functions: extern_functions.iter().cloned().collect(),
             extern_commands: extern_commands.iter().cloned().collect(),
+            functions: empty_functions(),
+            available_functions: None,
+            current_function: None,
             index,
-            component,
+            component: Some(component),
             parent,
             builtin_parent,
         };
     }
 
+    /// A binder with no component, for checking a document-level function
+    /// body. Only the expression/statement paths are reachable; the
+    /// component-shaped entry points would report the missing component.
+    fn for_function(
+        extern_functions: &[String],
+        extern_commands: &[String],
+        index: &'source DocumentIndex,
+        functions: &'source HashMap<String, FunctionSignature>,
+        available: &'source HashSet<String>,
+    ) -> ComponentBinder<'source> {
+        let mut binder = ComponentBinder {
+            diagnostics: Vec::new(),
+            property_types: HashMap::new(),
+            signals: HashSet::new(),
+            machine_states: HashMap::new(),
+            ids: HashMap::new(),
+            node_states: HashMap::new(),
+            seen_ids: HashSet::new(),
+            scopes: Vec::new(),
+            local_count: 0,
+            binding_edges: Vec::new(),
+            extern_functions: extern_functions.iter().cloned().collect(),
+            extern_commands: extern_commands.iter().cloned().collect(),
+            functions,
+            available_functions: Some(available),
+            current_function: None,
+            index,
+            component: None,
+            parent: None,
+            builtin_parent: None,
+        };
+        binder.available_functions = Some(available);
+        return binder;
+    }
+
+    /// The component being bound; panics only inside `bind`, which is never
+    /// reached while binding a document-level function.
+    fn component(&self) -> &'source ComponentDecl {
+        return self
+            .component
+            .expect("component-shaped binding requires a component");
+    }
+
     fn bind(&mut self) -> ComponentIr {
         self.collect_info();
+        let name = self.component().name.name.clone();
         let mut component_ir = ComponentIr {
-            name: self.component.name.name.clone(),
+            name,
             ..ComponentIr::default()
         };
         // The inherited half, laid down first. A derived component's
@@ -1127,7 +1373,7 @@ impl<'source> ComponentBinder<'source> {
         //   body is inherited wholesale.
         let inherited_roots: Vec<NodeIr> = std::mem::take(&mut component_ir.roots);
         let mut body_roots: Vec<NodeIr> = Vec::new();
-        for member in &self.component.members {
+        for member in &self.component().members {
             match member {
                 ComponentMember::Property(decl) => {
                     if let Some(property) = self.bind_property(decl) {
@@ -1175,12 +1421,12 @@ impl<'source> ComponentBinder<'source> {
             // dropped, for the same reason as the component case below.
             component_ir.roots = inherited_roots;
             self.diagnostics.push(nui_syntax::Diagnostic::error(
-                self.component.name.span,
+                self.component().name.span,
                 format!(
                     "`{}` extends the built-in `{builtin}`, which takes no content, so \
                      these nodes have nowhere to go; a derived component's body may \
                      only override inherited properties",
-                    self.component.name.name
+                    self.component().name.name
                 ),
             ));
         } else if inherited_roots.is_empty() {
@@ -1195,12 +1441,12 @@ impl<'source> ComponentBinder<'source> {
             match find_slot(&mut component_ir.roots) {
                 Some(slot) => slot.children.extend(body_roots),
                 None => self.diagnostics.push(nui_syntax::Diagnostic::error(
-                    self.component.name.span,
+                    self.component().name.span,
                     format!(
                         "`{}` extends a component whose body has no `{SLOT}`, so these \
                          nodes have nowhere to go; add a `{SLOT}` to the parent, or \
                          wrap them in a root of this component's own",
-                        self.component.name.name
+                        self.component().name.name
                     ),
                 )),
             }
@@ -1264,7 +1510,7 @@ impl<'source> ComponentBinder<'source> {
                     .sum::<usize>();
             })
             .unwrap_or(0);
-        for member in &self.component.members {
+        for member in &self.component().members {
             let ComponentMember::Node(node) = member else {
                 continue;
             };
@@ -1275,14 +1521,14 @@ impl<'source> ComponentBinder<'source> {
             // Point at the first slot the *derived* body adds, if it adds
             // one; otherwise at the component name (the parent already has
             // its own, and its error was reported when it was bound).
-            let span = slots.first().copied().unwrap_or(self.component.name.span);
+            let span = slots.first().copied().unwrap_or(self.component().name.span);
             self.diagnostics.push(nui_syntax::Diagnostic::error(
                 span,
                 format!(
                     "component `{}` has more than one `{SLOT}` once its parent is \
                      merged in; a component has exactly one place a call site's \
                      content can go",
-                    self.component.name.name
+                    self.component().name.name
                 ),
             ));
         }
@@ -1331,7 +1577,7 @@ impl<'source> ComponentBinder<'source> {
                     .insert(prop.name.to_string(), prop_type_to_type(prop.ty));
             }
         }
-        for member in &self.component.members {
+        for member in &self.component().members {
             match member {
                 ComponentMember::Property(decl) => {
                     let ty = decl
@@ -1742,7 +1988,6 @@ impl<'source> ComponentBinder<'source> {
             });
             self.push_scope();
             self.declare_local(&binding.variable.name, Type::Unknown);
-            self.reject_component_in_for(decl);
             self.bind_node_members(&mut node, &decl.body, is_root);
             self.pop_scope();
             return node;
@@ -1771,36 +2016,64 @@ impl<'source> ComponentBinder<'source> {
                 NodeMember::Node(child) => {
                     node.children.push(self.bind_node(child, false));
                 }
+                NodeMember::State(state) => {
+                    self.bind_node_state(node, state);
+                }
             }
         }
     }
 
-    /// Reports a component reference inside a `For` / `ListView` body.
+    /// Registers a node-scoped `state` declaration and lowers it to an
+    /// ordinary static assignment of its default.
     ///
-    /// Row instantiation happens in the engine, which has no component
-    /// catalog, so the reference could not be expanded. The check lives
-    /// here rather than in `bind_node` because the offending shape is a
-    /// property of the *enclosing* loop, and the loop is what knows it is
-    /// a loop.
-    fn reject_component_in_for(&mut self, decl: &NodeDecl) {
-        if decl.ty.name != "For" && decl.ty.name != "ListView" {
+    /// The declaration's whole purpose is the *registration*: it tells the
+    /// checker that this name is deliberate, so a later assignment to it is
+    /// not a misspelled built-in property. The lowering is the same write a
+    /// plain `name = default` argument would produce — the runtime has no
+    /// separate notion of a "state" field, and does not need one.
+    ///
+    /// Keying by `<id>.<name>` rather than by bare name is what lets two
+    /// nodes declare a state of the same name without colliding.
+    fn bind_node_state(&mut self, node: &mut NodeIr, state: &nui_syntax::StateFieldDecl) {
+        let Some(declared_ty) = Type::from_name(&state.declared_type.name) else {
+            self.diagnostics.push(nui_syntax::Diagnostic::error(
+                state.declared_type.span,
+                format!("unknown type `{}`", state.declared_type.name),
+            ));
+            return;
+        };
+        let value = self.check_expr(&state.default);
+        let value_ty = value.type_of();
+        if unify(declared_ty, value_ty).is_none() {
+            self.diagnostics.push(nui_syntax::Diagnostic::error(
+                state.span,
+                format!(
+                    "type mismatch in the default of `{}`: expected {}, found {value_ty}",
+                    state.name.name, declared_ty
+                ),
+            ));
+        }
+        let owner = node
+            .id
+            .clone()
+            .unwrap_or_else(|| return "<self>".to_string());
+        let key = format!("{owner}.{}", state.name.name);
+        if let Some(previous) = self.node_states.get(&key) {
+            let message = format!(
+                "`{}` is already declared as {}; declared {} times",
+                state.name.name, previous, 2
+            );
+            self.diagnostics
+                .push(nui_syntax::Diagnostic::error(state.name.span, message));
             return;
         }
-        for member in &decl.body {
-            let NodeMember::Node(child) = member else {
-                continue;
-            };
-            if self.index.component(&child.ty.name).is_some() {
-                self.diagnostics.push(nui_syntax::Diagnostic::error(
-                    child.ty.span,
-                    format!(
-                        "`{}` cannot be instantiated inside a `For` body: rows are built \
-                         without the document, so there is nothing to expand it from",
-                        child.ty.name
-                    ),
-                ));
-            }
-        }
+        self.node_states.insert(key, declared_ty);
+        node.assignments.push(AssignmentIr {
+            path: vec![state.name.name.clone()],
+            target: PropertyTarget::Id(owner, state.name.name.clone()),
+            kind: InitKind::Static,
+            value,
+        });
     }
 
     /// Binds a node that instantiates a component declared in this
@@ -1905,6 +2178,13 @@ impl<'source> ComponentBinder<'source> {
                         when.span,
                         decl.ty.name.as_str(),
                         "`when` blocks",
+                    );
+                }
+                NodeMember::State(state) => {
+                    self.reject_reference_body_member(
+                        state.span,
+                        decl.ty.name.as_str(),
+                        "`state` declarations",
                     );
                 }
             }
@@ -2021,6 +2301,8 @@ impl<'source> ComponentBinder<'source> {
                 .lookup_local(&assignment.target.parts[0].name)
                 .is_some()
         {
+            let name = assignment.target.parts[0].name.as_str();
+            self.require_node_property(assignment, node, name);
             // Own-node property: check the value, record no component edge.
             let value = self.check_expr(&assignment.value);
             if assignment.op == InitOp::TwoWay
@@ -2049,6 +2331,62 @@ impl<'source> ComponentBinder<'source> {
             };
         }
         return self.bind_assignment(assignment, edge_sink);
+    }
+
+    /// Rejects a single-part name on an element node that is neither a
+    /// built-in property of the node's type nor a declared `state`.
+    ///
+    /// This is the check `plan.md` §13 option (a) unblocks. Before it, an
+    /// unknown name was a silent no-op: the runtime stored the value on the
+    /// element and nothing ever read it, so `Text(contnt = "x")` produced no
+    /// error, no warning, and no visible effect — the hardest class of bug
+    /// to find.
+    ///
+    /// The name space is shared on purpose (a page's state hangs on its own
+    /// root element), so the check is not "is this a built-in property" but
+    /// "is this *either* a built-in property *or* declared here". Nothing is
+    /// guessed: the author names what they meant, and a typo of the other
+    /// kind is then caught.
+    ///
+    /// Skipped entirely for a node whose type the compiler does not know —
+    /// a host-registered type owns its own property surface, which the
+    /// built-in table cannot enumerate.
+    fn require_node_property(
+        &mut self,
+        assignment: &PropertyAssignment,
+        node: &NodeIr,
+        name: &str,
+    ) {
+        if node.component.is_some() || !nui_core::props::is_builtin_type(&node.ty) {
+            return;
+        }
+        if nui_core::props::prop_of(&node.ty, name).is_some() {
+            return;
+        }
+        let owner = node
+            .id
+            .clone()
+            .unwrap_or_else(|| return "<self>".to_string());
+        if self.node_states.contains_key(&format!("{owner}.{name}")) {
+            return;
+        }
+        let message = match closest_property_name(&node.ty, name) {
+            Some(suggestion) => {
+                format!(
+                    "`{}` has no property `{name}`; did you mean `{suggestion}`?",
+                    node.ty
+                )
+            }
+            None => format!(
+                "`{}` has no property `{name}`; declare it with `state {name}: <Type> = <value>` \
+                 if it is your own",
+                node.ty
+            ),
+        };
+        self.diagnostics.push(nui_syntax::Diagnostic::error(
+            assignment.target.span,
+            message,
+        ));
     }
 
     fn bind_assignment(
@@ -2177,6 +2515,78 @@ impl<'source> ComponentBinder<'source> {
                         effects.push(effect);
                     }
                 }
+                Statement::Return { span, value } => {
+                    let declared = self
+                        .current_function
+                        .as_ref()
+                        .map(|function| return function.return_type);
+                    let Some(declared) = declared else {
+                        self.diagnostics.push(nui_syntax::Diagnostic::error(
+                            *span,
+                            "`return` is only allowed inside a function".to_string(),
+                        ));
+                        if let Some(value) = value {
+                            let _ = self.check_expr(value);
+                        }
+                        continue;
+                    };
+                    let declared = declared.unwrap_or(Type::Unknown);
+                    let checked = value.as_ref().map(|value| return self.check_expr(value));
+                    match (&checked, value) {
+                        (Some(checked), Some(value)) => {
+                            let value_ty = checked.type_of();
+                            if unify(declared, value_ty).is_none() {
+                                self.diagnostics.push(nui_syntax::Diagnostic::error(
+                                    value.span(),
+                                    format!("`return` value must be {declared}, found {value_ty}"),
+                                ));
+                            }
+                        }
+                        // A bare `return` in a valued function is legal but
+                        // yields nothing; the runtime treats it as `Void` and
+                        // the caller's binding stores `Unresolved`.
+                        (None, _) => {}
+                        (Some(_), None) => {}
+                    }
+                    effects.push(Effect::Return { value: checked });
+                }
+                Statement::Expr { value, .. } => {
+                    // A bare expression statement is evaluated for its
+                    // effect. Only calls have effects today; anything else
+                    // is a likely typo, so it is reported rather than
+                    // silently dropped.
+                    match value {
+                        Expr::Call { callee, args, .. } => {
+                            if let Expr::Ident { name, .. } = callee.as_ref() {
+                                let path = nui_syntax::PropertyPath {
+                                    span: value.span(),
+                                    parts: vec![Ident {
+                                        span: value.span(),
+                                        name: name.clone(),
+                                    }],
+                                };
+                                if let Some(effect) = self.bind_call(&path, args) {
+                                    effects.push(effect);
+                                }
+                            } else {
+                                let _ = self.check_expr(value);
+                                self.diagnostics.push(nui_syntax::Diagnostic::error(
+                                    value.span(),
+                                    "an expression statement must be a plain call".to_string(),
+                                ));
+                            }
+                        }
+                        _ => {
+                            let _ = self.check_expr(value);
+                            self.diagnostics.push(nui_syntax::Diagnostic::error(
+                                value.span(),
+                                "expression statement has no effect; \
+                                 use an assignment, `emit`, or a call"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
             }
         }
         self.pop_scope();
@@ -2222,15 +2632,21 @@ impl<'source> ComponentBinder<'source> {
         args: &[nui_syntax::CallArg],
     ) -> Option<Effect> {
         if callee.parts.len() == 1 {
-            // Single-name call: a host-registered function (plan §5 宿主
-            // 互操作), resolved from the runtime registry at emit time.
+            // Single-name call: a document-declared function or a
+            // host-registered function (plan §5 宿主互操作). The document's
+            // own functions are resolved first, since a document that
+            // declares `fn save()` means its own `save`, not the host's.
             //
-            // Checked against the host's names for the same reason the
-            // *value* path is: a name the host never registered can only
-            // fail at runtime, where an evaluation error is dropped and the
-            // statement silently does nothing. A command is welcome here —
-            // statement position is the only place it is legal at all.
+            // Checked against the names for the same reason the *value*
+            // path is: a name neither the document nor the host declares
+            // can only fail at runtime, where an evaluation error is
+            // dropped and the statement silently does nothing. A command is
+            // welcome here — statement position is the only place it is
+            // legal at all.
             let name = &callee.parts[0].name;
+            if let Some(signature) = self.lookup_function(name) {
+                return self.bind_user_call_statement(callee, name, &signature, args);
+            }
             let mut checked_args = Vec::new();
             for arg in args {
                 if arg.name.is_some() {
@@ -2740,6 +3156,12 @@ impl<'source> ComponentBinder<'source> {
             return TypedExpr::Error;
         };
         let Some(func) = Builtin::from_name(name) else {
+            // A document-declared function, before the host's names: the
+            // document owns its own vocabulary, and `collect_function_signatures`
+            // already rejected a redeclaration of a builtin.
+            if let Some(signature) = self.lookup_function(name) {
+                return self.check_user_call(*span, name, &signature, args);
+            }
             if self.extern_functions.contains(name) {
                 // A command acts; it has no value to hand back. Caught here
                 // rather than at runtime because a failed evaluation is
@@ -3104,6 +3526,261 @@ impl<'source> ComponentBinder<'source> {
         }
         return None;
     }
+
+    /// The signature of a document function callable here, if any.
+    ///
+    /// Inside a component every declared function is callable; inside a
+    /// function body only those declared earlier are, which is what makes a
+    /// call cycle unwritable.
+    fn lookup_function(&self, name: &str) -> Option<FunctionSignature> {
+        let signature = self.functions.get(name)?;
+        if let Some(available) = self.available_functions
+            && !available.contains(name)
+        {
+            return None;
+        }
+        return Some(signature.clone());
+    }
+
+    /// Checks a document-level function body and lowers it to [`FunctionIr`].
+    ///
+    /// The parameters are declared as ordinary locals in an outer scope, so
+    /// the existing expression and statement paths resolve them without a
+    /// second lookup mechanism. `current_function` is set for the duration
+    /// so `return` is legal and its value is checked against the declared
+    /// result; the parameter count and types were already validated by
+    /// [`collect_function_signatures`], which is the only place with the AST
+    /// in hand.
+    fn bind_function(&mut self, declaration: &'source nui_syntax::FunctionDecl) -> FunctionIr {
+        let Some(signature) = self.functions.get(&declaration.name.name).cloned() else {
+            return FunctionIr {
+                name: declaration.name.name.clone(),
+                parameters: Vec::new(),
+                return_type: Type::Unknown,
+                body: Vec::new(),
+                has_value: false,
+            };
+        };
+        self.current_function = Some(signature.clone());
+        self.push_scope();
+        let mut parameters = Vec::new();
+        for (parameter_decl, parameter_sig) in declaration
+            .parameters
+            .iter()
+            .zip(signature.parameters.iter())
+        {
+            let default = parameter_decl
+                .default
+                .as_ref()
+                .map(|value| return self.check_expr(value));
+            if let Some(default) = &default {
+                let default_ty = default.type_of();
+                if unify(parameter_sig.ty, default_ty).is_none() {
+                    self.diagnostics.push(nui_syntax::Diagnostic::error(
+                        parameter_decl.span,
+                        format!(
+                            "default value for `{}` must be {}, found {default_ty}",
+                            parameter_sig.name, parameter_sig.ty
+                        ),
+                    ));
+                }
+            }
+            self.declare_local(&parameter_sig.name, parameter_sig.ty);
+            parameters.push(ParameterIr {
+                name: parameter_sig.name.clone(),
+                ty: parameter_sig.ty,
+                default,
+            });
+        }
+        let body = self.bind_effect(&declaration.body);
+        self.pop_scope();
+        self.current_function = None;
+        return FunctionIr {
+            name: signature.name.clone(),
+            parameters,
+            return_type: signature.return_type.unwrap_or(Type::Unknown),
+            body,
+            has_value: signature.return_type.is_some(),
+        };
+    }
+
+    /// Checks a `fn` call against its declared signature and lowers it to
+    /// [`TypedExpr::UserCall`].
+    ///
+    /// Named arguments are accepted and reordered into declaration order;
+    /// omitted arguments with defaults are filled in from the declaration
+    /// so the runtime call frame is always positional and complete.
+    fn check_user_call(
+        &mut self,
+        span: Span,
+        name: &str,
+        signature: &FunctionSignature,
+        args: &[nui_syntax::CallArg],
+    ) -> TypedExpr {
+        // A `Void` function has no value to hand back. This path is only
+        // reached from a value position (a statement call goes through
+        // `bind_call`), so the diagnostic is unconditional here.
+        if signature.return_type.is_none() {
+            self.diagnostics.push(nui_syntax::Diagnostic::error(
+                span,
+                format!("`{name}` returns nothing; call it as a statement instead"),
+            ));
+            for arg in args {
+                let _ = self.check_expr(&arg.value);
+            }
+            return TypedExpr::Error;
+        }
+        let (lowered, defaulted) = self.bind_call_arguments(span, name, signature, args);
+        let ty = signature.return_type.unwrap_or(Type::Unknown);
+        return TypedExpr::UserCall {
+            name: signature.name.clone(),
+            args: lowered,
+            defaulted,
+            ty,
+        };
+    }
+
+    /// Checks a document function call in statement position, lowering it to
+    /// [`Effect::UserCall`].
+    fn bind_user_call_statement(
+        &mut self,
+        callee: &nui_syntax::PropertyPath,
+        name: &str,
+        signature: &FunctionSignature,
+        args: &[nui_syntax::CallArg],
+    ) -> Option<Effect> {
+        let span = callee.span;
+        let (lowered, defaulted) = self.bind_call_arguments(span, name, signature, args);
+        return Some(Effect::UserCall {
+            name: signature.name.clone(),
+            args: lowered,
+            defaulted,
+        });
+    }
+
+    /// Binds a document function's arguments: reorders named ones into
+    /// declaration order, checks each against its parameter, and marks
+    /// omitted ones for the runtime to fill from the declaration.
+    fn bind_call_arguments(
+        &mut self,
+        span: Span,
+        name: &str,
+        signature: &FunctionSignature,
+        args: &[nui_syntax::CallArg],
+    ) -> (Vec<TypedExpr>, Vec<bool>) {
+        let mut checked: Vec<Option<TypedExpr>> = Vec::new();
+        checked.resize_with(signature.parameters.len(), || return None);
+        let mut saw_named = false;
+        let mut positional_cursor = 0usize;
+        for arg in args {
+            if let Some(arg_name) = &arg.name {
+                saw_named = true;
+                let index = signature
+                    .parameters
+                    .iter()
+                    .position(|parameter| return parameter.name == arg_name.name);
+                let Some(index) = index else {
+                    self.diagnostics.push(nui_syntax::Diagnostic::error(
+                        arg_name.span,
+                        format!("`{name}` has no parameter `{}`", arg_name.name),
+                    ));
+                    let _ = self.check_expr(&arg.value);
+                    continue;
+                };
+                self.check_named_argument(&mut checked, index, &signature.parameters[index], arg);
+            } else {
+                if saw_named {
+                    self.diagnostics.push(nui_syntax::Diagnostic::error(
+                        arg.span,
+                        "positional arguments must come before named ones".to_string(),
+                    ));
+                }
+                if positional_cursor >= signature.parameters.len() {
+                    self.diagnostics.push(nui_syntax::Diagnostic::error(
+                        arg.span,
+                        format!(
+                            "`{name}` takes {} argument(s), found {}",
+                            signature.parameters.len(),
+                            args.len()
+                        ),
+                    ));
+                    let _ = self.check_expr(&arg.value);
+                    continue;
+                }
+                let parameter = &signature.parameters[positional_cursor];
+                let checked_value = self.check_expr(&arg.value);
+                let value_ty = checked_value.type_of();
+                if unify(parameter.ty, value_ty).is_none() {
+                    self.diagnostics.push(nui_syntax::Diagnostic::error(
+                        arg.span,
+                        format!(
+                            "argument `{}` of `{name}` must be {}, found {value_ty}",
+                            parameter.name, parameter.ty
+                        ),
+                    ));
+                }
+                checked[positional_cursor] = Some(checked_value);
+                positional_cursor += 1;
+            }
+        }
+        let mut lowered = Vec::new();
+        let mut defaulted = Vec::new();
+        for (index, parameter) in signature.parameters.iter().enumerate() {
+            match checked[index].take() {
+                Some(value) => {
+                    lowered.push(value);
+                    defaulted.push(false);
+                }
+                // An omitted argument with a default is filled by the
+                // runtime from the declaration, which is the only place the
+                // default expression is written. The `true` here is the
+                // marker; `Error` is a placeholder the runtime never
+                // evaluates precisely because the flag is set.
+                None if parameter.has_default => {
+                    lowered.push(TypedExpr::Error);
+                    defaulted.push(true);
+                }
+                None => {
+                    self.diagnostics.push(nui_syntax::Diagnostic::error(
+                        span,
+                        format!("`{name}` is missing argument `{}`", parameter.name),
+                    ));
+                    lowered.push(TypedExpr::Error);
+                    defaulted.push(true);
+                }
+            }
+        }
+        return (lowered, defaulted);
+    }
+
+    /// Type-checks one named argument and stores it in its slot.
+    fn check_named_argument(
+        &mut self,
+        checked: &mut [Option<TypedExpr>],
+        index: usize,
+        parameter: &ParameterSignature,
+        arg: &nui_syntax::CallArg,
+    ) {
+        if checked[index].is_some() {
+            self.diagnostics.push(nui_syntax::Diagnostic::error(
+                arg.span,
+                format!("argument `{}` is given more than once", parameter.name),
+            ));
+            return;
+        }
+        let checked_value = self.check_expr(&arg.value);
+        let value_ty = checked_value.type_of();
+        if unify(parameter.ty, value_ty).is_none() {
+            self.diagnostics.push(nui_syntax::Diagnostic::error(
+                arg.span,
+                format!(
+                    "argument `{}` must be {}, found {value_ty}",
+                    parameter.name, parameter.ty
+                ),
+            ));
+        }
+        checked[index] = Some(checked_value);
+    }
 }
 
 /// Collects component-property reads from an expression (for the binding
@@ -3140,6 +3817,17 @@ fn collect_property_reads(expr: &TypedExpr, out: &mut Vec<String>) {
         }
         TypedExpr::HostCall { args, .. } => {
             for arg in args {
+                collect_property_reads(arg, out);
+            }
+        }
+        TypedExpr::UserCall {
+            args, defaulted, ..
+        } => {
+            for (index, arg) in args.iter().enumerate() {
+                // An omitted argument is a placeholder, not a dependency.
+                if defaulted.get(index).copied().unwrap_or(false) {
+                    continue;
+                }
                 collect_property_reads(arg, out);
             }
         }
@@ -3467,12 +4155,12 @@ mod tests {
     #[test]
     fn checks_animation_argument_types() {
         let good = compile(
-            "component A { property count: Int = 0 Text(x <- tween(count, duration = 200ms, easing = ease-out)) {} }",
+            "component A { property count: Int = 0 Text(offset_x <- tween(count, duration = 200ms, easing = ease-out)) {} }",
         );
-        assert!(good.diagnostics.is_empty());
+        assert!(good.diagnostics.is_empty(), "{:?}", good.diagnostics);
 
         let bad = compile(
-            "component A { property count: Int = 0 Text(x <- tween(count, duration = 1)) {} }",
+            "component A { property count: Int = 0 Text(offset_x <- tween(count, duration = 1)) {} }",
         );
         assert!(
             bad.diagnostics
@@ -3565,7 +4253,7 @@ mod tests {
     #[test]
     fn supports_length_and_duration_arithmetic() {
         let good = compile(
-            "component A { property w: Length = 420dp Text(x <- w * 0.5, y <- w + 10dp) {} }",
+            "component A { property w: Length = 420dp Text(offset_x <- w * 0.5, offset_y <- w + 10dp) {} }",
         );
         assert!(
             good.diagnostics.is_empty(),
@@ -3630,7 +4318,7 @@ mod tests {
         assert!(good.diagnostics.is_empty(), "{:?}", good.diagnostics);
 
         let tween = compile(
-            "component A { property count: Int = 0 Text(x <- tween(count, duration = 200ms, easing = ease-out)) {} }",
+            "component A { property count: Int = 0 Text(offset_x <- tween(count, duration = 200ms, easing = ease-out)) {} }",
         );
         assert!(tween.diagnostics.is_empty(), "{:?}", tween.diagnostics);
     }
@@ -3672,19 +4360,19 @@ mod tests {
         for (label, source) in [
             (
                 "clause-only-for",
-                "component B { property rows: Model Window(id = root) { For(item in root.rows) { Rectangle(height = 10dp) { Text(label <- item.label) {} } } } }",
+                "component B { property rows: Model Window(id = root) { For(item in root.rows) { Rectangle(height = 10dp) { Text(content <- item.label) {} } } } }",
             ),
             (
                 "clause-only-direct",
-                "component B { property rows: Model Window(id = root) { For(item in root.rows) { Text(label <- item.label) {} } } }",
+                "component B { property rows: Model Window(id = root) { For(item in root.rows) { Text(content <- item.label) {} } } }",
             ),
             (
                 "id-arg",
-                "component B { property rows: Model Window(id = root) { ListView(item in root.rows, id = list) { Rectangle(height = 10dp) { Text(label <- item.label) {} } } } }",
+                "component B { property rows: Model Window(id = root) { ListView(item in root.rows, id = list) { Rectangle(height = 10dp) { Text(content <- item.label) {} } } } }",
             ),
             (
                 "prop-arg",
-                "component B { property rows: Model Window(id = root) { ListView(item in root.rows, height = 50dp) { Rectangle(height = 10dp) { Text(label <- item.label) {} } } } }",
+                "component B { property rows: Model Window(id = root) { ListView(item in root.rows, height = 50dp) { Rectangle(height = 10dp) { Text(content <- item.label) {} } } } }",
             ),
         ] {
             let outcome = compile(source);
@@ -3699,7 +4387,7 @@ mod tests {
     #[test]
     fn list_view_with_mixed_args_resolves_item() {
         let outcome = compile(
-            "component Big { property rows: Model Window(id = root) { ListView(item in root.rows, id = list, height = 50dp, row_height = 10dp) { Rectangle(height = 10dp) { Text(label <- item.label) {} } } } }",
+            "component Big { property rows: Model Window(id = root) { ListView(item in root.rows, id = list, height = 50dp, row_height = 10dp) { Rectangle(height = 10dp) { Text(content <- item.label) {} } } } }",
         );
         assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
     }
@@ -3713,7 +4401,7 @@ mod tests {
     #[test]
     fn math_builtins_accept_numeric_arguments() {
         let outcome = compile(
-            "component A { property p: Float = 4.0 Window(id = root, width = 200dp, height = 100dp) { Rectangle(width <- sqrt(p), height <- abs(-2.5), x <- sin(3.14), y <- floor(1.9)) {} } }",
+            "component A { property p: Float = 4.0 Window(id = root, width = 200dp, height = 100dp) { Rectangle(width <- sqrt(p), height <- abs(-2.5), offset_x <- sin(3.14), offset_y <- floor(1.9)) {} } }",
         );
         assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
     }
@@ -4705,7 +5393,12 @@ mod document_id_fallback {
 /// compile errors, and the idioms that must keep compiling.
 #[cfg(test)]
 mod vocabulary {
+    use crate::bytecode::{InterpPart, TypedExpr};
+    use crate::types::Type;
     use crate::{compile, compile_with_host};
+    // The shared distance metric, named explicitly because this module does
+    // not glob-import its parent.
+    use nui_tools::edit_distance;
 
     fn messages(source: &str) -> Vec<String> {
         return compile(source)
@@ -4802,11 +5495,29 @@ mod vocabulary {
     }
 
     #[test]
-    fn element_state_is_still_allowed() {
-        // The idiom that blocks the property half of the vocabulary, and
-        // the reason it must keep compiling: `clicks` is not a Button
-        // property, it is state the page hangs on the element.
-        let found = messages(
+    fn element_state_must_be_declared_to_be_allowed() {
+        // The idiom that *used* to block the property half of the
+        // vocabulary: `clicks` is not a Button property, it is state the
+        // page hangs on the element. It still compiles — but only once
+        // the page says so. `state` is the disambiguation the language
+        // decision in `plan.md` §13 asked for.
+        let declared = messages(
+            r#"
+            component App {
+                Window {
+                    Button(id = containers_page, label = "x") {
+                        state clicks: Int = 0
+                    }
+                }
+            }
+            "#,
+        );
+        assert!(declared.is_empty(), "{declared:?}");
+
+        // The same name without a declaration is exactly the mistake the
+        // check exists to catch, so it is now an error rather than a
+        // silently-ignored assignment.
+        let undeclared = messages(
             r#"
             component App {
                 Window {
@@ -4815,30 +5526,402 @@ mod vocabulary {
             }
             "#,
         );
-        assert!(found.is_empty(), "{found:?}");
-    }
-
-    #[test]
-    fn a_misspelled_property_is_still_silent_by_design() {
-        // Recording the gap rather than pretending it is closed. When the
-        // language decision in `plan.md` §13 is made (a `state` keyword, or
-        // a `state.` prefix), this expectation is what has to change.
-        let found = messages("component App { Window { Text(contnt = \"x\") } }");
+        assert_eq!(undeclared.len(), 1, "{undeclared:?}");
         assert!(
-            found.is_empty(),
-            "property spelling is not checked yet: {found:?}"
+            undeclared[0].contains("has no property `clicks`"),
+            "{undeclared:?}"
+        );
+        assert!(
+            undeclared[0].contains("state clicks:"),
+            "the error should name the fix: {undeclared:?}"
         );
     }
 
     #[test]
+    fn a_misspelled_property_is_an_error() {
+        // The other half of `plan.md` §13, now closed: a built-in
+        // element's properties are a closed vocabulary, so a typo is a
+        // compile error with the intended name suggested.
+        let found = messages("component App { Window { Text(contnt = \"x\") } }");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("has no property `contnt`"), "{found:?}");
+        assert!(
+            found[0].contains("did you mean `content`?"),
+            "a near-miss should be offered: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_far_misspelling_gets_the_state_hint_and_no_suggestion() {
+        // Two behaviours in one: a name with no close neighbour offers no
+        // suggestion (a bad guess is worse than none), and every rejection
+        // still names the way out.
+        let found = messages("component App { Window { Text(zzzzzzz = \"x\") } }");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("declare it with `state zzzzzzz:"),
+            "{found:?}"
+        );
+        assert!(
+            !found[0].contains("did you mean"),
+            "no suggestion should be offered: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_component_property_still_shadows_nothing() {
+        // A component's own `property` is not in the per-element table,
+        // so the check has to skip targets that are not element
+        // properties — otherwise every component property write becomes
+        // an error.
+        let found = messages(
+            r#"
+            component App {
+                property clicks: Int = 0
+                Window {
+                    Button(label = "x") { on click => clicks += 1 }
+                }
+            }
+            "#,
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
     fn the_distance_metric_counts_characters_not_bytes() {
+        // The metric itself now lives in `nui-tools` and is tested there.
+        // What this pins is that the compiler still *reaches* it with
+        // character semantics: the suggestion machinery is only useful if
+        // a CJK typo scores as one edit rather than several.
+        //
         // Type names are ASCII today, but a host may register one that is
         // not, and byte slicing would panic on a multi-byte boundary.
-        assert_eq!(super::edit_distance("ab", "ab"), 0);
-        assert_eq!(super::edit_distance("ab", "ac"), 1);
-        assert_eq!(super::edit_distance("ab", "abc"), 1);
-        assert_eq!(super::edit_distance("abc", "ab"), 1);
-        assert_eq!(super::edit_distance("", "abc"), 3);
-        assert_eq!(super::edit_distance("按钮", "按纽"), 1);
+        assert_eq!(edit_distance("ab", "ab"), 0);
+        assert_eq!(edit_distance("按钮", "按纽"), 1, "one character apart");
+        assert_eq!(edit_distance("按", "按纽"), 1, "one insertion");
+    }
+
+    #[test]
+    fn a_short_name_gets_a_tighter_ceiling_than_a_long_one() {
+        // The one judgement that stayed in this file when the metric moved:
+        // a wrong suggestion is worse than none, so short names (≤ 4 chars)
+        // tolerate only one edit. `edit_distance` has no ceiling of its own
+        // — it always reports the true distance.
+        //
+        // One edit from a 4-char name is still suggested.
+        let found = messages("component App { Window { Text(wdth = \"x\") } }");
+        assert!(
+            found
+                .iter()
+                .any(|message| return message.contains("did you mean `width`?")),
+            "a one-edit short name is suggested: {found:?}"
+        );
+        // Two edits from a 4-char name is not. `wdth` is 1 away from
+        // `width`; `wzth` is 2 away, and that is over the ceiling.
+        let found = messages("component App { Window { Text(wzth = \"x\") } }");
+        assert!(
+            found
+                .iter()
+                .all(|message| return !message.contains("did you mean")),
+            "a short name two edits away gets no guess: {found:?}"
+        );
+        // A *long* name two edits away is still suggested — the ceiling
+        // widens with length, which is the whole rule.
+        let found = messages("component App { Window { Text(contant = \"x\") } }");
+        assert!(
+            found
+                .iter()
+                .any(|message| return message.contains("did you mean `content`?")),
+            "a long name two edits away is still suggested: {found:?}"
+        );
+    }
+
+    // -- document-level functions -----------------------------------------
+
+    const FUNCTIONS: &str = r#"
+        fn clamp01(value: Float) -> Float {
+            if value < 0.0 { return 0.0 }
+            if value > 1.0 { return 1.0 }
+            return value
+        }
+
+        fn label(prefix: String, count: Int = 0) -> String {
+            return "{prefix}: {count}"
+        }
+
+        fn announce(times: Int) {
+            let handled = times + 1
+        }
+
+        component App {
+            property progress: Float = 0.5
+            Window(width = 200dp) {
+                Text(content <- label(prefix = "p", count = 3))
+                Text(content <- "{clamp01(progress)}")
+                Button(label = "go") {
+                    on click => announce(2)
+                }
+            }
+        }
+    "#;
+
+    #[test]
+    fn compiles_functions_cleanly() {
+        let outcome = compile(FUNCTIONS);
+        assert!(
+            outcome.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(outcome.document.functions.len(), 3);
+        let clamp01 = &outcome.document.functions[0];
+        assert_eq!(clamp01.name, "clamp01");
+        assert_eq!(clamp01.return_type, Type::Float);
+        assert!(clamp01.has_value);
+        assert_eq!(clamp01.parameters.len(), 1);
+        assert!(clamp01.parameters[0].default.is_none());
+
+        let label = &outcome.document.functions[1];
+        assert_eq!(label.parameters.len(), 2);
+        assert!(label.parameters[1].default.is_some(), "count defaults to 0");
+
+        let announce = &outcome.document.functions[2];
+        assert!(!announce.has_value, "a Void function has no value");
+    }
+
+    #[test]
+    fn a_function_call_can_read_a_component_property() {
+        // `clamp01(progress)` inside a binding: the argument is a property
+        // read, so the call participates in the binding graph.
+        let outcome = compile(FUNCTIONS);
+        let component = &outcome.document.components[0];
+        let root = &component.roots[0];
+        let text = &root.children[1];
+        let assignment = &text.assignments[0];
+        match &assignment.value {
+            TypedExpr::Interp { parts } => {
+                let TypedExpr::UserCall { name, ty, args, .. } = parts
+                    .iter()
+                    .find_map(|part| {
+                        return match part {
+                            InterpPart::Expr(expr) => Some(expr.as_ref()),
+                            InterpPart::Text(_) => None,
+                        };
+                    })
+                    .expect("an interpolation hole")
+                else {
+                    panic!("expected a user call");
+                };
+                assert_eq!(name, "clamp01");
+                assert_eq!(*ty, Type::Float);
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected an interpolated string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_named_argument_is_reordered_into_declaration_order() {
+        let outcome = compile(FUNCTIONS);
+        let component = &outcome.document.components[0];
+        let text = &component.roots[0].children[0];
+        let TypedExpr::UserCall { name, args, .. } = &text.assignments[0].value else {
+            panic!("expected a user call");
+        };
+        assert_eq!(name, "label");
+        assert_eq!(args.len(), 2, "both arguments are bound");
+    }
+
+    #[test]
+    fn an_unknown_function_is_reported() {
+        let found = messages("component App { Window { Text(content = \"{missing(1)}\") } }");
+        assert!(
+            found
+                .iter()
+                .any(|message| return message.contains("unknown function `missing`")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_wrong_argument_type_is_reported() {
+        let found = messages(
+            r#"
+            fn double(value: Int) -> Int { return value + value }
+            component App { Window { Text(content = "{double(true)}") } }
+            "#,
+        );
+        assert!(
+            found
+                .iter()
+                .any(|message| return message.contains("must be Int, found Bool")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_required_argument_is_reported() {
+        let found = messages(
+            r#"
+            fn double(value: Int) -> Int { return value + value }
+            component App { Window { Text(content = "{double()}") } }
+            "#,
+        );
+        assert!(
+            found
+                .iter()
+                .any(|message| return message.contains("missing argument `value`")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_return_outside_a_function_is_reported() {
+        let found = messages(
+            "component App { Window(width = 1dp) { } machine m { state s { enter => return 1 } } }",
+        );
+        assert!(
+            found.iter().any(|message| {
+                return message.contains("`return` is only allowed inside a function");
+            }),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_return_type_mismatch_is_reported() {
+        let found = messages(
+            "fn bad() -> Int { return \"text\" } component App { Window(width = 1dp) {} }",
+        );
+        assert!(
+            found
+                .iter()
+                .any(|message| return message.contains("`return` value must be Int")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_function_may_not_redeclare_a_builtin() {
+        let found = messages(
+            "fn min(a: Int, b: Int) -> Int { return a } component App { Window(width = 1dp) {} }",
+        );
+        assert!(
+            found.iter().any(|message| {
+                return message.contains("is a builtin function and cannot be redeclared");
+            }),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_forward_function_reference_is_an_unknown_function() {
+        // A function may only call functions declared *before* it: that
+        // rule is what makes a call cycle unwritable.
+        let found = messages(
+            r#"
+            fn first() -> Int { return second() }
+            fn second() -> Int { return 1 }
+            component App { Window(width = 1dp) {} }
+            "#,
+        );
+        assert!(
+            found
+                .iter()
+                .any(|message| return message.contains("unknown function `second`")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_component_may_call_any_declared_function() {
+        // Unlike a function body, a component sees the whole table, so a
+        // component declared before a function can still call it.
+        let found = messages(
+            r#"
+            component App {
+                Window(width = 1dp) {}
+            }
+            fn later() -> Int { return 1 }
+            "#,
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_duplicate_function_is_reported() {
+        let found = messages(
+            r#"
+            fn twice() -> Int { return 1 }
+            fn twice() -> Int { return 2 }
+            component App { Window(width = 1dp) {} }
+            "#,
+        );
+        assert!(
+            found
+                .iter()
+                .any(|message| return message.contains("`twice` is declared more than once")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_parameter_without_a_default_may_not_follow_one_with_a_default() {
+        let found = messages(
+            r#"
+            fn bad(a: Int = 1, b: Int) -> Int { return a + b }
+            component App { Window(width = 1dp) {} }
+            "#,
+        );
+        assert!(
+            found
+                .iter()
+                .any(|message| return message.contains("has no default")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_parameter_type_is_reported() {
+        let found = messages(
+            "fn bad(a: Widget) -> Int { return 1 } component App { Window(width = 1dp) {} }",
+        );
+        assert!(
+            found
+                .iter()
+                .any(|message| return message.contains("unknown type `Widget`")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_void_function_cannot_be_used_as_a_value() {
+        let found = messages(
+            r#"
+            fn act() { }
+            component App { Window(width = 1dp) { Text(content = "{act()}") } }
+            "#,
+        );
+        assert!(
+            found
+                .iter()
+                .any(|message| return message.contains("`act` returns nothing")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_void_function_is_callable_as_a_statement() {
+        let found = messages(
+            r#"
+            fn act() { let handled = 1 }
+            component App {
+                Window(width = 1dp) {
+                    Button(label = "go") { on click => act() }
+                }
+            }
+            "#,
+        );
+        assert!(found.is_empty(), "{found:?}");
     }
 }

@@ -4,11 +4,45 @@ use nui_core::{Duration, Length};
 
 use crate::span::Span;
 
-/// A parsed document: one or more component declarations.
+/// A parsed document: free functions followed by component declarations.
 #[derive(Debug, Clone)]
 pub struct Document {
+    /// Document-level function declarations in source order.
+    ///
+    /// Functions are declared at the top level (outside any component) with
+    /// `fn name(param: Type, ...) -> Type { return expr }`, and may be called
+    /// from any component's expressions, bindings and effect blocks.
+    pub functions: Vec<FunctionDecl>,
     /// Component declarations in source order.
     pub components: Vec<ComponentDecl>,
+}
+
+/// A function declaration: `fn name(a: Int, b: Int) -> Int { return a + b }`.
+#[derive(Debug, Clone)]
+pub struct FunctionDecl {
+    /// Span covering the whole declaration.
+    pub span: Span,
+    /// Function name.
+    pub name: Ident,
+    /// Parameters in declaration order.
+    pub parameters: Vec<Parameter>,
+    /// Declared result type; `None` means `Void` (no `return` value usable).
+    pub return_type: Option<Ident>,
+    /// Function body: `let`, `if`/`else`, `return`, and expression statements.
+    pub body: Vec<Statement>,
+}
+
+/// A function parameter: `count: Int`.
+#[derive(Debug, Clone)]
+pub struct Parameter {
+    /// Span covering the parameter.
+    pub span: Span,
+    /// Parameter name.
+    pub name: Ident,
+    /// Declared type.
+    pub declared_type: Ident,
+    /// Default value, enabling the parameter to be omitted at the call site.
+    pub default: Option<Expr>,
 }
 
 /// A single component declaration (`component Name { ... }`).
@@ -144,6 +178,32 @@ pub enum NodeMember {
     Node(NodeDecl),
     /// Conditional property block (`when cond { ... }`).
     When(WhenBlock),
+    /// State declaration (`state clicks: Int = 0`).
+    State(StateFieldDecl),
+}
+
+/// A node-level state declaration: `state name: Type = default`.
+///
+/// This is the node-scoped counterpart of a component's `property`: a value
+/// that lives on the element and is read and written as `id.name`. It exists
+/// because element properties and element state **share one namespace** (the
+/// platform idiom is to hang a page's state on its root element), so the
+/// compiler cannot tell a misspelled built-in property from a deliberately
+/// introduced state — unless the state is declared, which is what this is.
+///
+/// See `plan.md` §13 option (a). With declarations in place, a name that is
+/// neither a built-in property of the element type nor a declared state is a
+/// compile-time error, so `Text(contnt = "x")` no longer fails silently.
+#[derive(Debug, Clone)]
+pub struct StateFieldDecl {
+    /// Span covering the declaration.
+    pub span: Span,
+    /// State name.
+    pub name: Ident,
+    /// Declared type.
+    pub declared_type: Ident,
+    /// Default value; required, since a state must start somewhere.
+    pub default: Expr,
 }
 
 /// A property assignment: `target op value`.
@@ -272,6 +332,22 @@ pub enum Statement {
         span: Span,
         /// Signal name.
         signal: Ident,
+    },
+    /// `return expr` — the result of a function body. Only valid inside a
+    /// `fn` declaration.
+    Return {
+        /// Span covering the statement.
+        span: Span,
+        /// Returned expression; `None` returns `Void` early.
+        value: Option<Expr>,
+    },
+    /// A bare expression used as a statement (e.g. `count += 1` written as
+    /// `set(count, count + 1)`); its value is discarded.
+    Expr {
+        /// Span covering the statement.
+        span: Span,
+        /// The expression being evaluated for its effect.
+        value: Expr,
     },
     /// `element.method(args)` (e.g. `timer.start()`).
     Call {

@@ -1,0 +1,12 @@
+[package]
+name = "nui-tools"
+description = "nui dependency-free helpers: numeric, text, hashing, curve, and color math"
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

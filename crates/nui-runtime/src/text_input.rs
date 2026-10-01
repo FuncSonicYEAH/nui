@@ -377,21 +377,16 @@ impl TextInputState {
     }
 }
 
-/// Byte offset of char index `index` in a collected char slice.
-fn char_to_byte(chars: &[char], index: usize) -> usize {
-    return chars
-        .iter()
-        .take(index)
-        .map(|character| return character.len_utf8())
-        .sum();
-}
-
 // -- engine routing (M7): focus cycling, key dispatch, input writes --------
 
 use crate::binding::Engine;
 use crate::element::{Element, ElementId, ElementTree};
 use crate::notify::ChangeSource;
 use nui_core::{Key, Modifiers, Value};
+// The character-offset and field-validator helpers are plain
+// `&str`/`&[char]` arithmetic with no nui types in their signatures, so
+// they live in `nui-tools` next to the other shared helpers.
+use nui_tools::text::{char_to_byte, is_email, is_float, is_integer};
 
 impl Engine {
     /// Moves keyboard focus to `element`, applying the field's focus
@@ -789,6 +784,9 @@ impl Element {
 /// this build knows — an unrecognised name must not mark a field
 /// permanently invalid, since a document may target a later nui.
 ///
+/// The three predicates themselves are [`nui_tools::text`]'s; what lives
+/// here is the *vocabulary* — which `kind` strings this build answers for.
+///
 /// An empty field is always valid: "nothing typed yet" is not a mistake,
 /// and requiring a value is the document's business (`required` on the
 /// label, or a disable on the submit button).
@@ -799,82 +797,6 @@ pub fn validates(kind: &str, text: &str) -> Option<bool> {
         "email" => Some(is_email(text)),
         _ => None,
     };
-}
-
-/// An optionally signed run of decimal digits.
-fn is_integer(text: &str) -> bool {
-    if text.is_empty() {
-        return true;
-    }
-    let digits = text
-        .strip_prefix('-')
-        .or_else(|| return text.strip_prefix('+'))
-        .unwrap_or(text);
-    return !digits.is_empty()
-        && digits
-            .chars()
-            .all(|character| return character.is_ascii_digit());
-}
-
-/// An optionally signed decimal with at most one point. A trailing or
-/// leading point is accepted (`"1."`, `".5"`): both are states a field
-/// passes through while being typed, and flagging them mid-keystroke is
-/// noise, not information.
-fn is_float(text: &str) -> bool {
-    if text.is_empty() {
-        return true;
-    }
-    let body = text
-        .strip_prefix('-')
-        .or_else(|| return text.strip_prefix('+'))
-        .unwrap_or(text);
-    let mut seen_point = false;
-    let mut digits = 0;
-    for character in body.chars() {
-        if character == '.' {
-            if seen_point {
-                return false;
-            }
-            seen_point = true;
-            continue;
-        }
-        if !character.is_ascii_digit() {
-            return false;
-        }
-        digits += 1;
-    }
-    return digits > 0;
-}
-
-/// A pragmatic email shape: exactly one `@`, a non-empty local part, and a
-/// dotted domain with no empty labels, no whitespace anywhere.
-///
-/// Deliberately not RFC 5322. That grammar admits addresses no mail system
-/// accepts and its complexity buys nothing for a form hint; what this does
-/// catch is the mistakes people actually make — a missing `@`, a domain
-/// without a dot, a trailing dot, a stray space from a paste.
-fn is_email(text: &str) -> bool {
-    if text.is_empty() {
-        return true;
-    }
-    if text
-        .chars()
-        .any(|character| return character.is_whitespace())
-    {
-        return false;
-    }
-    let mut parts = text.split('@');
-    let local = parts.next().unwrap_or_default();
-    let Some(domain) = parts.next() else {
-        return false;
-    };
-    if parts.next().is_some() || local.is_empty() || domain.is_empty() {
-        return false;
-    }
-    return domain.contains('.')
-        && !domain.starts_with('.')
-        && !domain.ends_with('.')
-        && !domain.contains("..");
 }
 
 impl Engine {

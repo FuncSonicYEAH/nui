@@ -75,7 +75,10 @@ const STATEFUL_COUNTER: &str = r#"
 
         Window(id = root) {
             Text(id = label, content <- "count: {count}")
-            Text(id = flag, flagged <- mode.overflow)
+            Text(id = flag) {
+                state flagged: Bool = mode.overflow
+                flagged <- mode.overflow
+            }
             when mode.overflow {
                 label.opacity = 0.5
             }
@@ -172,7 +175,10 @@ fn binding_chain_updates_on_property_write() {
         component Chain {
             property base: Int = 2
             Window(id = root) {
-                Text(id = out, value <- base * 10 + 1)
+                Text(id = out) {
+                    state value: Float = base * 10 + 1
+                    value <- base * 10 + 1
+                }
             }
         }
     "#;
@@ -194,7 +200,10 @@ fn timer_fires_repeatedly_until_stopped() {
             property ticks: Int = 0
             Window(id = root) {
                 Timer(id = timer)
-                Text(id = out, value <- "t{ticks}")
+                Text(id = out) {
+                    state value: String = "t{ticks}"
+                    value <- "t{ticks}"
+                }
                 Button(id = go) {
                     on click => timer.start(50ms)
                 }
@@ -230,7 +239,10 @@ fn runtime_cycle_is_caught_not_looped() {
         component Loop {
             property a: Int = 1
             Window(id = root) {
-                Text(id = out, value <- a)
+                Text(id = out) {
+                    state value: Float = a
+                    value <- a
+                }
             }
         }
     "#;
@@ -259,7 +271,10 @@ fn effect_write_clears_binding_d10_end_to_end() {
         component D10 {
             property count: Int = 0
             Window(id = root) {
-                Text(id = out, value <- "n{count}")
+                Text(id = out) {
+                    state value: String = "n{count}"
+                    value <- "n{count}"
+                }
                 Button(id = btn) {
                     on click => out.value = "static"
                 }
@@ -468,7 +483,10 @@ fn observer_sees_binding_and_effect_changes_in_order() {
         component Watched {
             property count: Int = 1
             Window(id = root) {
-                Text(id = out, doubled <- count * 2)
+                Text(id = out) {
+                    state doubled: Float = count * 2
+                    doubled <- count * 2
+                }
                 Button(id = btn) {
                     on click => count += 5
                 }
@@ -513,7 +531,10 @@ fn set_direct_records_host_change_and_invalidates() {
         component Hosted {
             property count: Int = 0
             Window(id = root) {
-                Text(id = out, value <- "n{count}")
+                Text(id = out) {
+                    state value: String = "n{count}"
+                    value <- "n{count}"
+                }
             }
         }
     "#;
@@ -547,7 +568,10 @@ fn unsubscribed_observer_stops_receiving() {
     let source = r#"
         component Quiet {
             Window(id = root) {
-                Text(id = out, value <- "x")
+                Text(id = out) {
+                    state value: String = "x"
+                    value <- "x"
+                }
             }
         }
     "#;
@@ -634,7 +658,10 @@ const FOR_MODEL_LIST: &str = r#"
 
         Window(id = root) {
             For(item in root.items) {
-                Text(label <- item.label)
+                Text() {
+                    state label: String = ""
+                    label <- item.label
+                }
             }
         }
     }
@@ -795,7 +822,10 @@ fn tween_binding_routes_target_through_the_clock() {
             property count: Int = 0
 
             Window(id = root) {
-                Text(x <- tween(count, duration = 100ms, easing = linear))
+                Text() {
+                    state x: Float = tween(count, duration = 100ms, easing = linear)
+                    x <- tween(count, duration = 100ms, easing = linear)
+                }
             }
         }
     "#;
@@ -839,7 +869,10 @@ fn a_named_cubic_bezier_easing_reaches_the_clock() {
             property count: Int = 0
 
             Window(id = root) {
-                Text(x <- tween(count, duration = 100ms, easing = emphasized-decelerate))
+                Text() {
+                    state x: Float = tween(count, duration = 100ms, easing = emphasized-decelerate)
+                    x <- tween(count, duration = 100ms, easing = emphasized-decelerate)
+                }
             }
         }
     "#;
@@ -883,7 +916,10 @@ fn an_overshooting_easing_passes_its_target_and_comes_back() {
             property count: Int = 0
 
             Window(id = root) {
-                Text(x <- tween(count, duration = 100ms, easing = spatial-fast))
+                Text() {
+                    state x: Float = tween(count, duration = 100ms, easing = spatial-fast)
+                    x <- tween(count, duration = 100ms, easing = spatial-fast)
+                }
             }
         }
     "#;
@@ -919,7 +955,10 @@ fn spring_binding_settles_at_target() {
             property count: Int = 0
 
             Window(id = root) {
-                Text(x <- spring(count))
+                Text() {
+                    state x: Float = spring(count)
+                    x <- spring(count)
+                }
             }
         }
     "#;
@@ -1594,7 +1633,10 @@ fn list_view_virtualizes_rows_to_the_visible_window() {
             Window(id = root) {
                 ListView(item in root.rows, id = list, height = 50dp, row_height = 10dp) {
                     Rectangle(height = 10dp) {
-                        Text(label <- item.label)
+                        Text() {
+                            state label: String = ""
+                            label <- item.label
+                        }
                     }
                 }
             }
