@@ -19,7 +19,7 @@ pub mod document;
 pub mod types;
 
 pub use bytecode::{AssignOp, Builtin, Effect, InterpPart, PropertyTarget, TypedExpr};
-pub use check::{CheckOutcome, check, check_with, check_with_host};
+pub use check::{CheckOutcome, check, check_with, check_with_host, check_with_vocabulary};
 pub use document::{
     AssignmentIr, ComponentIr, DocumentIr, ForIr, HandlerIr, InitKind, MachineIr, NodeIr,
     PropertyDefaultIr, PropertyIr, StateIr, TransitionIr, WhenIr, assign_op_name,
@@ -82,6 +82,18 @@ pub struct HostVocabulary {
     /// The subset of [`Self::functions`] that acts instead of returning:
     /// legal as a statement, an error in a value position.
     pub commands: Vec<String>,
+    /// The names of types the host registered with `register_component`.
+    ///
+    /// A document may name one of these as an `extends` parent. The host
+    /// supplies the *name* so the checker can accept the clause; the
+    /// inherited members come from the host's own descriptor, which the
+    /// runtime already holds.
+    ///
+    /// Unlike `functions` / `commands`, an empty list here does **not**
+    /// mean "nothing is allowed": the built-in element types are always
+    /// available (see [`nui_core::props::is_builtin_type`]). This slot only
+    /// adds names the compiler does not know on its own.
+    pub components: Vec<String>,
 }
 
 impl HostVocabulary {
@@ -105,6 +117,15 @@ impl HostVocabulary {
         }
         return self;
     }
+
+    /// Builder: the type names a document may `extends`.
+    pub fn with_components(
+        mut self,
+        components: impl IntoIterator<Item = String>,
+    ) -> HostVocabulary {
+        self.components.extend(components);
+        return self;
+    }
 }
 
 /// Compiles nui-lang source text against a host vocabulary; see
@@ -114,7 +135,8 @@ pub fn compile_with_host(source: &str, host: &HostVocabulary) -> CompileOutcome 
         document,
         mut diagnostics,
     } = nui_syntax::parse(source);
-    let outcome = check_with_host(&document, &host.functions, &host.commands);
+    let outcome =
+        check::check_with_vocabulary(&document, &host.functions, &host.commands, &host.components);
     diagnostics.extend(outcome.diagnostics);
     diagnostics.sort_by_key(|diagnostic| return diagnostic.span.start);
     return CompileOutcome {

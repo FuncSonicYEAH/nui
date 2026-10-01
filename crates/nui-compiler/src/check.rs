@@ -84,6 +84,14 @@ struct DocumentIndex {
     /// component -> the components it instantiates, with the span of the
     /// node that named them. The edge set the recursion check walks.
     edges: HashMap<String, Vec<(String, Span)>>,
+    /// component -> the component it `extends`, with the span of the parent
+    /// name. A **separate** graph from [`Self::edges`], and deliberately so:
+    /// an inheritance edge is not an instantiation, so folding it into
+    /// `edges` would mark the parent `referenced` and stop the runtime from
+    /// instantiating it as an entry point. It also gets its own cycle
+    /// diagnostic, because "extends itself" and "instantiates itself" fail
+    /// for different reasons.
+    extends_edges: HashMap<String, (String, Span)>,
     /// Every element id declared anywhere in the document, with the type name
     /// it was declared on.
     ///
@@ -92,6 +100,14 @@ struct DocumentIndex {
     /// See [`ComponentBinder::check_name`] and the note there for why a
     /// document-level fallback exists at all.
     document_ids: HashMap<String, String>,
+    /// The element type names the host registered, as a set.
+    ///
+    /// Needed after the build, to tell a host-owned parent from a built-in
+    /// one. Both are absent from `signatures`, but they are not
+    /// interchangeable: the host's types have their own property surface
+    /// that the compiler cannot enumerate, so a derived component over one
+    /// contributes no synthesized root and no seeded properties.
+    host_types: HashSet<String>,
 }
 
 impl DocumentIndex {
@@ -101,7 +117,11 @@ impl DocumentIndex {
     /// component's binder can see: a component that instantiates itself
     /// (directly or through a chain), and an instantiated component that
     /// does not declare exactly one root.
-    fn build(document: &Document, diagnostics: &mut Vec<nui_syntax::Diagnostic>) -> DocumentIndex {
+    fn build(
+        document: &Document,
+        extern_components: &[String],
+        diagnostics: &mut Vec<nui_syntax::Diagnostic>,
+    ) -> DocumentIndex {
         // Two passes, and the order matters: the edge pass has to see *every*
         // signature, or a component that references one declared later in
         // the file records no edge and a cycle through it goes unnoticed.
@@ -118,6 +138,29 @@ impl DocumentIndex {
                 ));
             }
         }
+        // The inheritance edges, collected into their own map. Kept apart
+        // from `edges` on purpose -- see the field docs. Gathered before the
+        // signatures are merged because the merge needs them.
+        let mut extends_edges: HashMap<String, (String, Span)> = HashMap::new();
+        for decl in &document.components {
+            let Some(parent) = &decl.extends else {
+                continue;
+            };
+            extends_edges.insert(decl.name.name.clone(), (parent.name.clone(), parent.span));
+        }
+        // Fold each parent's signature into every component that extends it,
+        // so a derived component's *declared API* -- what a call site is
+        // checked against, which signals it may subscribe to, whether it
+        // takes content -- is the union its body actually has. Done here, in
+        // inheritance order, rather than in `signature_of`, because a parent
+        // may be declared after its child and a shared parent must be folded
+        // in exactly once.
+        merge_signatures(
+            &mut signatures,
+            &extends_edges,
+            &document.components,
+            &extern_components.iter().cloned().collect(),
+        );
         let mut edges: HashMap<String, Vec<(String, Span)>> = HashMap::new();
         for decl in &document.components {
             let mut outgoing = Vec::new();
@@ -157,13 +200,36 @@ impl DocumentIndex {
                 collect_node_ids(node, &mut document_ids);
             }
         }
+        // A parent that is neither a component, a registered host type, nor
+        // a built-in element type is an error, not a silent no-op: an
+        // unknown parent would mean the merge does nothing and the derived
+        // component is missing the very members it was written to inherit.
+        for (child, (parent, span)) in &extends_edges {
+            if signatures.contains_key(parent)
+                || extern_components.contains(parent)
+                || nui_core::props::is_builtin_type(parent)
+            {
+                continue;
+            }
+            diagnostics.push(nui_syntax::Diagnostic::error(
+                *span,
+                format!(
+                    "`{child}` extends `{parent}`, which is not a component in \
+                     this document, a type the host registered, or a built-in \
+                     element type"
+                ),
+            ));
+        }
         let index = DocumentIndex {
             signatures,
             referenced,
             document_ids,
             edges,
+            extends_edges,
+            host_types: extern_components.iter().cloned().collect(),
         };
         index.report_recursion(diagnostics);
+        index.report_extends_cycles(diagnostics);
         index.report_root_counts(diagnostics);
         return index;
     }
@@ -218,6 +284,149 @@ impl DocumentIndex {
         for name in names {
             walk(self, name, &mut marks, &mut path, diagnostics);
         }
+    }
+
+    /// Reports a cycle in the *inheritance* graph.
+    ///
+    /// A separate walk from [`Self::report_recursion`] because it is a
+    /// separate graph with a different failure. `A extends B extends A`
+    /// would make the member merge run forever; it is caught here, at the
+    /// declaration, rather than by any depth guard in the merge.
+    fn report_extends_cycles(&self, diagnostics: &mut Vec<nui_syntax::Diagnostic>) {
+        /// 1 = on the current path, 2 = fully explored.
+        const ON_PATH: u8 = 1;
+        const DONE: u8 = 2;
+
+        fn walk(
+            index: &DocumentIndex,
+            name: &str,
+            marks: &mut HashMap<String, u8>,
+            path: &mut Vec<String>,
+            diagnostics: &mut Vec<nui_syntax::Diagnostic>,
+        ) {
+            match marks.get(name) {
+                Some(&ON_PATH) => {
+                    // Point the error at the `extends` clause that closed the
+                    // cycle, which is where the fix is.
+                    let span = index
+                        .extends_edges
+                        .get(name)
+                        .map(|(_, span)| return *span)
+                        .or_else(|| {
+                            return index
+                                .signatures
+                                .get(name)
+                                .map(|signature| return signature.span);
+                        });
+                    let message = format!("`{name}` extends itself: {}", cycle_path(path, name));
+                    match span {
+                        Some(span) => {
+                            diagnostics.push(nui_syntax::Diagnostic::error(span, message))
+                        }
+                        None => diagnostics.push(nui_syntax::Diagnostic::error(
+                            nui_syntax::Span::new(0, 0),
+                            message,
+                        )),
+                    }
+                    return;
+                }
+                Some(&DONE) => return,
+                _ => {}
+            }
+            marks.insert(name.to_string(), ON_PATH);
+            path.push(name.to_string());
+            if let Some((parent, _)) = index.extends_edges.get(name) {
+                walk(index, parent, marks, path, diagnostics);
+            }
+            path.pop();
+            marks.insert(name.to_string(), DONE);
+        }
+
+        let mut marks: HashMap<String, u8> = HashMap::new();
+        let mut path = Vec::new();
+        let mut names: Vec<&String> = self.extends_edges.keys().collect();
+        names.sort();
+        for name in names {
+            walk(self, name, &mut marks, &mut path, diagnostics);
+        }
+    }
+
+    /// The components in an order where a parent is always bound before any
+    /// child that extends it.
+    ///
+    /// Binding a child needs the parent's *bound* [`ComponentIr`] -- its
+    /// checked properties, its mangled-ready roots -- so the order is not a
+    /// convenience. A depth-first walk from the roots of the inheritance
+    /// forest yields it; a component already visited (shared parent, or a
+    /// diamond) is skipped, and a cycle simply stops descending, since it is
+    /// already reported as an error and binding order no longer matters.
+    fn binding_order(&self, components: &[ComponentDecl]) -> Vec<String> {
+        fn visit(
+            index: &DocumentIndex,
+            name: &str,
+            order: &mut Vec<String>,
+            visited: &mut HashSet<String>,
+        ) {
+            if !visited.insert(name.to_string()) {
+                return;
+            }
+            if let Some((parent, _)) = index.extends_edges.get(name) {
+                visit(index, parent, order, visited);
+            }
+            order.push(name.to_string());
+        }
+
+        let mut order = Vec::new();
+        let mut visited = HashSet::new();
+        for decl in components {
+            visit(self, &decl.name.name, &mut order, &mut visited);
+        }
+        return order;
+    }
+
+    /// The chain of parents above `name`, nearest first.
+    ///
+    /// Stops at a component that is not declared in the document (a
+    /// host-registered parent has no `.nui` body to inherit from) and at a
+    /// cycle, so it always terminates.
+    /// The chain of `extends` parents above `name`, nearest first.
+    ///
+    /// The walk stops at the first name that is not a component declared in
+    /// this document. A *built-in* parent (`extends Button`) is still
+    /// included as the last entry: it has no `.nui` signature to descend
+    /// into, but the caller needs its name to know the chain bottoms out in
+    /// an element type rather than a component. A host-registered parent is
+    /// included on the same terms; both are told apart by
+    /// [`Self::host_types`] first and [`nui_core::props::is_builtin_type`]
+    /// second.
+    ///
+    /// The order matters and is not arbitrary: a host that registers `Card`
+    /// owns that name, including when the compiler's built-in table also
+    /// knows a `Card`. Seeding the built-in properties into such a derived
+    /// component would invent declarations the host never agreed to — a
+    /// call site's `Card(radius = 8dp)` would type-check as a built-in
+    /// property while the host reads something else entirely.
+    fn parent_chain(&self, name: &str) -> Vec<String> {
+        let mut chain = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(name.to_string());
+        let mut current = name.to_string();
+        while let Some((parent, _)) = self.extends_edges.get(&current) {
+            if !seen.insert(parent.clone()) {
+                break;
+            }
+            chain.push(parent.clone());
+            if !self.signatures.contains_key(parent) {
+                // Not a component: the chain ends here. Staying in the loop
+                // would look the name up in `extends_edges` and find
+                // nothing, which is the same answer -- but recording it
+                // explicitly is what lets the caller distinguish "built-in"
+                // from "no parent at all".
+                break;
+            }
+            current = parent.clone();
+        }
+        return chain;
     }
 
     /// An instantiated component has to be instantiable: exactly one root
@@ -351,6 +560,18 @@ fn collect_slot_spans(node: &NodeDecl, out: &mut Vec<Span>) {
     }
 }
 
+/// How many `Slot` nodes a bound subtree contains. The IR counterpart of
+/// [`collect_slot_spans`], for counting an inherited body's slots.
+fn count_slots(node: &NodeIr) -> usize {
+    let here = usize::from(node.ty == SLOT);
+    return here
+        + node
+            .children
+            .iter()
+            .map(|child| return count_slots(child))
+            .sum::<usize>();
+}
+
 /// Whether a component declaration contains a `Slot`.
 ///
 /// Walks the whole body rather than just the root, because a slot usually sits
@@ -374,6 +595,34 @@ fn declares_slot(decl: &ComponentDecl) -> bool {
         };
         return in_node(node);
     });
+}
+
+/// The `Slot` node inside a bound subtree, for a derived body to append into.
+///
+/// Depth-first so the shallowest `Slot` wins, which matches how the runtime
+/// fills one: `descendants_of_type` returns an element for every `Slot` in
+/// the tree, and a well-formed component has at most one (enforced by
+/// [`ComponentBinder::check_slots`]).
+fn find_slot(roots: &mut [NodeIr]) -> Option<&mut NodeIr> {
+    for root in roots.iter_mut() {
+        if let Some(slot) = find_slot_in(root) {
+            return Some(slot);
+        }
+    }
+    return None;
+}
+
+/// [`find_slot`] within one subtree.
+fn find_slot_in(node: &mut NodeIr) -> Option<&mut NodeIr> {
+    if node.ty == SLOT {
+        return Some(node);
+    }
+    for child in node.children.iter_mut() {
+        if let Some(slot) = find_slot_in(child) {
+            return Some(slot);
+        }
+    }
+    return None;
 }
 
 /// The declared API of one component declaration.
@@ -410,6 +659,189 @@ fn signature_of(decl: &ComponentDecl) -> ComponentSignature {
     return signature;
 }
 
+/// Folds each component's ancestors into its signature.
+///
+/// The merge walks the inheritance forest parents-first, so a signature is
+/// complete before any child folds it in. Two rules, and both matter:
+///
+/// - **A child's own member wins.** `properties` and `signals` are unions,
+///   but on a name collision the child's entry is kept -- an override is the
+///   point of deriving, and a parent's default must not shadow it.
+/// - **`root_count` is inherited only when the child declares none.** A
+///   derived body that writes its own nodes *replaces* the parent's roots;
+///   one that writes none is an "inherit the body and change the API"
+///   component, and needs the parent's single root so its own
+///   [`crate::document::ComponentIr::roots`] can be filled from the parent.
+///
+/// A parent that is not declared in this document contributes whatever it
+/// can: a host-registered type contributes nothing here (it has no `.nui`
+/// signature, and the host holds its descriptor), while a *built-in*
+/// element type contributes its property table — see
+/// [`nui_core::props::TABLE`]. That table is what makes
+/// `component Fancy extends Button` inherit `label`, `variant`,
+/// `enabled` and the rest, typed, so an override is checked like any
+/// other property.
+fn merge_signatures(
+    signatures: &mut HashMap<String, ComponentSignature>,
+    extends_edges: &HashMap<String, (String, Span)>,
+    components: &[ComponentDecl],
+    host_types: &HashSet<String>,
+) {
+    fn visit(
+        name: &str,
+        signatures: &mut HashMap<String, ComponentSignature>,
+        extends_edges: &HashMap<String, (String, Span)>,
+        host_types: &HashSet<String>,
+        on_path: &mut Vec<String>,
+        merged: &mut HashSet<String>,
+    ) {
+        if merged.contains(name) {
+            return;
+        }
+        // A cycle is reported by `report_extends_cycles`; stop descending so
+        // this walk terminates rather than recursing forever.
+        if on_path.iter().any(|entry| return entry == name) {
+            return;
+        }
+        // The end of the chain: a name with no `extends` clause. (A
+        // built-in parent is handled below, in the child's own step, since
+        // it has no signature to descend into.)
+        let Some((parent, _)) = extends_edges.get(name) else {
+            merged.insert(name.to_string());
+            return;
+        };
+        // The parent contributes the built-in property table. Merged before
+        // the `signatures` lookup because a built-in has no signature of
+        // its own -- and merged even when the child's own properties will
+        // overwrite some of them, because the *types* are the point.
+        //
+        // Unless the host registered the name, in which case the host's
+        // descriptor is authoritative and this table must not speak for it.
+        if !signatures.contains_key(parent)
+            && !host_types.contains(parent)
+            && let Some(props) = nui_core::props::props_of(parent)
+        {
+            if let Some(signature) = signatures.get_mut(name) {
+                for prop in props {
+                    signature
+                        .properties
+                        .entry(prop.name.to_string())
+                        .or_insert(prop_type_to_type(prop.ty));
+                }
+                // A built-in draws itself: the derived component's
+                // inherited body is the built-in element, so it has
+                // exactly one root.
+                if signature.root_count == 0 {
+                    signature.root_count = 1;
+                }
+            }
+            merged.insert(name.to_string());
+            return;
+        }
+        on_path.push(name.to_string());
+        let parent_name = parent.clone();
+        visit(
+            &parent_name,
+            signatures,
+            extends_edges,
+            host_types,
+            on_path,
+            merged,
+        );
+        on_path.pop();
+        let Some(parent_signature) = signatures.get(&parent_name).cloned() else {
+            merged.insert(name.to_string());
+            return;
+        };
+        if let Some(signature) = signatures.get_mut(name) {
+            for (property, ty) in &parent_signature.properties {
+                // The child's own declaration wins; only fill the gap.
+                signature.properties.entry(property.clone()).or_insert(*ty);
+            }
+            for signal in &parent_signature.signals {
+                signature.signals.insert(signal.clone());
+            }
+            if signature.root_count == 0 {
+                signature.root_count = parent_signature.root_count;
+            }
+            // `has_slot` is inherited: a derived component may pass content
+            // through to a `Slot` its parent declares.
+            signature.has_slot |= parent_signature.has_slot;
+        }
+        merged.insert(name.to_string());
+    }
+
+    let mut merged: HashSet<String> = HashSet::new();
+    let mut names: Vec<String> = components
+        .iter()
+        .map(|decl| return decl.name.name.clone())
+        .collect();
+    names.sort();
+    for name in names {
+        let mut on_path = Vec::new();
+        visit(
+            &name,
+            signatures,
+            extends_edges,
+            host_types,
+            &mut on_path,
+            &mut merged,
+        );
+    }
+}
+
+/// The number of single-character edits (insert, delete, substitute) that
+/// turn `left` into `right`.
+///
+/// Levenshtein, on `char`s rather than bytes: type names are ASCII today,
+/// but a host may register one that is not, and slicing a `&str` by byte
+/// index would then panic on a multi-byte boundary. Two rows rather than a
+/// full matrix -- only the previous row is ever read.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    if left.is_empty() {
+        return right.len();
+    }
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current: Vec<usize> = vec![0; right.len() + 1];
+    for (row, &left_char) in left.iter().enumerate() {
+        current[0] = row + 1;
+        for (column, &right_char) in right.iter().enumerate() {
+            let substitute = previous[column] + usize::from(left_char != right_char);
+            current[column + 1] = substitute
+                .min(previous[column + 1] + 1)
+                .min(current[column] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    return previous[right.len()];
+}
+
+/// The compiler's type for a built-in property's declared type.
+///
+/// `Number` maps to `Unknown` rather than `Float`: a `Number` property
+/// accepts both an `Int` and a `Float`, and `Float` would reject the
+/// integer a document writes (`step = 5`). `Unknown` suppresses the check
+/// for that one property -- the widget layer keeps whichever kind the
+/// document used, so both are in fact correct.
+fn prop_type_to_type(ty: nui_core::props::PropType) -> Type {
+    use nui_core::props::PropType;
+    return match ty {
+        PropType::Bool => Type::Bool,
+        PropType::Int => Type::Int,
+        PropType::Float => Type::Float,
+        PropType::String => Type::String,
+        PropType::Color => Type::Color,
+        PropType::Length => Type::Length,
+        // A variant name is an identifier in a document but a string at
+        // runtime; `Enum` is the type that accepts both spellings.
+        PropType::Enum => Type::Enum,
+        PropType::Number => Type::Unknown,
+        PropType::Model => Type::Model,
+    };
+}
+
 /// The chain `a -> b -> a` for a recursion diagnostic, as a readable path.
 fn cycle_path(path: &[String], repeated: &str) -> String {
     let start = path
@@ -439,15 +871,80 @@ pub fn check_with_host(
     extern_functions: &[String],
     extern_commands: &[String],
 ) -> CheckOutcome {
+    return check_with_vocabulary(document, extern_functions, extern_commands, &[]);
+}
+
+/// [`check_with_host`], plus the names of host-registered *types* a component
+/// may name as its `extends` parent.
+///
+/// Separate from [`check_with_host`] rather than folded into it because the
+/// two are consumed by different layers: the function/command lists are what
+/// a *call* is checked against, and the component list is what a *declaration*
+/// is checked against. A caller that offers no registered types passes an
+/// empty list, and `extends` may then only name a component in the document.
+pub fn check_with_vocabulary(
+    document: &Document,
+    extern_functions: &[String],
+    extern_commands: &[String],
+    extern_components: &[String],
+) -> CheckOutcome {
     let mut diagnostics = Vec::new();
-    let index = DocumentIndex::build(document, &mut diagnostics);
-    let mut components = Vec::new();
-    for decl in &document.components {
-        let mut binder = ComponentBinder::new(decl, extern_functions, extern_commands, &index);
+    let index = DocumentIndex::build(document, extern_components, &mut diagnostics);
+    // Bound in inheritance order, parents first, because a child folds its
+    // parent's *bound* IR into its own. A derived component's inherited
+    // properties, ids and body are the parent's, already checked and already
+    // in the shape the runtime consumes -- re-deriving them from the AST
+    // would be a second implementation of binding, free to drift from this
+    // one.
+    let by_name: HashMap<&str, &ComponentDecl> = document
+        .components
+        .iter()
+        .map(|decl| return (decl.name.name.as_str(), decl))
+        .collect();
+    let mut bound: HashMap<String, ComponentIr> = HashMap::new();
+    for name in index.binding_order(&document.components) {
+        let Some(decl) = by_name.get(name.as_str()) else {
+            continue;
+        };
+        let parent_name = index.parent_chain(&name).first().cloned();
+        let parent = parent_name
+            .as_deref()
+            .and_then(|parent| return bound.get(parent).cloned());
+        // A parent that is a built-in element type has no IR, so the
+        // binder synthesises its element instead. Detected here rather than
+        // inside the binder so the two cases stay visually distinct: one
+        // clones an IR, the other builds a node from the property table.
+        //
+        // A parent the host registered is excluded first, even when the
+        // built-in table knows the same name: the host owns the type, and
+        // its property surface is not the compiler's to enumerate. Such a
+        // parent is therefore indistinguishable from `Unknown` here, which
+        // is the honest answer -- the derived component gets its parent's
+        // declarations only when the host's IR is available, and a host
+        // type has no IR.
+        let builtin_parent = parent_name
+            .as_deref()
+            .filter(|parent| return !bound.contains_key(*parent))
+            .filter(|parent| return !index.host_types.contains(*parent))
+            .filter(|parent| return nui_core::props::is_builtin_type(parent));
+        let mut binder = ComponentBinder::new(
+            decl,
+            extern_functions,
+            extern_commands,
+            &index,
+            parent.as_ref(),
+            builtin_parent,
+        );
         let component = binder.bind();
         diagnostics.append(&mut binder.diagnostics);
-        components.push(component);
+        bound.insert(name.clone(), component);
     }
+    // Emit in *source order*, the order a reader sees, not binding order.
+    let mut components: Vec<ComponentIr> = document
+        .components
+        .iter()
+        .filter_map(|decl| return bound.remove(&decl.name.name))
+        .collect();
     // Entry points are the components nothing instantiates. Decided after
     // binding because only then is every call site known.
     for component in &mut components {
@@ -544,6 +1041,23 @@ struct ComponentBinder<'source> {
     /// The document-wide component index (shared by every binder).
     index: &'source DocumentIndex,
     component: &'source ComponentDecl,
+    /// The bound IR of the component this one `extends`, when the parent is
+    /// declared in this document. Its properties, signals, machines, ids and
+    /// (when this body declares no root of its own) its roots are folded in
+    /// before this component's own members are checked. `None` for a
+    /// component with no parent, or one whose parent is host-registered --
+    /// which has no `.nui` body to inherit from.
+    parent: Option<&'source ComponentIr>,
+    /// The name of the built-in element type this component extends, when
+    /// the parent is a built-in rather than a component. The built-in has
+    /// no `.nui` body to clone, so its *element* is synthesised here: the
+    /// derived component's root is one node of this type, and its
+    /// properties come from [`nui_core::props::TABLE`].
+    ///
+    /// A built-in has no `Slot` (it draws its own chrome), so a derived
+    /// body that declares nodes is an error rather than a silent drop --
+    /// see [`ComponentBinder::bind`].
+    builtin_parent: Option<&'source str>,
 }
 
 impl<'source> ComponentBinder<'source> {
@@ -552,6 +1066,8 @@ impl<'source> ComponentBinder<'source> {
         extern_functions: &[String],
         extern_commands: &[String],
         index: &'source DocumentIndex,
+        parent: Option<&'source ComponentIr>,
+        builtin_parent: Option<&'source str>,
     ) -> ComponentBinder<'source> {
         return ComponentBinder {
             diagnostics: Vec::new(),
@@ -567,6 +1083,8 @@ impl<'source> ComponentBinder<'source> {
             extern_commands: extern_commands.iter().cloned().collect(),
             index,
             component,
+            parent,
+            builtin_parent,
         };
     }
 
@@ -576,22 +1094,115 @@ impl<'source> ComponentBinder<'source> {
             name: self.component.name.name.clone(),
             ..ComponentIr::default()
         };
+        // The inherited half, laid down first. A derived component's
+        // inherited members are its parent's *checked* ones -- same types,
+        // same mangled-ready shape -- so folding the parent's IR in is a
+        // clone, not a second binding pass that could drift.
+        if let Some(parent) = self.parent {
+            component_ir.properties = parent.properties.clone();
+            component_ir.signals = parent.signals.clone();
+            component_ir.machines = parent.machines.clone();
+            component_ir.ids = parent.ids.clone();
+            component_ir.roots = parent.roots.clone();
+        }
+        // A built-in parent has no IR to clone, so its element is
+        // synthesised: one node of the built-in's type, which is the
+        // derived component's root. The properties themselves were already
+        // folded into the signature (see `merge_signatures`) and are
+        // declared as this component's own `property` members by
+        // `collect_info`, so they arrive here as ordinary properties.
+        if let Some(builtin) = self.builtin_parent {
+            component_ir.roots = vec![self.bind_builtin_root(builtin)];
+        }
+        // Binding the body. Where the bound nodes *go* depends on whether
+        // this component inherits a body:
+        //
+        // - **No inherited body** (the ordinary component): each top-level
+        //   node is a root.
+        // - **Inherited body + this body declares nodes**: the body's nodes
+        //   are *appended into the inherited tree's `Slot`* -- the same
+        //   mechanism a call site uses, resolved here so the runtime needs no
+        //   derivation concept at all.
+        // - **Inherited body + this body declares no nodes**: the parent's
+        //   body is inherited wholesale.
+        let inherited_roots: Vec<NodeIr> = std::mem::take(&mut component_ir.roots);
+        let mut body_roots: Vec<NodeIr> = Vec::new();
         for member in &self.component.members {
             match member {
                 ComponentMember::Property(decl) => {
                     if let Some(property) = self.bind_property(decl) {
-                        component_ir.properties.push(property);
+                        // An override replaces the inherited entry in place,
+                        // so `ComponentIr::property` -- a linear first-match
+                        // find -- returns the derived one. Two entries for
+                        // one name would hand the parent's default back.
+                        match component_ir
+                            .properties
+                            .iter_mut()
+                            .find(|existing| return existing.name == property.name)
+                        {
+                            Some(existing) => *existing = property,
+                            None => component_ir.properties.push(property),
+                        }
                     }
                 }
                 ComponentMember::Signal(decl) => {
-                    component_ir.signals.push(decl.name.name.clone());
+                    if !component_ir.signals.contains(&decl.name.name) {
+                        component_ir.signals.push(decl.name.name.clone());
+                    }
                 }
                 ComponentMember::Machine(decl) => {
-                    component_ir.machines.push(self.bind_machine(decl));
+                    let machine = self.bind_machine(decl);
+                    match component_ir
+                        .machines
+                        .iter_mut()
+                        .find(|existing| return existing.name == machine.name)
+                    {
+                        Some(existing) => *existing = machine,
+                        None => component_ir.machines.push(machine),
+                    }
                 }
                 ComponentMember::Node(node) => {
-                    component_ir.roots.push(self.bind_node(node, true));
+                    body_roots.push(self.bind_node(node, true));
                 }
+            }
+        }
+        if body_roots.is_empty() {
+            // Inherit the parent's body wholesale.
+            component_ir.roots = inherited_roots;
+        } else if let Some(builtin) = self.builtin_parent {
+            // A built-in parent has no `Slot` to append into: it draws its
+            // own chrome and takes no content. Refused rather than silently
+            // dropped, for the same reason as the component case below.
+            component_ir.roots = inherited_roots;
+            self.diagnostics.push(nui_syntax::Diagnostic::error(
+                self.component.name.span,
+                format!(
+                    "`{}` extends the built-in `{builtin}`, which takes no content, so \
+                     these nodes have nowhere to go; a derived component's body may \
+                     only override inherited properties",
+                    self.component.name.name
+                ),
+            ));
+        } else if inherited_roots.is_empty() {
+            // This body *is* the component's body; nothing was inherited.
+            component_ir.roots = body_roots;
+        } else {
+            // Both: append the body into the inherited tree's `Slot`. With
+            // no `Slot` the appended nodes would be silently dropped, which
+            // is exactly the failure D26 exists to prevent, so it is an
+            // error pointing at the parent that needs the marker.
+            component_ir.roots = inherited_roots;
+            match find_slot(&mut component_ir.roots) {
+                Some(slot) => slot.children.extend(body_roots),
+                None => self.diagnostics.push(nui_syntax::Diagnostic::error(
+                    self.component.name.span,
+                    format!(
+                        "`{}` extends a component whose body has no `{SLOT}`, so these \
+                         nodes have nowhere to go; add a `{SLOT}` to the parent, or \
+                         wrap them in a root of this component's own",
+                        self.component.name.name
+                    ),
+                )),
             }
         }
         // The component's own element ids, which the runtime's id rewrite needs
@@ -631,21 +1242,46 @@ impl<'source> ComponentBinder<'source> {
     ///
     /// Reported here rather than at each call site so the message names the
     /// component, which is where the fix is.
+    ///
+    /// A derived component's slots are counted *together with its parent's*:
+    /// one `Slot` in the inherited body plus one in the derived body is two
+    /// in the merged tree, and a call site's content would have two possible
+    /// homes. Counting only the derived body's own slots would let that
+    /// through.
     fn check_slots(&mut self) {
         let mut slots: Vec<Span> = Vec::new();
+        // The inherited tree's slots. Their spans belong to the parent's
+        // source, but the error has to name *this* component (it is the one
+        // that can fix it by not adding a second slot), so a parent span is
+        // only used when there is one to point at.
+        let inherited_slots = self
+            .parent
+            .map(|parent| {
+                return parent
+                    .roots
+                    .iter()
+                    .map(|root| return count_slots(root))
+                    .sum::<usize>();
+            })
+            .unwrap_or(0);
         for member in &self.component.members {
             let ComponentMember::Node(node) = member else {
                 continue;
             };
             collect_slot_spans(node, &mut slots);
         }
-        for extra in slots.iter().skip(1) {
+        let total = inherited_slots + slots.len();
+        if total > 1 {
+            // Point at the first slot the *derived* body adds, if it adds
+            // one; otherwise at the component name (the parent already has
+            // its own, and its error was reported when it was bound).
+            let span = slots.first().copied().unwrap_or(self.component.name.span);
             self.diagnostics.push(nui_syntax::Diagnostic::error(
-                *extra,
+                span,
                 format!(
-                    "component `{}` declares more than one `{SLOT}`; a component has \
-                     exactly one place a call site's content can go, so merge them \
-                     or wrap the second in its own element",
+                    "component `{}` has more than one `{SLOT}` once its parent is \
+                     merged in; a component has exactly one place a call site's \
+                     content can go",
                     self.component.name.name
                 ),
             ));
@@ -654,7 +1290,47 @@ impl<'source> ComponentBinder<'source> {
 
     /// First pass: collect property names, signals, machines, and ids so
     /// that expressions can resolve them regardless of declaration order.
+    ///
+    /// The parent's members go in first, so that this component's own
+    /// declaration of a name is the one that survives -- an override has to
+    /// win, and `HashMap::insert` keeps the last write.
     fn collect_info(&mut self) {
+        if let Some(parent) = self.parent {
+            for property in &parent.properties {
+                self.property_types
+                    .insert(property.name.clone(), property.ty);
+            }
+            for signal in &parent.signals {
+                self.signals.insert(signal.clone());
+            }
+            for machine in &parent.machines {
+                let states: HashSet<String> = machine
+                    .states
+                    .iter()
+                    .map(|state| return state.name.clone())
+                    .collect();
+                self.machine_states.insert(machine.name.clone(), states);
+            }
+            // The parent's ids are this component's ids: at run time they are
+            // namespaced per instance like any other, and leaving them out
+            // would demote them to "document-level" (D20), so two instances
+            // would collide in one namespace -- the failure D22 records.
+            for (id, ty) in &parent.ids {
+                self.ids.insert(id.clone(), ty.clone());
+            }
+        }
+        // A built-in parent's properties come from the table rather than
+        // from a `.nui` declaration. Seeded before the component's own
+        // members so a `property label: String = "Save"` override lands on
+        // top of the inherited entry rather than beside it.
+        if let Some(builtin) = self.builtin_parent
+            && let Some(props) = nui_core::props::props_of(builtin)
+        {
+            for prop in props {
+                self.property_types
+                    .insert(prop.name.to_string(), prop_type_to_type(prop.ty));
+            }
+        }
         for member in &self.component.members {
             match member {
                 ComponentMember::Property(decl) => {
@@ -869,6 +1545,145 @@ impl<'source> ComponentBinder<'source> {
     /// property is a different slot on a different element, so
     /// `Column(width = width)` is the ordinary way to size a child from a
     /// component property, and the two must not share a node in this graph.
+    /// Synthesises the element a built-in parent contributes.
+    ///
+    /// `component Fancy extends Button` has no `.nui` tree to clone, so its
+    /// body *is* one `Button` node. Every property of that node is a
+    /// component property: the derived component declares them (inherited
+    /// from the table, possibly overridden), and the element reads them by
+    /// name -- which is exactly how a document-written `Button` works
+    /// today. So the binding is one assignment per declared property,
+    /// source `Property(name)`.
+    ///
+    /// A `Button` has no `id` of its own here: the component's own root is
+    /// named by the *call site* (`Fancy(id = save)`), and the runtime
+    /// resolves that to the instance element as it does for any component.
+    fn bind_builtin_root(&mut self, builtin: &str) -> NodeIr {
+        let mut node = NodeIr {
+            ty: builtin.to_string(),
+            ..NodeIr::default()
+        };
+        // Sorted so the IR is deterministic: property order would otherwise
+        // follow `HashMap` iteration and the snapshot tests would flake.
+        let mut names: Vec<String> = self.property_types.keys().cloned().collect();
+        names.sort();
+        for name in names {
+            let ty = self
+                .property_types
+                .get(&name)
+                .copied()
+                .unwrap_or(Type::Unknown);
+            node.assignments.push(AssignmentIr {
+                path: vec![name.clone()],
+                // `<self>` addresses the node the assignment sits on -- the
+                // built-in element that *is* this component's root. The
+                // mangler rewrites it to the instance element, exactly as
+                // it does for a hand-written `Text(content = label)`.
+                target: PropertyTarget::Id("<self>".to_string(), name.clone()),
+                kind: InitKind::Bind,
+                value: TypedExpr::Property {
+                    // Reading the *component's* property of that name is
+                    // what makes the value arrive: the call site's argument
+                    // (`Fancy(label = "Save")`) writes the component
+                    // property, and this binding carries it to the element.
+                    target: PropertyTarget::Component(name),
+                    ty,
+                },
+            });
+        }
+        return node;
+    }
+
+    /// Reports a node type that is neither a component, a type the host
+    /// registered, nor a built-in element type.
+    ///
+    /// This is the unambiguous half of the vocabulary hole `plan.md` §13
+    /// records. The *property* half is blocked on a language decision --
+    /// element state deliberately shares the property namespace
+    /// (`Column(id = page, clicks = 0)`), so the checker cannot tell a
+    /// misspelled built-in property from an element's own state. A **type**
+    /// name has no such ambiguity: a node is instantiated by the runtime,
+    /// which looks the name up in its own element table, and a name that is
+    /// not there renders as nothing at all.
+    ///
+    /// The failure mode is what makes this worth a diagnostic. `Buton(...)`
+    /// produces no runtime error, no warning, and no element -- the node is
+    /// dropped and the surrounding layout closes over the gap as if the
+    /// line had been deleted. There is nothing to observe and nothing to
+    /// grep for.
+    ///
+    /// Reported once per node, and the function still returns an ordinary
+    /// node: the caller binds its members as usual, so the arguments inside
+    /// get checked too rather than being swallowed by the first error.
+    fn require_element_type(&mut self, decl: &NodeDecl) {
+        let name = decl.ty.name.as_str();
+        if self.index.host_types.contains(name) || nui_core::props::is_builtin_type(name) {
+            return;
+        }
+        // The suggestion is worth the scan: a typo is the common case, and
+        // the built-in table is a fixed list of about forty names, so an
+        // edit-distance match is cheap and usually right. Candidates from
+        // the document and the host come first -- they are what the author
+        // was most likely reaching for -- but only exact names are ever
+        // accepted.
+        let Some(suggestion) = self.closest_type_name(name) else {
+            self.diagnostics.push(nui_syntax::Diagnostic::error(
+                decl.ty.span,
+                format!("unknown element type `{name}`"),
+            ));
+            return;
+        };
+        self.diagnostics.push(nui_syntax::Diagnostic::error(
+            decl.ty.span,
+            format!("unknown element type `{name}`; did you mean `{suggestion}`?"),
+        ));
+    }
+
+    /// The nearest known type name to `name`, when one is close enough to be
+    /// worth suggesting.
+    ///
+    /// Distance is counted in changed characters, and the ceiling is one
+    /// edit for a short name and two for a longer one -- beyond that the
+    /// "suggestion" is noise, and a wrong suggestion is worse than none
+    /// because it reads as authoritative.
+    fn closest_type_name(&self, name: &str) -> Option<String> {
+        let ceiling = if name.chars().count() <= 4 { 1 } else { 2 };
+        let mut best: Option<(usize, String)> = None;
+        // Three separate walks rather than one chained iterator: the sources
+        // have different lifetimes (the document's signatures and the host's
+        // names borrow `self`, the built-in table is `'static`), and a chain
+        // tries to unify all three into a single item lifetime.
+        let consider = |candidate: &str, best: &mut Option<(usize, String)>| {
+            let distance = edit_distance(name, candidate);
+            if distance == 0 || distance > ceiling {
+                return;
+            }
+            // Ties go to the shorter name, then to the alphabetically first,
+            // so the suggestion is deterministic rather than dependent on
+            // hash iteration order.
+            let better = match best {
+                None => true,
+                Some((best_distance, best_name)) => {
+                    (distance, candidate.len(), candidate)
+                        < (*best_distance, best_name.len(), best_name.as_str())
+                }
+            };
+            if better {
+                *best = Some((distance, candidate.to_string()));
+            }
+        };
+        for candidate in self.index.signatures.keys() {
+            consider(candidate, &mut best);
+        }
+        for candidate in &self.index.host_types {
+            consider(candidate, &mut best);
+        }
+        for candidate in nui_core::props::type_names() {
+            consider(candidate, &mut best);
+        }
+        return best.map(|(_, name)| return name);
+    }
+
     fn bind_node(&mut self, decl: &NodeDecl, is_root: bool) -> NodeIr {
         // A node whose type names a component declared in this document is
         // a *reference*, not an element: the subtree lives in that
@@ -877,6 +1692,7 @@ impl<'source> ComponentBinder<'source> {
         if let Some(signature) = self.index.component(&decl.ty.name).cloned() {
             return self.bind_component_reference(decl, &signature);
         }
+        self.require_element_type(decl);
         let mut node = NodeIr {
             ty: decl.ty.name.clone(),
             ..NodeIr::default()
@@ -3260,6 +4076,8 @@ mod edge_keys {
 #[cfg(test)]
 mod document_id_fallback {
     use crate::compile;
+    use crate::document::PropertyIr;
+    use crate::types::Type;
 
     /// Compiles a source expected to be clean, panicking with the diagnostics
     /// if it is not.
@@ -3501,5 +4319,526 @@ mod document_id_fallback {
             "{:?}",
             outcome.diagnostics
         );
+    }
+
+    // -- `extends`: a component derived from another -------------------------
+
+    /// The first diagnostic message, or `None` when the document is clean.
+    fn first_message(outcome: &crate::CompileOutcome) -> Option<String> {
+        return outcome
+            .diagnostics
+            .first()
+            .map(|diagnostic| return diagnostic.message.clone());
+    }
+
+    #[test]
+    fn a_derived_component_inherits_properties_and_signals() {
+        // Nothing is declared twice: `tone` and `picked` come from the base,
+        // so a Tag call site may pass `tone` and subscribe to `picked`.
+        let source = r#"
+            component Base {
+                property tone: Color = #336699
+                signal picked
+                Rectangle(fill = tone) { }
+            }
+            component Tag extends Base {
+                property label: String = ""
+            }
+            component App {
+                Window {
+                    Tag(tone = #ff0000, label = "hi") { on picked => root.note = 1 }
+                }
+            }
+        "#;
+        let outcome = compile(source);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let tag = outcome
+            .document
+            .components
+            .iter()
+            .find(|component| return component.name == "Tag")
+            .expect("Tag exists");
+        assert!(
+            tag.properties
+                .iter()
+                .any(|property| return property.name == "tone"),
+            "the inherited property is part of Tag's API"
+        );
+        assert!(
+            tag.declares_signal("picked"),
+            "the inherited signal may be subscribed at a Tag call site"
+        );
+        // The body was inherited verbatim from Base.
+        assert_eq!(tag.roots.len(), 1);
+        assert_eq!(tag.roots[0].ty, "Rectangle");
+    }
+
+    #[test]
+    fn a_derived_body_appends_into_the_inherited_slot() {
+        let source = r#"
+            component Base {
+                Rectangle(id = frame, width = 100dp, height = 20dp) { Slot { } }
+            }
+            component Tag extends Base {
+                Text(content = "badge")
+            }
+            component App { Window { Tag() } }
+        "#;
+        let outcome = compile(source);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let tag = outcome
+            .document
+            .components
+            .iter()
+            .find(|component| return component.name == "Tag")
+            .expect("Tag exists");
+        let mut roots = tag.roots.clone();
+        let slot = super::find_slot(&mut roots).expect("the inherited Slot survives");
+        assert_eq!(
+            slot.children.len(),
+            1,
+            "the derived node landed inside the inherited Slot"
+        );
+        assert_eq!(slot.children[0].ty, "Text");
+    }
+
+    #[test]
+    fn a_derived_body_without_a_slot_in_the_parent_is_an_error() {
+        // The failure D26 exists to prevent: content with nowhere to go must
+        // be loud, not silently dropped.
+        let source = r#"
+            component Base { Rectangle(width = 100dp, height = 20dp) { } }
+            component Tag extends Base {
+                Text(content = "badge")
+            }
+            component App { Window { Tag() } }
+        "#;
+        let message = first_message(&compile(source)).expect("a diagnostic");
+        assert!(
+            message.contains("no `Slot`"),
+            "the message names the missing marker: {message}"
+        );
+    }
+
+    #[test]
+    fn a_derived_property_overrides_the_parent_default() {
+        let source = r#"
+            component Base {
+                property tone: Color = #336699
+                Rectangle(fill = tone) { }
+            }
+            component Tag extends Base { property tone: Color = #ff0000 }
+            component App { Window { Tag() } }
+        "#;
+        let outcome = compile(source);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let tag = outcome
+            .document
+            .components
+            .iter()
+            .find(|component| return component.name == "Tag")
+            .expect("Tag exists");
+        let tones: Vec<&PropertyIr> = tag
+            .properties
+            .iter()
+            .filter(|property| return property.name == "tone")
+            .collect();
+        assert_eq!(
+            tones.len(),
+            1,
+            "one entry per name, not one per declaration"
+        );
+        // `property()` is a first-match find, so a second entry would hand
+        // the parent's default back.
+        assert_eq!(
+            tag.property("tone").map(|property| return property.ty),
+            Some(Type::Color)
+        );
+    }
+
+    #[test]
+    fn an_unknown_parent_is_an_error() {
+        let source = r#"
+            component Tag extends Nowhere { Rectangle { } }
+            component App { Window { Tag() } }
+        "#;
+        let outcome = compile(source);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| return d.message.contains("extends `Nowhere`")),
+            "the unknown parent is named: {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    #[test]
+    fn an_extends_cycle_is_reported() {
+        let source = r#"
+            component A extends B { }
+            component B extends A { }
+            component App { Window { A() } }
+        "#;
+        let outcome = compile(source);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| return d.message.contains("extends itself")),
+            "the cycle is reported, not a stack overflow: {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    #[test]
+    fn extending_a_component_does_not_make_it_referenced() {
+        // The distinction that keeps an entry point instantiable: an
+        // inheritance edge is not an instantiation, so the base is still an
+        // entry component and the runtime still builds its tree.
+        let source = r#"
+            component Base {
+                property tone: Color = #336699
+                Window(id = shell) { Rectangle(fill = tone) { } }
+            }
+            component Tag extends Base { property label: String = "" }
+        "#;
+        let outcome = compile(source);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let base = outcome
+            .document
+            .components
+            .iter()
+            .find(|component| return component.name == "Base")
+            .expect("Base exists");
+        assert!(
+            !base.referenced,
+            "`extends` is not a use; Base is still an entry point"
+        );
+    }
+
+    #[test]
+    fn two_slots_across_the_inheritance_chain_are_refused() {
+        let source = r#"
+            component Base { Rectangle { Slot { } } }
+            component Tag extends Base { Column { Slot { } } }
+            component App { Window { Tag() } }
+        "#;
+        let message = first_message(&compile(source)).expect("a diagnostic");
+        assert!(
+            message.contains("more than one `Slot`"),
+            "the merged view sees both slots: {message}"
+        );
+    }
+
+    #[test]
+    fn a_derived_component_reads_a_document_id() {
+        // The derived body is bound in the *derived* component's scope,
+        // which is the same scope the parent's body was bound in. A
+        // document-level id (D20) must resolve from either.
+        let source = r#"
+            component Base { property tone: Color = #336699 }
+            component Tag extends Base {
+                property lit: Bool = false
+                Text(content <- lit ? "yes" : "no")
+            }
+            component App {
+                Window(id = shell, dark = false) { Tag(lit <- shell.dark) }
+            }
+        "#;
+        let outcome = compile(source);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+    }
+
+    #[test]
+    fn a_derived_component_extends_a_host_registered_type() {
+        // The host registers `Card`; a document may extend it by name. The
+        // clause is accepted rather than reported as an unknown parent --
+        // but a host type has no `.nui` body to inherit, so the derived
+        // component still has to declare a root of its own.
+        let host = crate::HostVocabulary::new().with_components([String::from("Card")]);
+        let source = r#"
+            component FancyCard extends Card {
+                property title: String = ""
+                Rectangle(width = 100dp, height = 40dp) { Text(content = title) }
+            }
+            component App { Window { FancyCard(title = "hi") } }
+        "#;
+        let outcome = crate::compile_with_host(source, &host);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let card = outcome
+            .document
+            .components
+            .iter()
+            .find(|component| return component.name == "FancyCard")
+            .expect("FancyCard exists");
+        assert!(
+            card.property("title").is_some(),
+            "the derived API is present"
+        );
+        assert_eq!(card.roots.len(), 1, "the derived body supplies the root");
+    }
+
+    #[test]
+    fn extending_a_host_type_without_a_body_has_no_root() {
+        // The honest cost of extending a type the host owns: there is no
+        // `.nui` tree to inherit, so an empty body is not instantiable. The
+        // error says so rather than producing an empty instance.
+        let host = crate::HostVocabulary::new().with_components([String::from("Card")]);
+        let source = r#"
+            component FancyCard extends Card { property title: String = "" }
+            component App { Window { FancyCard(title = "hi") } }
+        "#;
+        let outcome = crate::compile_with_host(source, &host);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| return d.message.contains("exactly one root node")),
+            "an empty derived body is not silently instantiated: {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_derived_component_inherits_the_parent_ids() {
+        // D22: the ids a component's rewrite namespaces come from
+        // `ComponentIr.ids`. An inherited id left out would become
+        // "document-level" and two instances would collide.
+        let source = r#"
+            component Base {
+                Column(id = body) { Text(id = caption, content = "x") }
+            }
+            component Tag extends Base { }
+            component App { Window { Tag() } }
+        "#;
+        let outcome = compile(source);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let tag = outcome
+            .document
+            .components
+            .iter()
+            .find(|component| return component.name == "Tag")
+            .expect("Tag exists");
+        let ids: Vec<&str> = tag.ids.iter().map(|(id, _)| return id.as_str()).collect();
+        assert!(
+            ids.contains(&"body"),
+            "the inherited id is namespaced: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"caption"),
+            "nested inherited ids too: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_parent_declared_after_its_child_still_merges() {
+        // Forward reference: the binding order has to see the parent first
+        // even though the source writes the child first.
+        let source = r#"
+            component Tag extends Base {
+                Text(content = "badge")
+            }
+            component Base {
+                Column { Slot { } }
+            }
+            component App { Window { Tag() } }
+        "#;
+        let outcome = compile(source);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let tag = outcome
+            .document
+            .components
+            .iter()
+            .find(|component| return component.name == "Tag")
+            .expect("Tag exists");
+        assert_eq!(tag.roots.len(), 1, "the inherited root is there");
+        assert_eq!(tag.roots[0].ty, "Column");
+    }
+
+    #[test]
+    fn a_three_level_chain_merges_through() {
+        let source = r#"
+            component A {
+                property a: Int = 1
+                Column { Slot { } }
+            }
+            component B extends A {
+                property b: Int = 2
+            }
+            component C extends B {
+                property c: Int = 3
+            }
+            component App { Window { C(a = 9, b = 8, c = 7) } }
+        "#;
+        let outcome = compile(source);
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+        let c = outcome
+            .document
+            .components
+            .iter()
+            .find(|component| return component.name == "C")
+            .expect("C exists");
+        for name in ["a", "b", "c"] {
+            assert!(
+                c.properties
+                    .iter()
+                    .any(|property| return property.name == name),
+                "`{name}` reached the bottom of the chain"
+            );
+        }
+    }
+}
+
+/// Element vocabulary: type names are checked, property names are not.
+///
+/// The asymmetry is the point of this module, and `plan.md` §13 is where it
+/// is argued. A *type* name is unambiguous — the runtime instantiates a node
+/// by looking its type up in the element table, so a name that is not there
+/// produces no element, no error and no warning. A *property* name is not:
+/// element state is deliberately hung on the element that owns it
+/// (`Column(id = page, clicks = 0)`, read back as `page.clicks`), so the
+/// checker cannot tell a misspelled built-in property from a state slot the
+/// author meant to create.
+///
+/// These tests therefore pin both halves: the mistakes that must now be
+/// compile errors, and the idioms that must keep compiling.
+#[cfg(test)]
+mod vocabulary {
+    use crate::{compile, compile_with_host};
+
+    fn messages(source: &str) -> Vec<String> {
+        return compile(source)
+            .diagnostics
+            .iter()
+            .map(|diagnostic| return diagnostic.message.clone())
+            .collect();
+    }
+
+    #[test]
+    fn a_misspelled_element_type_is_reported() {
+        let found = messages("component App { Window { Buton(label = \"x\") } }");
+        assert!(
+            found
+                .iter()
+                .any(|message| return message.contains("unknown element type `Buton`")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_misspelled_element_type_suggests_the_nearest_name() {
+        // The suggestion is the reason this diagnostic is worth more than a
+        // bare "unknown": the failure it replaces is silent, so the message
+        // has to carry the whole answer.
+        let found = messages("component App { Window { Buton(label = \"x\") } }");
+        assert!(
+            found
+                .iter()
+                .any(|message| return message.contains("did you mean `Button`")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_name_with_no_close_relative_is_only_reported() {
+        // Two edits away from a five-letter name is the ceiling, so
+        // `Xyzzy` must not come back as `Button`-adjacent noise.
+        let found = messages("component App { Window { Xyzzy() } }");
+        assert!(
+            found
+                .iter()
+                .any(|message| return message.contains("unknown element type `Xyzzy`")),
+            "{found:?}"
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|message| return message.contains("did you mean")),
+            "no suggestion should be offered: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_component_reference_is_not_an_element_type_error() {
+        let found = messages(
+            r#"
+            component Chip { Rectangle(width = 10dp, height = 10dp) }
+            component App { Window { Chip() } }
+            "#,
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_host_registered_type_is_not_an_element_type_error() {
+        // The host's own descriptor is authoritative, so a name it
+        // registered must pass even though the built-in table has never
+        // heard of it.
+        let host = crate::HostVocabulary::new().with_components([String::from("Sparkline")]);
+        let outcome = compile_with_host(
+            "component App { Window { Sparkline(points = \"0,0 1,1\") } }",
+            &host,
+        );
+        assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
+    }
+
+    #[test]
+    fn every_builtin_type_is_accepted() {
+        // The guard against the table being *incomplete* rather than the
+        // check being wrong: each name the table declares has to compile as
+        // a node. A type missing from the table would fail here, which is
+        // exactly the failure the check would otherwise introduce.
+        for ty in nui_core::props::type_names() {
+            let source = format!("component App {{ Window {{ {ty}() }} }}");
+            let found = messages(&source);
+            assert!(
+                !found
+                    .iter()
+                    .any(|message| return message.contains("unknown element type")),
+                "`{ty}` is in the table but was rejected: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn element_state_is_still_allowed() {
+        // The idiom that blocks the property half of the vocabulary, and
+        // the reason it must keep compiling: `clicks` is not a Button
+        // property, it is state the page hangs on the element.
+        let found = messages(
+            r#"
+            component App {
+                Window {
+                    Button(id = containers_page, label = "x", clicks = 0)
+                }
+            }
+            "#,
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_misspelled_property_is_still_silent_by_design() {
+        // Recording the gap rather than pretending it is closed. When the
+        // language decision in `plan.md` §13 is made (a `state` keyword, or
+        // a `state.` prefix), this expectation is what has to change.
+        let found = messages("component App { Window { Text(contnt = \"x\") } }");
+        assert!(
+            found.is_empty(),
+            "property spelling is not checked yet: {found:?}"
+        );
+    }
+
+    #[test]
+    fn the_distance_metric_counts_characters_not_bytes() {
+        // Type names are ASCII today, but a host may register one that is
+        // not, and byte slicing would panic on a multi-byte boundary.
+        assert_eq!(super::edit_distance("ab", "ab"), 0);
+        assert_eq!(super::edit_distance("ab", "ac"), 1);
+        assert_eq!(super::edit_distance("ab", "abc"), 1);
+        assert_eq!(super::edit_distance("abc", "ab"), 1);
+        assert_eq!(super::edit_distance("", "abc"), 3);
+        assert_eq!(super::edit_distance("按钮", "按纽"), 1);
     }
 }
