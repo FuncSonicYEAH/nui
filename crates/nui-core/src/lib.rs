@@ -19,6 +19,7 @@ pub mod event;
 pub mod geometry;
 pub mod length;
 pub mod path;
+pub mod props;
 pub mod value;
 
 pub use color::Color;
