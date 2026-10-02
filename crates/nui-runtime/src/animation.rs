@@ -326,30 +326,34 @@ fn numeric_value(raw: f64, like: &Value) -> Value {
     };
 }
 
-/// Interpolates between two values of the same type at `progress` (0..=1).
+/// Interpolates between two values at `progress` (0..=1).
 ///
-/// The numeric mixing itself is [`nui_tools::lerp_f64`] — it was a local
-/// `mix` closure here, and the same arithmetic was also spelled out in
-/// `nui-core`'s color and the renderer's scene builder. What is specific
+/// The numeric mixing itself is [`nui_tools::lerp_f64`]; what is specific
 /// to this function is the *dispatch*: which `Value` variants can be
 /// interpolated at all, and which hold their target.
+///
+/// Numeric shapes interpolate **across** shapes, the result taking the
+/// target's: instantiation seeds every bound property with an `Int(0)`
+/// placeholder (`instantiate.rs`), so a `Float` (or `dp`) target's first
+/// tween starts from an `Int` `from`. Matching the shapes exactly made
+/// this function fall into the hold branch and return the target on every
+/// tick — the whole animation collapsed into a single jump, which showed
+/// up as "the tween sometimes just doesn't play". (Spring never had the
+/// bug: it integrates a scalar `position` and projects it through
+/// [`numeric_value`].)
 fn interpolate(from: &Value, to: &Value, progress: f64) -> Value {
-    let mix = |a: f64, b: f64| -> f64 {
-        return nui_tools::lerp_f64(a, b, progress);
-    };
-    return match (from, to) {
-        (Value::Int(a), Value::Int(b)) => Value::Int(mix(*a as f64, *b as f64) as i64),
-        (Value::Float(a), Value::Float(b)) => Value::Float(mix(*a, *b)),
-        (Value::Length(nui_core::Length::Dp(a)), Value::Length(nui_core::Length::Dp(b))) => {
-            Value::Length(nui_core::Length::Dp(mix(*a as f64, *b as f64) as f32))
-        }
-        (Value::Duration(a), Value::Duration(b)) => Value::Duration(Duration::from_millis(mix(
+    if let (Value::Duration(a), Value::Duration(b)) = (from, to) {
+        return Value::Duration(Duration::from_millis(nui_tools::lerp_f64(
             a.as_millis_f64(),
             b.as_millis_f64(),
-        ))),
-        // Non-interpolable values hold the target for the whole run.
-        _ => to.clone(),
-    };
+            progress,
+        )));
+    }
+    if let (Some(a), Some(b)) = (numeric_of(from), numeric_of(to)) {
+        return numeric_value(nui_tools::lerp_f64(a, b, progress), to);
+    }
+    // Non-numeric values hold the target for the whole run.
+    return to.clone();
 }
 
 #[cfg(test)]

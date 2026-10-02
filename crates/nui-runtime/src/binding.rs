@@ -376,6 +376,17 @@ impl Engine {
         return changes;
     }
 
+    /// Peeks at the changes buffered so far this frame **without draining
+    /// them** ([`Engine::take_changes`] keeps ownership of the notify
+    /// pass).
+    ///
+    /// The host reads this before deciding whether the frame still has to
+    /// run taffy (D40): if every buffered write is paint-only, no box can
+    /// have moved and the layout pass would be idle work.
+    pub fn pending_changes(&self) -> &[PropertyChange] {
+        return &self.changes;
+    }
+
     /// Subscribes a property observer; notified on every
     /// [`Engine::take_changes`] drain.
     pub fn subscribe(&mut self, observer: Box<dyn PropertyObserver>) -> ObserverHandle {
@@ -704,7 +715,18 @@ impl Engine {
                 ..
             }
         ) {
-            return self.start_bound_animation(tree, element, &property, &expr, value);
+            // Defensive: a tweened slot with *no* value at all has nothing
+            // to animate from, so the target lands through the plain
+            // write-back below instead of entering the clock with a
+            // fabricated `from`. (In practice instantiation seeds bound
+            // slots with an `Int(0)` placeholder, so this guards the
+            // rarer paths — a `<=>` partner cleared its binding, a host
+            // cleared the slot — rather than the common first frame.)
+            if tree.arena[element].get(&property).is_none() {
+                self.clock.cancel(element, &property);
+            } else {
+                return self.start_bound_animation(tree, element, &property, &expr, value);
+            }
         }
 
         // Write-back without clobbering the binding itself.

@@ -816,6 +816,73 @@ fn effect_let_scopes_and_resolves_locals() {
 }
 
 #[test]
+fn a_tweened_slot_without_a_seed_still_lands_and_animates() {
+    // The todo page spells `opacity <- tween(item.done ? 1.0 : 0.4, ...)`
+    // with no `state` and no static default. Instantiation seeds every
+    // bound slot with an `Int(0)` placeholder, so the first tween runs
+    // from an *Int* `from` toward a *Float* target — and `interpolate`
+    // used to match shapes exactly, fall into its hold branch, and return
+    // the target on every tick: the animation collapsed into a single
+    // jump ("the tween sometimes just doesn't play"). The seeded variants
+    // above (a `state x: Float = tween(count, ...)` declaration) could
+    // not see this — there both shapes are Float.
+    let source = r#"
+        component A {
+            Window(id = root) {
+                Rectangle(id = panel, width = 100dp, height = 10dp) {
+                    state lit: Bool = false
+                    opacity <- tween(panel.lit ? 1.0 : 0.4, duration = 100ms, easing = linear)
+                }
+            }
+        }
+    "#;
+    let (mut tree, mut engine) = build(source);
+    let panel = tree.lookup_id("panel").unwrap();
+    engine.propagate(&mut tree);
+    // Instantiation seeded the slot with an `Int(0)` placeholder, so the
+    // first evaluation animates from *that*: the tween runs, and across
+    // shapes (Int from, Float target) it must interpolate numerically —
+    // not collapse into a single jump to the target.
+    assert!(
+        engine.has_active_animations(),
+        "the first evaluation tweens from the placeholder seed"
+    );
+    engine.tick_animations(&mut tree, Duration::from_millis(50.0));
+    assert_eq!(
+        tree.arena[panel].get("opacity"),
+        Some(&Value::Float(0.2)),
+        "linear easing at half duration, from the Int(0) placeholder"
+    );
+    engine.tick_animations(&mut tree, Duration::from_millis(50.0));
+    assert_eq!(tree.arena[panel].get("opacity"), Some(&Value::Float(0.4)));
+    assert!(!engine.has_active_animations(), "finished tweens retire");
+
+    // From here on the slot holds a real Float, and toggling animates
+    // between the two targets as usual.
+    engine.set_direct(&mut tree, panel, "lit", Value::Bool(true));
+    engine.propagate(&mut tree);
+    assert!(
+        engine.has_active_animations(),
+        "a target change from a landed value must start the tween"
+    );
+    assert_eq!(
+        tree.arena[panel].get("opacity"),
+        Some(&Value::Float(0.4)),
+        "the displayed value must not jump to the target at bind time"
+    );
+
+    engine.tick_animations(&mut tree, Duration::from_millis(50.0));
+    assert_eq!(
+        tree.arena[panel].get("opacity"),
+        Some(&Value::Float(0.7)),
+        "linear easing at half duration"
+    );
+    engine.tick_animations(&mut tree, Duration::from_millis(50.0));
+    assert_eq!(tree.arena[panel].get("opacity"), Some(&Value::Float(1.0)));
+    assert!(!engine.has_active_animations(), "finished tweens retire");
+}
+
+#[test]
 fn tween_binding_routes_target_through_the_clock() {
     let source = r#"
         component A {

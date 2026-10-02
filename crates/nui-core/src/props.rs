@@ -270,6 +270,49 @@ pub const PAINT: &[PropDecl] = &[
     f("stroke.cap", PropType::Enum, DefaultValue::Text("butt")),
 ];
 
+/// The properties a frame can write **without any box changing** (D40).
+///
+/// `nui-layout` reads none of these — they are consumed by the scene
+/// builder and the shaders — so a frame whose writes all land here can
+/// skip `layout_with_text` entirely. This is what makes a `tween` on
+/// `opacity` (or a hover recolour, or a `scroll_y` drag) cheap per frame.
+///
+/// The list is **fail-safe on purpose**: a property name missing here
+/// only costs a layout pass that was probably needed anyway, while a
+/// name wrongly listed here would pin stale boxes on screen. `opacity`
+/// is [`UNIVERSAL`] but consumed at draw time; `color` is the
+/// control-owned colour each widget declares separately; `scroll_y` is
+/// the D38 viewport translation, not a layout input.
+pub const PAINT_ONLY: &[&str] = &[
+    "opacity",
+    "fill",
+    "tint",
+    "color",
+    "radius",
+    "rotation",
+    "clip",
+    "shadow.color",
+    "shadow.dx",
+    "shadow.dy",
+    "shadow.blur",
+    "gradient.from",
+    "gradient.to",
+    "gradient.kind",
+    "gradient.angle",
+    "gradient.center_x",
+    "gradient.center_y",
+    "gradient.radius",
+    "stroke.color",
+    "stroke.width",
+    "stroke.cap",
+    "scroll_y",
+];
+
+/// Whether writing `name` can never change a box (see [`PAINT_ONLY`]).
+pub fn is_paint_only_property(name: &str) -> bool {
+    return PAINT_ONLY.contains(&name);
+}
+
 /// Declares a type's properties as `UNIVERSAL + LAYOUT + PAINT + extras`.
 ///
 /// A macro rather than a function because a `&'static [PropDecl]` cannot be
@@ -547,6 +590,13 @@ pub static TABLE: &[TypeProps] = &[
             f("max_lines", PropType::Int, DefaultValue::None),
             f("elide", PropType::Enum, DefaultValue::Text("clip")),
             f("align", PropType::Enum, DefaultValue::Text("start")),
+            // Where the run sits *inside* the box, read by the scene
+            // builder for every `Text`. Without entries here the D33
+            // property-name check rejects the two names the renderer
+            // actually consumes — the exact table/renderer drift D31
+            // exists to prevent.
+            f("halign", PropType::Enum, DefaultValue::Text("start")),
+            f("valign", PropType::Enum, DefaultValue::Text("start")),
             f(
                 "padding",
                 PropType::Length,

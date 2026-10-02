@@ -49,6 +49,10 @@ pub struct WindowHost {
     scale: f32,
     /// Whether a frame must be drawn (dirty data or active animation).
     needs_redraw: bool,
+    /// Whether the next frame must run taffy (D40): true after a reload or
+    /// a resize, when boxes may be missing or stale; false once a frame
+    /// has laid out and subsequent frames only wrote paint-only values.
+    needs_layout: bool,
     /// Surface configuration (reconfigured on resize).
     surface_format: wgpu::TextureFormat,
     click: PointerGesture,
@@ -166,6 +170,7 @@ impl WindowHost {
             size: Size::new(size.width as f32 / scale, size.height as f32 / scale),
             scale,
             needs_redraw: true,
+            needs_layout: true,
             surface_format,
             click: PointerGesture::default(),
             scrollbar_drag: ScrollbarDrag::default(),
@@ -222,6 +227,9 @@ impl WindowHost {
             self.scrollbar_drag = ScrollbarDrag::default();
             self.widgets.reset();
             self.needs_redraw = true;
+            // The tree was rebuilt wholesale: the new elements have no
+            // boxes until the next pipeline lays them out (D40).
+            self.needs_layout = true;
         }
         return outcome;
     }
@@ -555,7 +563,23 @@ impl WindowHost {
             let _ = self.engine.propagate(&mut self.tree);
         }
         let _ = self.engine.apply_when_blocks(&mut self.tree);
-        nui_layout::layout_with_text(&mut self.tree, self.size, Some(&mut self.text));
+        // D40: run taffy only when something this frame could have moved a
+        // box. Rows were rebuilt, the last frame has not laid out yet, or a
+        // buffered write touched a property outside the paint-only set —
+        // otherwise every write went to the scene builder, the layout pass
+        // would reproduce the same boxes, and a 200 ms `tween` would pay
+        // for it at frame rate. A tween on `opacity` measured ~0.4 ms of
+        // pipeline work per frame before this and ~6.8 ms with the layout
+        // it never needed (gallery-sized trees; see `tween_perf.rs`).
+        let run_layout = self.needs_layout
+            || rebuilt > 0
+            || self.engine.pending_changes().iter().any(|change| {
+                return !nui_core::props::is_paint_only_property(&change.property);
+            });
+        self.needs_layout = false;
+        if run_layout {
+            nui_layout::layout_with_text(&mut self.tree, self.size, Some(&mut self.text));
+        }
         // Widget state mirrors focus and layout into element properties
         // (批次 0). Run after layout so the first pass sees real boxes;
         // `set_direct` only dirties the tree when a value actually moved.
@@ -670,6 +694,7 @@ impl WindowHost {
         );
         nui_layout::layout(&mut self.tree, logical);
         self.needs_redraw = true;
+        self.needs_layout = true;
     }
 
     /// Draws one frame: scene build (rects + glyphs + layers) + error
