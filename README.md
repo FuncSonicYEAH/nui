@@ -1,8 +1,8 @@
 # nui
 
-A Qt Quick-style UI framework for Rust. UIs are described in a standalone
-declarative language (`.nui`), the engine is written in Rust, and rendering
-goes through wgpu.
+Written entirely by AI: a Qt Quick-style UI framework for Rust. UIs are
+described in a standalone declarative language (`.nui`), the engine is written
+in Rust, and rendering goes through wgpu.
 
 [![CI](https://github.com/FuncSonicYEAH/nui/actions/workflows/ci.yml/badge.svg)](https://github.com/FuncSonicYEAH/nui/actions/workflows/ci.yml)
 
@@ -59,19 +59,10 @@ cargo run -p nui --example gallery --release -- --snap
 
 # hot reload: edit the .nui file while it runs
 cargo run -p nui-preview -- examples/counter.nui
-
-# fixed-size window (no user resizing; best-effort on Wayland)
-cargo run -p nui-preview -- examples/counter.nui --no-resize
 ```
 
 `NUI_BACKEND` forces a wgpu backend: `vulkan`, `gl`, `dx12`, `metal` or
 `primary` (e.g. `NUI_BACKEND=gl cargo run -p nui --example gallery`).
-
-## Documentation
-
-`plan.md` (written in Chinese) is the design document and the most detailed
-source of truth in this repository: decision log, language semantics,
-architecture, and milestone acceptance criteria.
 
 ## License
 

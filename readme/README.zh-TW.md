@@ -1,6 +1,6 @@
 # nui
 
-一個面向 Rust 的 Qt Quick 風格 UI 框架。介面以獨立的宣告式語言（`.nui`）描述，
+純 AI 寫的，一個面向 Rust 的 Qt Quick 風格 UI 框架。介面以獨立的宣告式語言（`.nui`）描述，
 引擎由 Rust 撰寫，算繪走 wgpu。
 
 [![CI](https://github.com/FuncSonicYEAH/nui/actions/workflows/ci.yml/badge.svg)](https://github.com/FuncSonicYEAH/nui/actions/workflows/ci.yml)
@@ -57,11 +57,6 @@ cargo run -p nui-preview -- examples/counter.nui
 
 `NUI_BACKEND` 可強制指定 wgpu 後端：`vulkan`、`gl`、`dx12`、`metal` 或
 `primary`（例如 `NUI_BACKEND=gl cargo run -p nui --example gallery`）。
-
-## 文件
-
-`plan.md`（中文撰寫）是本儲存庫的設計文件，也是最詳盡的事實來源：決策記錄、
-語言語義、架構，以及各里程碑的驗收標準。
 
 ## 授權條款
 
